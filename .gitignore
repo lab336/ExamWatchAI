@@ -1,0 +1,58 @@
+# Data directories
+data/
+*.mp4
+*.avi
+*.mov
+
+# Model files
+model/
+*.pt
+*.weights
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output directories
+detect/output/
+runs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+
+.mp4
+.avi
+.mov
+.pt
+.weights
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+.env
+.vscode/
+.idea/
+*.swp
+*.swo
+detect/output/
+runs/
+*.log
+.DS_Store       
