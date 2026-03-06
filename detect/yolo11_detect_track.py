@@ -4,7 +4,7 @@ YOLOv11 视频检测 + 跟踪（ID）脚本（独立可用）
 
 用法:
 1) 仅检测:
-python detect/yolo11_detect_track.py --source data/clipped_00000000028000000.mp4 --weights model/yolo11sbest.pt
+python detect/yolo11_detect_track.py --source data/clipped_00000000028000000.mp4 --weights model/yolo11sbest.pt  --img-size 1280 --conf 0.18 --iou 0.6 --device 0 --half
 
 2) 检测 + 跟踪（推荐）:
 python detect/yolo11_detect_track.py --source data/clipped_00000000028000000.mp4 --weights model/yolo11sbest.pt --track --tracker bytetrack.yaml --img-size 1280 --conf 0.18 --iou 0.6 --device 0 --half
