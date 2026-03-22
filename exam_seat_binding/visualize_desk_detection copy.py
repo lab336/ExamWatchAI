@@ -742,342 +742,14 @@ def split_into_columns_by_origin_walk(
     return columns, lines, seeds
 
 
-# ─── 误检测列修复：平移拟合 ─────────────────────────────────────────────
-
-
-def repair_columns_by_translation(
-    centers: np.ndarray,
-    columns: List[List[int]],
-    lines: List[Tuple[float, float]],
-    num_cols: int = 5,
-    max_mean_residual: float = 20.0,
-    max_single_residual: float = 40.0,
-    inlier_threshold: float = 35.0,
-) -> Tuple[List[List[int]], List[Tuple[float, float]], List[int]]:
-    """
-    误检测列修复——平移策略。
-
-    当某列的拟合直线质量差（均值残差 > max_mean_residual 或单点最大残差 > max_single_residual）
-    时视为"坏列"，处理策略：
-      1. 找出所有"好列"（低残差），计算相邻好列之间的 x 间距中位数 col_dx；
-      2. 以最近好列（优先左侧，即第一列或误检前一列）为参考，
-         按列索引差 * col_dx 平移其直线到坏列期望位置；
-      3. 用平移后的新直线替换坏列的拟合线；
-      4. 剔除坏列内距新线 > inlier_threshold 的离群点（误检测桌子）。
-
-    返回: (repaired_columns, repaired_lines, bad_col_indices)
-    """
-    if len(centers) == 0:
-        return columns, lines, []
-
-    # 以底部最大 y 为参考，计算各列在参考 y 处的 x 位置
-    y_ref = float(np.max(centers[:, 1]))
-    y_ref_up = -y_ref
-
-    def _line_x_at_ref(kb: Tuple[float, float]) -> float:
-        k, b = kb
-        return (y_ref_up - b) / k if abs(k) > 1e-8 else 1e9
-
-    x_at_ref = [_line_x_at_ref(lines[c]) for c in range(num_cols)]
-
-    # 计算各列到本列拟合线的均值/最大残差
-    def _col_residuals(c: int) -> np.ndarray:
-        if len(columns[c]) == 0:
-            return np.array([0.0])
-        pts = centers[np.array(columns[c], dtype=np.int32)]
-        return np.array([point_line_distance_kb(p, lines[c]) for p in pts])
-
-    mean_res = [float(np.mean(_col_residuals(c))) for c in range(num_cols)]
-    max_res_list = [float(np.max(_col_residuals(c))) for c in range(num_cols)]
-
-    good_flags = [
-        (
-            mean_res[c] <= max_mean_residual
-            and max_res_list[c] <= max_single_residual
-            and len(columns[c]) >= 2
-        )
-        for c in range(num_cols)
-    ]
-    good_cols = [c for c in range(num_cols) if good_flags[c]]
-    bad_cols = [c for c in range(num_cols) if not good_flags[c]]
-
-    LOGGER.info(
-        "列质量评估 — 好列: C%s  坏列: C%s",
-        "/".join(str(c + 1) for c in good_cols),
-        "/".join(str(c + 1) for c in bad_cols) or "无",
-    )
-    for c in range(num_cols):
-        LOGGER.info("  C%d 均值残差=%.1f  最大残差=%.1f", c + 1, mean_res[c], max_res_list[c])
-
-    if not bad_cols:
-        return columns, lines, []
-
-    if len(good_cols) < 2:
-        LOGGER.warning("好列数 < 2，无法估算列间距，跳过平移修复。")
-        return columns, lines, bad_cols
-
-    # 计算相邻好列之间每列索引差1的 x 间距，取中位数作为 col_dx
-    spacings = [
-        (x_at_ref[good_cols[i + 1]] - x_at_ref[good_cols[i]])
-        / (good_cols[i + 1] - good_cols[i])
-        for i in range(len(good_cols) - 1)
-    ]
-    col_dx = float(np.median(spacings))
-    # 使用好列的中位斜率作为公共斜率
-    good_k = float(np.median([lines[c][0] for c in good_cols]))
-
-    LOGGER.info("估算列间距 col_dx=%.1f px  公共斜率 k=%.4f", col_dx, good_k)
-
-    new_columns = [col[:] for col in columns]
-    new_lines = list(lines)
-
-    for bad_c in bad_cols:
-        # 优先取左侧最近好列（从第一列或误检前一列出发），退而取右侧
-        left_good = [c for c in good_cols if c < bad_c]
-        right_good = [c for c in good_cols if c > bad_c]
-        ref_c = left_good[-1] if left_good else (right_good[0] if right_good else None)
-        if ref_c is None:
-            continue
-
-        # 期望 x = 参考列 x + 列索引差 * col_dx
-        delta = bad_c - ref_c
-        expected_x = x_at_ref[ref_c] + delta * col_dx
-
-        # 用公共斜率 + 期望 x 重建平移直线（y_ref_up = k * x + b）
-        new_b = y_ref_up - good_k * expected_x
-        new_lines[bad_c] = (float(good_k), float(new_b))
-
-        # 剔除坏列内的离群点（误检测桌子），只保留在新线附近的点
-        inliers = [
-            idx for idx in new_columns[bad_c]
-            if point_line_distance_kb(centers[idx], new_lines[bad_c]) <= inlier_threshold
-        ]
-        new_columns[bad_c] = sorted(inliers, key=lambda i: centers[i, 1], reverse=True)
-
-        new_mean = (
-            float(np.mean([
-                point_line_distance_kb(centers[i], new_lines[bad_c])
-                for i in new_columns[bad_c]
-            ]))
-            if new_columns[bad_c] else 0.0
-        )
-        LOGGER.info(
-            "  C%d 修复：基于 C%d 平移 %+.1f px | 均值残差 %.1f→%.1f | 点数 %d→%d",
-            bad_c + 1, ref_c + 1, delta * col_dx,
-            mean_res[bad_c], new_mean,
-            len(columns[bad_c]), len(new_columns[bad_c]),
-        )
-
-    return new_columns, new_lines, bad_cols
-
-
-# ─── 误检测列修复：去首点重拟合 + 延长线找真实第一个点 ───────────────────
-
-
-def repair_columns_by_drop_refit(
-    centers: np.ndarray,
-    dets: List[Dict],
-    columns: List[List[int]],
-    lines: List[Tuple[float, float]],
-    num_cols: int = 5,
-    max_mean_residual: float = 20.0,
-    max_single_residual: float = 40.0,
-    corner_proximity: float = 120.0,
-    line_proximity: float = 30.0,
-) -> Tuple[List[List[int]], List[Tuple[float, float]], List[int]]:
-    """
-    坏列修复——去首点重拟合 + 延长线搜索真实第一个点。
-
-    策略：
-      1. 检测列拟合线是否"不直"（均值残差/最大残差超阈值）；
-      2. 逐步去掉头部点（最多去掉前 max_drop 个），找到使重拟合质量达标的最少去除数；
-      3. 沿列线延长方向估算被去掉的第一个真实点的期望位置；
-      4. 在所有检测框中双重搜索匹配框：
-         a) 框的左上角(x1,y1)、右下角(x2,y2) 或中心点距期望位置 < corner_proximity；
-         b) 框中心距新拟合线 < line_proximity，且 y 坐标在期望范围内；
-      5. 找到则以该框作为本列新的第一点并整体重拟合；否则保留去首点结果。
-
-    返回: (repaired_columns, repaired_lines, repaired_col_indices)
-    """
-    if len(centers) == 0:
-        return columns, lines, []
-
-    def _col_residuals(c: int) -> np.ndarray:
-        if len(columns[c]) == 0:
-            return np.array([0.0])
-        pts = centers[np.array(columns[c], dtype=np.int32)]
-        return np.array([point_line_distance_kb(p, lines[c]) for p in pts])
-
-    mean_res = [float(np.mean(_col_residuals(c))) for c in range(num_cols)]
-    max_res_list = [float(np.max(_col_residuals(c))) for c in range(num_cols)]
-
-    bad_cols = [
-        c for c in range(num_cols)
-        if mean_res[c] > max_mean_residual or max_res_list[c] > max_single_residual
-    ]
-
-    LOGGER.info(
-        "[drop-refit] 列质量评估 — 需修复: C%s",
-        "/".join(str(c + 1) for c in bad_cols) or "无",
-    )
-    for c in range(num_cols):
-        LOGGER.info("  C%d 均值残差=%.1f  最大残差=%.1f", c + 1, mean_res[c], max_res_list[c])
-
-    if not bad_cols:
-        return columns, lines, []
-
-    new_columns = [col[:] for col in columns]
-    new_lines = list(lines)
-    repaired: List[int] = []
-
-    for bad_c in bad_cols:
-        col = sorted(columns[bad_c], key=lambda i: centers[i, 1], reverse=True)
-        if len(col) < 3:
-            LOGGER.warning("  C%d 点数不足(%d)，跳过 drop-refit", bad_c + 1, len(col))
-            continue
-
-        # ── Step 1: 逐步去头部点，找到使线质量达标的最少去除数 ────────────
-        max_drop = min(3, len(col) - 2)  # 最多去掉3个，保留至少2个
-        best_remaining: List[int] = []
-        best_drop_n: int = 0
-        best_refit_line: Tuple[float, float] = lines[bad_c]
-        found_good_refit = False
-
-        for drop_n in range(1, max_drop + 1):
-            remaining = col[drop_n:]
-            if len(remaining) < 2:
-                break
-            pts_rem = centers[np.array(remaining, dtype=np.int32)]
-            candidate_line = fit_line_kb_positive(pts_rem, min_k=0.02)
-            res_after = [point_line_distance_kb(centers[i], candidate_line) for i in remaining]
-            mean_after = float(np.mean(res_after))
-            max_after = float(np.max(res_after))
-            if mean_after <= max_mean_residual and max_after <= max_single_residual:
-                best_remaining = remaining
-                best_drop_n = drop_n
-                best_refit_line = candidate_line
-                found_good_refit = True
-                LOGGER.info(
-                    "  C%d 去掉前 %d 个点后线质量达标（均值残差=%.1f）",
-                    bad_c + 1, drop_n, mean_after,
-                )
-                break
-
-        if not found_good_refit:
-            LOGGER.warning(
-                "  C%d 去掉前 %d 个点后仍不好，跳过 drop-refit",
-                bad_c + 1, max_drop,
-            )
-            continue
-
-        # ── Step 2: 估算被去掉的第一个点的期望位置 ────────────────────────
-        # 用相邻点间距中位数估算行间距
-        row_vecs = [
-            centers[best_remaining[j]] - centers[best_remaining[j + 1]]
-            for j in range(min(len(best_remaining) - 1, 3))
-        ]
-        row_dists = [float(np.linalg.norm(v)) for v in row_vecs]
-        avg_spacing = float(np.median(row_dists)) if row_dists else 80.0
-
-        p0 = centers[best_remaining[0]]  # 最底部（最大 y）
-        p1 = centers[best_remaining[1]] if len(best_remaining) > 1 else p0
-        dir_vec = p0 - p1
-        dir_norm = float(np.linalg.norm(dir_vec))
-        dir_unit = dir_vec / (dir_norm + 1e-8)
-
-        # 每去掉一个点就向下延伸一个行间距
-        expected_pos = p0 + dir_unit * avg_spacing * best_drop_n
-
-        LOGGER.info(
-            "  C%d 期望第一点位置: (%.1f, %.1f)，行间距=%.1f",
-            bad_c + 1, float(expected_pos[0]), float(expected_pos[1]), avg_spacing,
-        )
-
-        # ── Step 3: 双重搜索——角点距离 + 直线投影距离 ───────────────────
-        remaining_set = set(best_remaining)
-        # 期望 y 范围：允许 ±1 个行间距的误差
-        y_lo = float(expected_pos[1]) - avg_spacing * 1.2
-        y_hi = float(expected_pos[1]) + avg_spacing * 1.2
-
-        best_idx: int = -1
-        best_score: float = 1e18  # 越小越好
-
-        for det_i, det in enumerate(dets):
-            if det_i in remaining_set:
-                continue
-            x1, y1, x2, y2 = det["bbox"]
-            cx, cy = det["center"]
-
-            # 判据 a) 角点/中心距期望位置
-            corners = [
-                np.array([x1, y1], dtype=np.float32),
-                np.array([x2, y2], dtype=np.float32),
-                np.array([cx, cy], dtype=np.float32),
-            ]
-            d_corner = min(float(np.linalg.norm(pt - expected_pos)) for pt in corners)
-
-            # 判据 b) 中心点到新拟合线的距离 + y 范围内
-            d_line = point_line_distance_kb(np.array([cx, cy], dtype=np.float32), best_refit_line)
-            in_y_range = y_lo <= cy <= y_hi
-
-            # 综合得分：角点距离优先，线距作为辅助
-            if d_corner < corner_proximity:
-                score = d_corner  # 角点命中，直接计分
-            elif in_y_range and d_line < line_proximity:
-                score = d_line + corner_proximity  # 线距命中，分数较高（保留用于兜底）
-            else:
-                continue
-
-            if score < best_score:
-                best_score = score
-                best_idx = det_i
-
-        # ── Step 4: 更新列 ─────────────────────────────────────────────────
-        if best_idx >= 0:
-            final_col = [best_idx] + list(best_remaining)
-            pts_all = centers[np.array(final_col, dtype=np.int32)]
-            final_line = fit_line_kb_positive(pts_all, min_k=0.02)
-            final_mean = float(np.mean(
-                [point_line_distance_kb(centers[i], final_line) for i in final_col]
-            ))
-            hit_type = "角点" if best_score < corner_proximity else "线距"
-            LOGGER.info(
-                "  C%d 找到真实第一点 det[%d]（%s，score=%.1f）| 均值残差 %.1f→%.1f | 点数 %d",
-                bad_c + 1, best_idx, hit_type, best_score,
-                mean_res[bad_c], final_mean, len(final_col),
-            )
-            new_columns[bad_c] = final_col
-            new_lines[bad_c] = final_line
-        else:
-            final_mean = float(np.mean(
-                [point_line_distance_kb(centers[i], best_refit_line) for i in best_remaining]
-            ))
-            LOGGER.info(
-                "  C%d 未找到匹配点，保留去头点结果 | 均值残差 %.1f→%.1f | 点数 %d→%d",
-                bad_c + 1,
-                mean_res[bad_c], final_mean,
-                len(col), len(best_remaining),
-            )
-            new_columns[bad_c] = list(best_remaining)
-            new_lines[bad_c] = best_refit_line
-
-        repaired.append(bad_c)
-
-    return new_columns, new_lines, repaired
-
-
 def draw_visualization(
     image,
     dets: List[Dict],
     columns: List[List[int]],
-    lines: List[Tuple[float, float]] = None,
-    repaired_cols: List[int] = None,
     line_thickness: int = 2,
 ):
-    """绘制方框、座位编号、列内方框连线，以及拟合/修复列线。"""
+    """绘制方框、座位编号、列内方框左上/右下角连线。"""
     vis = image.copy()
-    h, w = vis.shape[:2]
-    repaired_cols = repaired_cols or []
 
     col_colors = [
         (255, 80, 80),
@@ -1086,24 +758,6 @@ def draw_visualization(
         (255, 200, 80),
         (220, 80, 255),
     ]
-
-    # 绘制拟合直线（修复列用加粗半透明线条并标注 "R"，正常列用细线）
-    if lines:
-        for c, line_kb in enumerate(lines):
-            color = col_colors[c % len(col_colors)]
-            pt1, pt2 = clip_line_kb_to_image(line_kb, w, h)
-            if c in repaired_cols:
-                overlay = vis.copy()
-                cv2.line(overlay, pt1, pt2, color, 4)
-                cv2.addWeighted(overlay, 0.55, vis, 0.45, 0, vis)
-                mid_x = (pt1[0] + pt2[0]) // 2
-                mid_y = (pt1[1] + pt2[1]) // 2
-                cv2.putText(
-                    vis, "R", (mid_x - 10, mid_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3, cv2.LINE_AA,
-                )
-            else:
-                cv2.line(vis, pt1, pt2, color, 1)
 
     # 先画灰色底框
     for i, det in enumerate(dets):
@@ -1144,15 +798,12 @@ def draw_visualization(
             cv2.line(vis, (ax1, ay1), (bx1, by1), color, line_thickness)
             cv2.line(vis, (ax2, ay2), (bx2, by2), color, line_thickness)
 
-        # 列名标注（修复列加 "[R]" 后缀）
+        # 列名标注
         top_idx = sorted_idxs[-1]
         tx, ty = [int(v) for v in dets[top_idx]["center"]]
-        label = f"C{col_id + 1}({len(sorted_idxs)})"
-        if col_id in repaired_cols:
-            label += "[R]"
         cv2.putText(
             vis,
-            label,
+            f"C{col_id + 1}({len(sorted_idxs)})",
             (tx + 8, max(20, ty - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -1193,32 +844,16 @@ def run(
 
     centers = np.array([d["center"] for d in dets], dtype=np.float32) if len(dets) > 0 else np.zeros((0, 2), dtype=np.float32)
 
-    columns, lines, _ = split_into_columns_by_origin_walk(
+    columns, _, _ = split_into_columns_by_origin_walk(
         centers,
         num_cols=num_cols,
         expected_per_col=6,
     )
 
-    # 误检测列修复
-    # 策略1（主）：去首点重拟合 + 延长线找真实第一个点
-    # 策略2（兜底）：若修复后仍有坏列，用相邻好列平移直线
-    if len(centers) > 0:
-        columns, lines, repaired_cols = repair_columns_by_drop_refit(
-            centers, dets, columns, lines, num_cols=num_cols
-        )
-        # 兜底：对 drop-refit 后仍残差过大的列，再走平移修复
-        columns, lines, extra_repaired = repair_columns_by_translation(
-            centers, columns, lines, num_cols=num_cols
-        )
-        # 合并两次修复的列索引（去重）
-        repaired_cols = list(dict.fromkeys(repaired_cols + extra_repaired))
-    else:
-        repaired_cols = []
-
     for c, idxs in enumerate(columns):
         LOGGER.info("C%d 点数: %d", c + 1, len(idxs))
 
-    vis = draw_visualization(image, dets, columns, lines=lines, repaired_cols=repaired_cols)
+    vis = draw_visualization(image, dets, columns)
 
     out_img = os.path.join(output_dir, "desk_detection_origin_walk_numbered.jpg")
     cv2.imwrite(out_img, vis)
@@ -1239,8 +874,8 @@ def parse_args():
     parser.add_argument("--model", type=str, default=default_model, help="桌子模型路径")
     parser.add_argument("--output-dir", type=str, default=default_output, help="输出目录")
     parser.add_argument("--device", type=str, default="0", help="推理设备，如 0/cpu")
-    parser.add_argument("--conf", type=float, default=0.6, help="置信度阈值")
-    parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU 阈值")
+    parser.add_argument("--conf", type=float, default=0.7, help="置信度阈值")
+    parser.add_argument("--iou", type=float, default=0.6, help="NMS IoU 阈值")
     parser.add_argument("--imgsz", type=int, default=1280, help="推理尺寸")
     parser.add_argument("--num-cols", type=int, default=5, help="列数（默认5）")
     parser.add_argument("--show", action="store_true", help="显示窗口")

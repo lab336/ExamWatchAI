@@ -3,12 +3,12 @@ data/
 *.mp4
 *.avi
 *.mov
-
+exam_seat_binding/weight
 # Model files
 model/
 *.pt
 *.weights
-
+exam_seat_binding/outputs
 # Python cache
 __pycache__/
 *.py[cod]
