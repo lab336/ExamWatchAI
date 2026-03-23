@@ -10,10 +10,10 @@ python detect/yolo11_detect_track.py --source data/clipped_00000000028000000.mp4
 python detect/yolo11_detect_track.py --source data/clipped_00000000028000000.mp4 --weights model/yolo11sbest.pt --track --tracker bytetrack.yaml --img-size 1280 --conf 0.18 --iou 0.6 --device 0 --half
 
 3) 用 BoT-SORT（更稳但略慢）:
-python detect/yolo11_detect_track.py --source data/clipped_00000000028000000.mp4 --weights model/yolo11sbest.pt --track --tracker botsort.yaml   --img-size 1280 --conf 0.18 --iou 0.6 --device 0 --half
+python detect/yolo11_detect_track.py --source data/clip_video/clipped_00000000028000000.mp4 --weights model/yolo11sbest.pt --track --tracker botsort.yaml   --img-size 2560 --conf 0.1 --iou 0.6 --device 0 --half
 
 4) 高分辨率小目标（教室远处人更稳）:
-python detect/yolo11_detect_track.py --source data/clipped_00000000028000000.mp4 --weights model/yolo11sbest.pt --track --img-size 1280 --conf 0.18 --iou 0.6 --device 0 --half
+python detect/yolo11_detect_track.py --source data/clip_video/clipped_00000000028000000.mp4 --weights model/yolo11sbest.pt --track --img-size 1280 --conf 0.18 --iou 0.6 --device 0 --half
 """
 
 import argparse

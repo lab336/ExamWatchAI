@@ -4,6 +4,7 @@ data/
 *.avi
 *.mov
 exam_seat_binding/weight
+output
 # Model files
 model/
 *.pt

@@ -145,7 +145,7 @@ def main():
     ap.add_argument("--half", action="store_true", help="FP16（仅GPU）")
     ap.add_argument("--classes", type=str, default="0", help="只检测的类别id，person一般是0")
 
-    # seat 状态机参数
+    # seat 状态机参数  python  detect/seat_count.py  -s data/clip_video/clipped_00000000028000000.mp4  -w model/best.pt  --seats detect/seats.json  --output detect/seatcount  --display
     ap.add_argument("--inc", type=float, default=0.15)
     ap.add_argument("--dec", type=float, default=0.03)
     ap.add_argument("--on", type=float, default=0.6)

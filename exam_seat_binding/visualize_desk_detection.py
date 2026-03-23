@@ -1,107 +1,36 @@
-# -*- coding: utf-8 -*-
 """
-桌子检测可视化脚本（5列中心点连线）
-=================================
-python exam_seat_binding/visualize_desk_detection_copy.py --image data/desk/originimages/room_first_frame.png --output-dir data/desk/output
-功能：
-1) 使用 exam_seat_binding/weight/yolov11_desk_model.pt 检测桌子
-2) 画出每个检测框与中心点
-3) 将中心点按 5 列分组
-4) 在每一列内按 y 从小到大连接中心点
+独立的YOLO11人群检测脚本
+可以将此脚本和模型权重移动到任何位置使用
+只需要: pip install ultralytics opencv-python
 
-运行方式（推荐）：
-python exam_seat_binding/visualize_desk_detection.py \
-  --image exam_seat_binding/weight/screenshot_01m57s719ms_frame002943.png \
-  --output-dir exam_seat_binding/outputs
+使用方法:
+1. 检测图片: python exam_seat_binding/standalone_detect.py --source data/desk/originimages/room_first_frame.png --weights exam_seat_binding/weight/yolo11desk.pt
+2. 检测视频: python exam_seat_binding/standalone_detect.py --source video.mp4 --weights exam_seat_binding/weight/yolo11desk.pt
+3. 检测摄像头: python exam_seat_binding/standalone_detect.py --source 0 --weights exam_seat_binding/weight/yolo11desk.pt
+4. 检测文件夹: python exam_seat_binding/standalone_detect.py --source data/desk/originimages --weights exam_seat_binding/weight/yolo11desk.pt
+5. 使用CPU: python exam_seat_binding/standalone_detect.py --source video.mp4 --weights exam_seat_binding/weight/yolo11desk.pt --device cpu
+6. 缩放图像: python exam_seat_binding/standalone_detect.py --source video.mp4 --weights exam_seat_binding/weight/yolo11desk.pt --img-size 1280
+7. 启用桌子排列策略(自动分列编号): python exam_seat_binding/standalone_detect.py --source data/desk/originimages --weights exam_seat_binding/weight/yolo11desk.pt --enable-desk-layout
+8. 指定列数: python exam_seat_binding/standalone_detect.py --source data/desk/originimages --weights exam_seat_binding/weight/yolo11desk.pt --enable-desk-layout --num-cols 5
 """
 
-import os
-import cv2
 import argparse
-import logging
-import importlib
-from typing import List, Dict, Tuple
-
+import os
+import sys
+from pathlib import Path
+import cv2
 import numpy as np
 from ultralytics import YOLO
-
-try:
-    _sk_cluster = importlib.import_module("sklearn.cluster")
-    _sk_linear = importlib.import_module("sklearn.linear_model")
-    KMeans = _sk_cluster.KMeans
-    RANSACRegressor = _sk_linear.RANSACRegressor
-    LinearRegression = _sk_linear.LinearRegression
-    SKLEARN_OK = True
-except Exception:
-    KMeans = None
-    RANSACRegressor = None
-    LinearRegression = None
-    SKLEARN_OK = False
-
+import logging
+from typing import List, Dict, Tuple
 
 LOGGER = logging.getLogger(__name__)
 
 
-def ensure_dir(path: str):
-    if path and (not os.path.exists(path)):
-        os.makedirs(path, exist_ok=True)
-
-
-def detect_desks(
-    image,
-    model_path: str,
-    conf: float = 0.6,
-    iou: float = 0.45,
-    device: str = "0",
-    imgsz: int = 1280,
-) -> List[Dict]:
-    """使用 YOLO 检测桌子，返回标准化结果。"""
-    model = YOLO(model_path)
-    results = model(image, conf=conf, iou=iou, imgsz=imgsz, device=device, verbose=False)
-
-    dets: List[Dict] = []
-    for result in results:
-        boxes = result.boxes
-        if boxes is None:
-            continue
-        for i in range(len(boxes)):
-            x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy().tolist()
-            score = float(boxes.conf[i].cpu().numpy())
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-            dets.append(
-                {
-                    "bbox": [x1, y1, x2, y2],
-                    "score": score,
-                    "center": [cx, cy],
-                }
-            )
-    return dets
-
-
-def split_into_columns_by_x(centers: np.ndarray, num_cols: int = 5) -> List[List[int]]:
-    """
-    按 x 坐标从左到右分列（等人数切分）。
-    返回每列对应的点索引列表。
-    """
-    n = len(centers)
-    if n == 0:
-        return [[] for _ in range(num_cols)]
-
-    order = np.argsort(centers[:, 0])
-    chunks = np.array_split(order, num_cols)
-    columns: List[List[int]] = [chunk.tolist() for chunk in chunks]
-
-    while len(columns) < num_cols:
-        columns.append([])
-    return columns[:num_cols]
-
+# ========== 桌子排列策略相关函数 ==========
 
 def fit_line_kb_positive(points: np.ndarray, min_k: float = 0.02) -> Tuple[float, float]:
-    """
-    拟合 y_up = kx + b（数学坐标，y_up=-y_img），并强制 k>0。
-    返回 (k, b)。
-    """
+    """拟合 y_up = kx + b（数学坐标，y_up=-y_img），并强制 k>0。返回 (k, b)。"""
     pts = np.asarray(points, dtype=np.float32)
     if len(pts) == 0:
         return 0.2, 0.0
@@ -130,9 +59,7 @@ def point_line_distance_kb(point: np.ndarray, line_kb: Tuple[float, float]) -> f
 
 
 def clip_line_kb_to_image(line_kb: Tuple[float, float], w: int, h: int):
-    """
-    将 y_up=kx+b 转到图像坐标 y_img=-kx-b，并裁剪到图像边界。
-    """
+    """将 y_up=kx+b 转到图像坐标 y_img=-kx-b，并裁剪到图像边界。"""
     k, b = line_kb
     pts = []
 
@@ -165,422 +92,6 @@ def clip_line_kb_to_image(line_kb: Tuple[float, float], w: int, h: int):
     y1 = int(round(-k * x1 - b))
     y2 = int(round(-k * x2 - b))
     return (x1, y1), (x2, y2)
-
-
-def find_bottom_row_seeds(centers: np.ndarray, num_cols: int = 5) -> List[int]:
-    """先找底排（y 最大）的5个点，按 x 从左到右作为5列种子。"""
-    n = len(centers)
-    if n == 0:
-        return []
-    k = min(num_cols, n)
-    bottom_ids = np.argsort(centers[:, 1])[::-1][:k]  # y 大 -> 近处底排
-    bottom_ids = sorted(bottom_ids.tolist(), key=lambda i: centers[i, 0])
-    return bottom_ids
-
-
-def estimate_global_slope_positive(centers: np.ndarray) -> float:
-    """估计全局正斜率 k（数学坐标 y_up = kx + b）。"""
-    n = len(centers)
-    if n < 4:
-        return 0.2
-
-    k = max(2, n // 5)
-    bottom = centers[np.argsort(centers[:, 1])[::-1][:k]]
-    top = centers[np.argsort(centers[:, 1])[:k]]
-
-    all_pts = np.vstack([bottom, top]).astype(np.float32)
-    k_est, _ = fit_line_kb_positive(all_pts, min_k=0.02)
-    return float(max(0.02, k_est))
-
-
-def split_into_columns_by_fitted_lines(
-    centers: np.ndarray,
-    num_cols: int = 5,
-    num_iters: int = 10,
-    expected_per_col: int = 6,
-) -> Tuple[List[List[int]], List[Tuple[float, float]], List[int]]:
-    """
-    先用底排5个点初始化5条列线，再迭代重分配并拟合。
-    返回: columns, lines, seeds
-    """
-    n = len(centers)
-    if n == 0:
-        return [[] for _ in range(num_cols)], [], []
-
-    seeds = find_bottom_row_seeds(centers, num_cols=num_cols)
-    if len(seeds) < num_cols:
-        return split_into_columns_by_x(centers, num_cols=num_cols), [], seeds
-
-    k_global = estimate_global_slope_positive(centers)
-
-    # 初始化5条直线（都过底排点，形式 y_up = kx + b）
-    lines = []
-    for sid in seeds:
-        x0, y0 = centers[sid]
-        y_up0 = -float(y0)
-        b0 = y_up0 - k_global * float(x0)
-        lines.append((float(k_global), float(b0)))
-
-    labels = np.full((n,), -1, dtype=np.int32)
-
-    for _ in range(num_iters):
-        # 1) 按“点到线距离 + 容量惩罚”分配
-        counts = [0 for _ in range(num_cols)]
-        process_order = np.argsort(centers[:, 1])[::-1]  # 先分配底排
-
-        for idx in process_order:
-            p = centers[idx]
-
-            # 底排种子固定到对应列
-            if idx in seeds:
-                c_fix = seeds.index(int(idx))
-                labels[idx] = c_fix
-                counts[c_fix] += 1
-                continue
-
-            best_c = 0
-            best_cost = 1e18
-            for c in range(num_cols):
-                d = point_line_distance_kb(p, lines[c])
-                penalty = 6.0 * max(0, counts[c] - expected_per_col + 1) ** 2
-                cost = d + penalty
-                if cost < best_cost:
-                    best_cost = cost
-                    best_c = c
-
-            labels[idx] = best_c
-            counts[best_c] += 1
-
-        # 2) 重拟合每列直线
-        new_lines = []
-        for c in range(num_cols):
-            idxs = np.where(labels == c)[0]
-            if len(idxs) == 0:
-                sid = seeds[c]
-                x0, y0 = centers[sid]
-                y_up0 = -float(y0)
-                b0 = y_up0 - k_global * float(x0)
-                new_lines.append((float(k_global), float(b0)))
-            else:
-                new_lines.append(fit_line_kb_positive(centers[idxs], min_k=0.02))
-
-        # 若列顺序错位，按底部交点 x 重新排序为 C1..C5
-        y_ref = float(np.max(centers[:, 1]))
-        y_ref_up = -y_ref
-        x_at_ref = []
-        for line in new_lines:
-            k_line, b_line = line
-            if abs(k_line) < 1e-8:
-                x_at_ref.append(1e9)
-            else:
-                x_at_ref.append((y_ref_up - b_line) / k_line)
-        order = np.argsort(np.array(x_at_ref))
-
-        remap = {int(old): int(new) for new, old in enumerate(order.tolist())}
-        labels = np.array([remap[int(l)] for l in labels], dtype=np.int32)
-        lines = [new_lines[i] for i in order]
-
-    columns = []
-    for c in range(num_cols):
-        idxs = np.where(labels == c)[0].tolist()
-        # 列内按 y 从大到小（底排 -> 顶排）
-        idxs = sorted(idxs, key=lambda i: centers[i, 1], reverse=True)
-        columns.append(idxs)
-
-    # 强制每列尽量 6 点：超出的列把“离本列直线最远点”转移到不足列
-    target = expected_per_col
-    for _ in range(200):
-        counts = [len(c) for c in columns]
-        over_cols = [i for i, cnt in enumerate(counts) if cnt > target]
-        under_cols = [i for i, cnt in enumerate(counts) if cnt < target]
-        if not over_cols or not under_cols:
-            break
-
-        src = over_cols[0]
-        dst = under_cols[0]
-
-        # src 中选一个最适合搬到 dst 的点
-        best_idx = None
-        best_gain = -1e18
-        for idx in columns[src]:
-            p = centers[idx]
-            d_src = point_line_distance_kb(p, lines[src])
-            d_dst = point_line_distance_kb(p, lines[dst])
-            gain = d_src - d_dst
-            if gain > best_gain:
-                best_gain = gain
-                best_idx = idx
-
-        if best_idx is None:
-            break
-
-        columns[src].remove(best_idx)
-        columns[dst].append(best_idx)
-
-        # 更新两列直线
-        if len(columns[src]) > 0:
-            lines[src] = fit_line_kb_positive(centers[np.array(columns[src], dtype=np.int32)], min_k=0.02)
-        if len(columns[dst]) > 0:
-            lines[dst] = fit_line_kb_positive(centers[np.array(columns[dst], dtype=np.int32)], min_k=0.02)
-
-    # 最终截断/排序，保证每列最多6点
-    for c in range(num_cols):
-        columns[c] = sorted(columns[c], key=lambda i: centers[i, 1], reverse=True)
-        if len(columns[c]) > target:
-            columns[c] = columns[c][:target]
-
-    # 最终根据列点重拟合一次，保证输出线与展示一致
-    for c in range(num_cols):
-        if len(columns[c]) > 0:
-            lines[c] = fit_line_kb_positive(centers[np.array(columns[c], dtype=np.int32)], min_k=0.02)
-
-    return columns, lines, seeds
-
-
-def _rebalance_columns_to_target(
-    centers: np.ndarray,
-    columns: List[List[int]],
-    lines: List[Tuple[float, float]],
-    target: int = 6,
-):
-    """把各列点数尽量平衡为 target（通常=6）。"""
-    num_cols = len(columns)
-
-    for _ in range(300):
-        counts = [len(c) for c in columns]
-        over_cols = [i for i, cnt in enumerate(counts) if cnt > target]
-        under_cols = [i for i, cnt in enumerate(counts) if cnt < target]
-        if not over_cols or not under_cols:
-            break
-
-        src = over_cols[0]
-        dst = under_cols[0]
-
-        best_idx = None
-        best_gain = -1e18
-        for idx in columns[src]:
-            p = centers[idx]
-            d_src = point_line_distance_kb(p, lines[src])
-            d_dst = point_line_distance_kb(p, lines[dst])
-            gain = d_src - d_dst
-            if gain > best_gain:
-                best_gain = gain
-                best_idx = idx
-
-        if best_idx is None:
-            break
-
-        columns[src].remove(best_idx)
-        columns[dst].append(best_idx)
-
-        if len(columns[src]) > 0:
-            lines[src] = fit_line_kb_positive(centers[np.array(columns[src], dtype=np.int32)], min_k=0.02)
-        if len(columns[dst]) > 0:
-            lines[dst] = fit_line_kb_positive(centers[np.array(columns[dst], dtype=np.int32)], min_k=0.02)
-
-    # 截断并排序（底->顶）
-    for c in range(num_cols):
-        columns[c] = sorted(columns[c], key=lambda i: centers[i, 1], reverse=True)
-        if len(columns[c]) > target:
-            columns[c] = columns[c][:target]
-        if len(columns[c]) > 0:
-            lines[c] = fit_line_kb_positive(centers[np.array(columns[c], dtype=np.int32)], min_k=0.02)
-
-
-def split_into_columns_by_kmeans_x(
-    centers: np.ndarray,
-    num_cols: int = 5,
-    expected_per_col: int = 6,
-) -> Tuple[List[List[int]], List[Tuple[float, float]], List[int]]:
-    """
-    方法1：KMeans 对中心点 x 做聚类分列（K=5），然后每列拟合直线。
-    """
-    n = len(centers)
-    if n == 0:
-        return [[] for _ in range(num_cols)], [], []
-
-    x_feat = centers[:, 0].reshape(-1, 1).astype(np.float32)
-
-    if SKLEARN_OK:
-        km = KMeans(n_clusters=num_cols, random_state=0, n_init=20)
-        labels = km.fit_predict(x_feat)
-        cxs = km.cluster_centers_.reshape(-1)
-    else:
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 0.1)
-        _, lbl, ctr = cv2.kmeans(x_feat, num_cols, None, criteria, 20, cv2.KMEANS_PP_CENTERS)
-        labels = lbl.reshape(-1)
-        cxs = ctr.reshape(-1)
-
-    order = np.argsort(cxs)
-    remap = {int(old): int(new) for new, old in enumerate(order.tolist())}
-    labels = np.array([remap[int(l)] for l in labels], dtype=np.int32)
-
-    columns = []
-    lines = []
-    seeds = []
-
-    for c in range(num_cols):
-        idxs = np.where(labels == c)[0].tolist()
-        idxs = sorted(idxs, key=lambda i: centers[i, 1], reverse=True)
-        columns.append(idxs)
-
-        if len(idxs) > 0:
-            line = fit_line_kb_positive(centers[np.array(idxs, dtype=np.int32)], min_k=0.02)
-            lines.append(line)
-            seeds.append(idxs[0])  # 底排点
-        else:
-            lines.append((0.02, 0.0))
-
-    _rebalance_columns_to_target(centers, columns, lines, target=expected_per_col)
-
-    # 更新 seeds
-    seeds = []
-    for c in range(num_cols):
-        seeds.append(columns[c][0] if len(columns[c]) > 0 else 0)
-
-    return columns, lines, seeds
-
-
-def _projection_t_from_seed(point: np.ndarray, line_kb: Tuple[float, float], seed_point: np.ndarray) -> float:
-    """沿列线方向的投影参数 t（用于列内排序）。"""
-    k, _ = line_kb
-    d = np.array([1.0, k], dtype=np.float64)
-    d = d / (np.linalg.norm(d) + 1e-8)
-
-    p = np.array([float(point[0]), -float(point[1])], dtype=np.float64)
-    p0 = np.array([float(seed_point[0]), -float(seed_point[1])], dtype=np.float64)
-    return float(np.dot(p - p0, d))
-
-
-def split_into_columns_by_ransac_projection(
-    centers: np.ndarray,
-    num_cols: int = 5,
-    num_iters: int = 12,
-    expected_per_col: int = 6,
-) -> Tuple[List[List[int]], List[Tuple[float, float]], List[int]]:
-    """
-    方法2：RANSAC 拟合5条列线 + 点投影排序。
-    """
-    n = len(centers)
-    if n == 0:
-        return [[] for _ in range(num_cols)], [], []
-
-    seeds = find_bottom_row_seeds(centers, num_cols=num_cols)
-    if len(seeds) < num_cols:
-        return split_into_columns_by_kmeans_x(centers, num_cols=num_cols, expected_per_col=expected_per_col)
-
-    k_global = estimate_global_slope_positive(centers)
-    lines: List[Tuple[float, float]] = []
-
-    # 初始化线
-    for sid in seeds:
-        x0, y0 = centers[sid]
-        b0 = -float(y0) - k_global * float(x0)
-        lines.append((float(k_global), float(b0)))
-
-    labels = np.full((n,), -1, dtype=np.int32)
-
-    for _ in range(num_iters):
-        # 分配
-        counts = [0 for _ in range(num_cols)]
-        order_points = np.argsort(centers[:, 1])[::-1]
-        for idx in order_points:
-            p = centers[idx]
-            if idx in seeds:
-                c_fix = seeds.index(int(idx))
-                labels[idx] = c_fix
-                counts[c_fix] += 1
-                continue
-
-            best_c = 0
-            best_cost = 1e18
-            for c in range(num_cols):
-                d = point_line_distance_kb(p, lines[c])
-                penalty = 6.0 * max(0, counts[c] - expected_per_col + 1) ** 2
-                cost = d + penalty
-                if cost < best_cost:
-                    best_cost = cost
-                    best_c = c
-            labels[idx] = best_c
-            counts[best_c] += 1
-
-        # RANSAC 重拟合
-        new_lines: List[Tuple[float, float]] = []
-        for c in range(num_cols):
-            idxs = np.where(labels == c)[0]
-            if len(idxs) == 0:
-                sid = seeds[c]
-                x0, y0 = centers[sid]
-                b0 = -float(y0) - k_global * float(x0)
-                new_lines.append((float(k_global), float(b0)))
-                continue
-
-            pts = centers[idxs]
-            x = pts[:, 0].reshape(-1, 1)
-            y_up = -pts[:, 1]
-
-            if SKLEARN_OK and len(idxs) >= 3:
-                try:
-                    ransac = RANSACRegressor(
-                        estimator=LinearRegression(),
-                        min_samples=max(2, len(idxs) // 2),
-                        residual_threshold=12.0,
-                        random_state=0,
-                    )
-                    ransac.fit(x, y_up)
-                    k = float(ransac.estimator_.coef_[0])
-                    b = float(ransac.estimator_.intercept_)
-                    k = max(0.02, k)
-                    b = float(np.mean(y_up - k * pts[:, 0]))
-                    new_lines.append((k, b))
-                except Exception:
-                    new_lines.append(fit_line_kb_positive(pts, min_k=0.02))
-            else:
-                new_lines.append(fit_line_kb_positive(pts, min_k=0.02))
-
-        # 左到右重排
-        y_ref = float(np.max(centers[:, 1]))
-        y_ref_up = -y_ref
-        x_at_ref = []
-        for k_line, b_line in new_lines:
-            if abs(k_line) < 1e-8:
-                x_at_ref.append(1e9)
-            else:
-                x_at_ref.append((y_ref_up - b_line) / k_line)
-        order_cols = np.argsort(np.array(x_at_ref))
-
-        remap = {int(old): int(new) for new, old in enumerate(order_cols.tolist())}
-        labels = np.array([remap[int(l)] for l in labels], dtype=np.int32)
-        lines = [new_lines[i] for i in order_cols]
-
-    columns = []
-    for c in range(num_cols):
-        idxs = np.where(labels == c)[0].tolist()
-        if len(idxs) == 0:
-            columns.append([])
-            continue
-
-        # 投影排序（底->顶）
-        seed_idx = max(idxs, key=lambda i: centers[i, 1])
-        seed_p = centers[seed_idx]
-        idxs = sorted(idxs, key=lambda i: _projection_t_from_seed(centers[i], lines[c], seed_p))
-        columns.append(idxs)
-
-    _rebalance_columns_to_target(centers, columns, lines, target=expected_per_col)
-
-    # 最终按投影排序并更新 seeds
-    seeds = []
-    for c in range(num_cols):
-        if len(columns[c]) == 0:
-            seeds.append(0)
-            continue
-        seed_idx = max(columns[c], key=lambda i: centers[i, 1])
-        seed_p = centers[seed_idx]
-        columns[c] = sorted(columns[c], key=lambda i: _projection_t_from_seed(centers[i], lines[c], seed_p))
-        columns[c] = sorted(columns[c], key=lambda i: centers[i, 1], reverse=True)
-        seeds.append(columns[c][0])
-
-    return columns, lines, seeds
 
 
 def _dist_to_origin(pt: np.ndarray) -> float:
@@ -648,13 +159,7 @@ def split_into_columns_by_origin_walk(
     num_cols: int = 5,
     expected_per_col: int = 6,
 ) -> Tuple[List[List[int]], List[Tuple[float, float]], List[int]]:
-    """
-    方法3（用户指定）：
-    1) 第一列头点：x 最小且距离原点最近
-    2) 同列向上找点：x 变小 + y 变小 + 距离原点近
-    3) 下一列头点：相对上一列头点 x 变大 + y 变大 且距离原点最近
-    4) 重复得到 5 列，每列目标 6 点
-    """
+    """桌子分列算法（原点距离+方向约束）。"""
     n = len(centers)
     if n == 0:
         return [[] for _ in range(num_cols)], [], []
@@ -675,7 +180,7 @@ def split_into_columns_by_origin_walk(
             remaining.remove(head)
 
         cur = head
-        # 同列补到 6 点
+        # 同列补到 expected_per_col 点
         for _ in range(expected_per_col - 1):
             nxt = _pick_next_in_same_column(centers, remaining, cur)
             if nxt < 0:
@@ -691,7 +196,7 @@ def split_into_columns_by_origin_walk(
         if c < num_cols - 1:
             head = _pick_next_column_head(centers, remaining, seeds[-1])
 
-    # 将剩余点分配到最近列线（若某列不足6）
+    # 将剩余点分配到最近列线
     lines: List[Tuple[float, float]] = []
     for c in range(num_cols):
         if len(columns[c]) > 0:
@@ -700,7 +205,7 @@ def split_into_columns_by_origin_walk(
         else:
             lines.append((0.02, 0.0))
 
-    # 先把剩余点按最近直线分配
+    # 分配剩余点
     for idx in list(remaining):
         p = centers[idx]
         best_c = 0
@@ -711,9 +216,6 @@ def split_into_columns_by_origin_walk(
                 best_d = d
                 best_c = c
         columns[best_c].append(idx)
-
-    # 平衡到每列 6 点
-    _rebalance_columns_to_target(centers, columns, lines, target=expected_per_col)
 
     # 列内排序：底->顶
     for c in range(num_cols):
@@ -742,522 +244,592 @@ def split_into_columns_by_origin_walk(
     return columns, lines, seeds
 
 
-# ─── 误检测列修复：平移拟合 ─────────────────────────────────────────────
-
-
-def repair_columns_by_translation(
-    centers: np.ndarray,
-    columns: List[List[int]],
-    lines: List[Tuple[float, float]],
-    num_cols: int = 5,
-    max_mean_residual: float = 20.0,
-    max_single_residual: float = 40.0,
-    inlier_threshold: float = 35.0,
-) -> Tuple[List[List[int]], List[Tuple[float, float]], List[int]]:
-    """
-    误检测列修复——平移策略。
-
-    当某列的拟合直线质量差（均值残差 > max_mean_residual 或单点最大残差 > max_single_residual）
-    时视为"坏列"，处理策略：
-      1. 找出所有"好列"（低残差），计算相邻好列之间的 x 间距中位数 col_dx；
-      2. 以最近好列（优先左侧，即第一列或误检前一列）为参考，
-         按列索引差 * col_dx 平移其直线到坏列期望位置；
-      3. 用平移后的新直线替换坏列的拟合线；
-      4. 剔除坏列内距新线 > inlier_threshold 的离群点（误检测桌子）。
-
-    返回: (repaired_columns, repaired_lines, bad_col_indices)
-    """
-    if len(centers) == 0:
-        return columns, lines, []
-
-    # 以底部最大 y 为参考，计算各列在参考 y 处的 x 位置
-    y_ref = float(np.max(centers[:, 1]))
-    y_ref_up = -y_ref
-
-    def _line_x_at_ref(kb: Tuple[float, float]) -> float:
-        k, b = kb
-        return (y_ref_up - b) / k if abs(k) > 1e-8 else 1e9
-
-    x_at_ref = [_line_x_at_ref(lines[c]) for c in range(num_cols)]
-
-    # 计算各列到本列拟合线的均值/最大残差
-    def _col_residuals(c: int) -> np.ndarray:
-        if len(columns[c]) == 0:
-            return np.array([0.0])
-        pts = centers[np.array(columns[c], dtype=np.int32)]
-        return np.array([point_line_distance_kb(p, lines[c]) for p in pts])
-
-    mean_res = [float(np.mean(_col_residuals(c))) for c in range(num_cols)]
-    max_res_list = [float(np.max(_col_residuals(c))) for c in range(num_cols)]
-
-    good_flags = [
-        (
-            mean_res[c] <= max_mean_residual
-            and max_res_list[c] <= max_single_residual
-            and len(columns[c]) >= 2
+class StandaloneDetector:
+    """独立的YOLO检测器（含桌子排列策略）"""
+    
+    def __init__(self, weights_path, conf_threshold=0.25, iou_threshold=0.45, device='', img_size=None, half=False, enable_desk_layout=False, num_cols=5):
+        """
+        初始化检测器
+        
+        Args:
+            weights_path: 模型权重文件路径
+            conf_threshold: 置信度阈值
+            iou_threshold: NMS的IOU阈值
+            device: 设备选择 ('cpu', 'cuda', '0', '1' 等)
+            img_size: 推理图像尺寸，如果为None则使用原始尺寸
+            half: 是否使用半精度(FP16)推理，可以减少显存并避免某些CUDA错误
+        """
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"权重文件不存在: {weights_path}")
+        
+        print(f"正在加载模型: {weights_path}")
+        
+        # 清理CUDA缓存
+        if self._check_cuda():
+            self._clear_cuda_cache()
+        
+        self.model = YOLO(weights_path)
+        self.conf_threshold = conf_threshold
+        self.iou_threshold = iou_threshold
+        self.device = device if device else ('cuda' if self._check_cuda() else 'cpu')
+        self.img_size = img_size
+        self.half = half and 'cuda' in str(self.device)  # 只在GPU上使用半精度
+        self.enable_desk_layout = enable_desk_layout  # 是否启用桌子排列策略
+        self.num_cols = num_cols  # 列数
+        
+        # 再次清理CUDA缓存
+        if 'cuda' in str(self.device):
+            self._clear_cuda_cache()
+        
+        print(f"模型加载成功!")
+        print(f"使用设备: {self.device}")
+        if self.img_size:
+            print(f"推理图像尺寸: {self.img_size}")
+        if self.half:
+            print(f"使用半精度(FP16)推理")
+        
+        # 显示GPU信息
+        if 'cuda' in str(self.device):
+            self._print_gpu_info()
+    
+    def _check_cuda(self):
+        """检查CUDA是否可用"""
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except:
+            return False
+    
+    def _clear_cuda_cache(self):
+        """清理CUDA缓存"""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+                print("已清理CUDA缓存")
+        except Exception as e:
+            pass
+    
+    def _print_gpu_info(self):
+        """打印GPU信息"""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_id = 0 if self.device == 'cuda' else int(self.device)
+                gpu_name = torch.cuda.get_device_name(gpu_id)
+                total_memory = torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3
+                allocated = torch.cuda.memory_allocated(gpu_id) / 1024**3
+                cached = torch.cuda.memory_reserved(gpu_id) / 1024**3
+                print(f"GPU: {gpu_name}")
+                print(f"总显存: {total_memory:.2f} GB")
+                print(f"已分配: {allocated:.2f} GB")
+                print(f"已缓存: {cached:.2f} GB")
+        except Exception as e:
+            pass
+        
+    def detect_image(self, image_path, save_dir="output"):
+        """
+        检测单张图片
+        
+        Args:
+            image_path: 图片路径
+            save_dir: 结果保存目录
+        """
+        if not os.path.exists(image_path):
+            print(f"警告: 图片不存在 - {image_path}")
+            return None
+        
+        # 创建输出目录
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 运行检测
+        results = self.model.predict(
+            source=image_path,
+            conf=self.conf_threshold,
+            iou=self.iou_threshold,
+            save=False,
+            verbose=False,
+            device=self.device,
+            imgsz=self.img_size or 640,
+            half=self.half
         )
-        for c in range(num_cols)
-    ]
-    good_cols = [c for c in range(num_cols) if good_flags[c]]
-    bad_cols = [c for c in range(num_cols) if not good_flags[c]]
-
-    LOGGER.info(
-        "列质量评估 — 好列: C%s  坏列: C%s",
-        "/".join(str(c + 1) for c in good_cols),
-        "/".join(str(c + 1) for c in bad_cols) or "无",
-    )
-    for c in range(num_cols):
-        LOGGER.info("  C%d 均值残差=%.1f  最大残差=%.1f", c + 1, mean_res[c], max_res_list[c])
-
-    if not bad_cols:
-        return columns, lines, []
-
-    if len(good_cols) < 2:
-        LOGGER.warning("好列数 < 2，无法估算列间距，跳过平移修复。")
-        return columns, lines, bad_cols
-
-    # 计算相邻好列之间每列索引差1的 x 间距，取中位数作为 col_dx
-    spacings = [
-        (x_at_ref[good_cols[i + 1]] - x_at_ref[good_cols[i]])
-        / (good_cols[i + 1] - good_cols[i])
-        for i in range(len(good_cols) - 1)
-    ]
-    col_dx = float(np.median(spacings))
-    # 使用好列的中位斜率作为公共斜率
-    good_k = float(np.median([lines[c][0] for c in good_cols]))
-
-    LOGGER.info("估算列间距 col_dx=%.1f px  公共斜率 k=%.4f", col_dx, good_k)
-
-    new_columns = [col[:] for col in columns]
-    new_lines = list(lines)
-
-    for bad_c in bad_cols:
-        # 优先取左侧最近好列（从第一列或误检前一列出发），退而取右侧
-        left_good = [c for c in good_cols if c < bad_c]
-        right_good = [c for c in good_cols if c > bad_c]
-        ref_c = left_good[-1] if left_good else (right_good[0] if right_good else None)
-        if ref_c is None:
-            continue
-
-        # 期望 x = 参考列 x + 列索引差 * col_dx
-        delta = bad_c - ref_c
-        expected_x = x_at_ref[ref_c] + delta * col_dx
-
-        # 用公共斜率 + 期望 x 重建平移直线（y_ref_up = k * x + b）
-        new_b = y_ref_up - good_k * expected_x
-        new_lines[bad_c] = (float(good_k), float(new_b))
-
-        # 剔除坏列内的离群点（误检测桌子），只保留在新线附近的点
-        inliers = [
-            idx for idx in new_columns[bad_c]
-            if point_line_distance_kb(centers[idx], new_lines[bad_c]) <= inlier_threshold
-        ]
-        new_columns[bad_c] = sorted(inliers, key=lambda i: centers[i, 1], reverse=True)
-
-        new_mean = (
-            float(np.mean([
-                point_line_distance_kb(centers[i], new_lines[bad_c])
-                for i in new_columns[bad_c]
-            ]))
-            if new_columns[bad_c] else 0.0
-        )
-        LOGGER.info(
-            "  C%d 修复：基于 C%d 平移 %+.1f px | 均值残差 %.1f→%.1f | 点数 %d→%d",
-            bad_c + 1, ref_c + 1, delta * col_dx,
-            mean_res[bad_c], new_mean,
-            len(columns[bad_c]), len(new_columns[bad_c]),
-        )
-
-    return new_columns, new_lines, bad_cols
-
-
-# ─── 误检测列修复：去首点重拟合 + 延长线找真实第一个点 ───────────────────
-
-
-def repair_columns_by_drop_refit(
-    centers: np.ndarray,
-    dets: List[Dict],
-    columns: List[List[int]],
-    lines: List[Tuple[float, float]],
-    num_cols: int = 5,
-    max_mean_residual: float = 20.0,
-    max_single_residual: float = 40.0,
-    corner_proximity: float = 120.0,
-    line_proximity: float = 30.0,
-) -> Tuple[List[List[int]], List[Tuple[float, float]], List[int]]:
-    """
-    坏列修复——去首点重拟合 + 延长线搜索真实第一个点。
-
-    策略：
-      1. 检测列拟合线是否"不直"（均值残差/最大残差超阈值）；
-      2. 逐步去掉头部点（最多去掉前 max_drop 个），找到使重拟合质量达标的最少去除数；
-      3. 沿列线延长方向估算被去掉的第一个真实点的期望位置；
-      4. 在所有检测框中双重搜索匹配框：
-         a) 框的左上角(x1,y1)、右下角(x2,y2) 或中心点距期望位置 < corner_proximity；
-         b) 框中心距新拟合线 < line_proximity，且 y 坐标在期望范围内；
-      5. 找到则以该框作为本列新的第一点并整体重拟合；否则保留去首点结果。
-
-    返回: (repaired_columns, repaired_lines, repaired_col_indices)
-    """
-    if len(centers) == 0:
-        return columns, lines, []
-
-    def _col_residuals(c: int) -> np.ndarray:
-        if len(columns[c]) == 0:
-            return np.array([0.0])
-        pts = centers[np.array(columns[c], dtype=np.int32)]
-        return np.array([point_line_distance_kb(p, lines[c]) for p in pts])
-
-    mean_res = [float(np.mean(_col_residuals(c))) for c in range(num_cols)]
-    max_res_list = [float(np.max(_col_residuals(c))) for c in range(num_cols)]
-
-    bad_cols = [
-        c for c in range(num_cols)
-        if mean_res[c] > max_mean_residual or max_res_list[c] > max_single_residual
-    ]
-
-    LOGGER.info(
-        "[drop-refit] 列质量评估 — 需修复: C%s",
-        "/".join(str(c + 1) for c in bad_cols) or "无",
-    )
-    for c in range(num_cols):
-        LOGGER.info("  C%d 均值残差=%.1f  最大残差=%.1f", c + 1, mean_res[c], max_res_list[c])
-
-    if not bad_cols:
-        return columns, lines, []
-
-    new_columns = [col[:] for col in columns]
-    new_lines = list(lines)
-    repaired: List[int] = []
-
-    for bad_c in bad_cols:
-        col = sorted(columns[bad_c], key=lambda i: centers[i, 1], reverse=True)
-        if len(col) < 3:
-            LOGGER.warning("  C%d 点数不足(%d)，跳过 drop-refit", bad_c + 1, len(col))
-            continue
-
-        # ── Step 1: 逐步去头部点，找到使线质量达标的最少去除数 ────────────
-        max_drop = min(3, len(col) - 2)  # 最多去掉3个，保留至少2个
-        best_remaining: List[int] = []
-        best_drop_n: int = 0
-        best_refit_line: Tuple[float, float] = lines[bad_c]
-        found_good_refit = False
-
-        for drop_n in range(1, max_drop + 1):
-            remaining = col[drop_n:]
-            if len(remaining) < 2:
-                break
-            pts_rem = centers[np.array(remaining, dtype=np.int32)]
-            candidate_line = fit_line_kb_positive(pts_rem, min_k=0.02)
-            res_after = [point_line_distance_kb(centers[i], candidate_line) for i in remaining]
-            mean_after = float(np.mean(res_after))
-            max_after = float(np.max(res_after))
-            if mean_after <= max_mean_residual and max_after <= max_single_residual:
-                best_remaining = remaining
-                best_drop_n = drop_n
-                best_refit_line = candidate_line
-                found_good_refit = True
-                LOGGER.info(
-                    "  C%d 去掉前 %d 个点后线质量达标（均值残差=%.1f）",
-                    bad_c + 1, drop_n, mean_after,
-                )
-                break
-
-        if not found_good_refit:
-            LOGGER.warning(
-                "  C%d 去掉前 %d 个点后仍不好，跳过 drop-refit",
-                bad_c + 1, max_drop,
-            )
-            continue
-
-        # ── Step 2: 估算被去掉的第一个点的期望位置 ────────────────────────
-        # 用相邻点间距中位数估算行间距
-        row_vecs = [
-            centers[best_remaining[j]] - centers[best_remaining[j + 1]]
-            for j in range(min(len(best_remaining) - 1, 3))
-        ]
-        row_dists = [float(np.linalg.norm(v)) for v in row_vecs]
-        avg_spacing = float(np.median(row_dists)) if row_dists else 80.0
-
-        p0 = centers[best_remaining[0]]  # 最底部（最大 y）
-        p1 = centers[best_remaining[1]] if len(best_remaining) > 1 else p0
-        dir_vec = p0 - p1
-        dir_norm = float(np.linalg.norm(dir_vec))
-        dir_unit = dir_vec / (dir_norm + 1e-8)
-
-        # 每去掉一个点就向下延伸一个行间距
-        expected_pos = p0 + dir_unit * avg_spacing * best_drop_n
-
-        LOGGER.info(
-            "  C%d 期望第一点位置: (%.1f, %.1f)，行间距=%.1f",
-            bad_c + 1, float(expected_pos[0]), float(expected_pos[1]), avg_spacing,
-        )
-
-        # ── Step 3: 双重搜索——角点距离 + 直线投影距离 ───────────────────
-        remaining_set = set(best_remaining)
-        # 期望 y 范围：允许 ±1 个行间距的误差
-        y_lo = float(expected_pos[1]) - avg_spacing * 1.2
-        y_hi = float(expected_pos[1]) + avg_spacing * 1.2
-
-        best_idx: int = -1
-        best_score: float = 1e18  # 越小越好
-
-        for det_i, det in enumerate(dets):
-            if det_i in remaining_set:
-                continue
-            x1, y1, x2, y2 = det["bbox"]
-            cx, cy = det["center"]
-
-            # 判据 a) 角点/中心距期望位置
-            corners = [
-                np.array([x1, y1], dtype=np.float32),
-                np.array([x2, y2], dtype=np.float32),
-                np.array([cx, cy], dtype=np.float32),
-            ]
-            d_corner = min(float(np.linalg.norm(pt - expected_pos)) for pt in corners)
-
-            # 判据 b) 中心点到新拟合线的距离 + y 范围内
-            d_line = point_line_distance_kb(np.array([cx, cy], dtype=np.float32), best_refit_line)
-            in_y_range = y_lo <= cy <= y_hi
-
-            # 综合得分：角点距离优先，线距作为辅助
-            if d_corner < corner_proximity:
-                score = d_corner  # 角点命中，直接计分
-            elif in_y_range and d_line < line_proximity:
-                score = d_line + corner_proximity  # 线距命中，分数较高（保留用于兜底）
-            else:
-                continue
-
-            if score < best_score:
-                best_score = score
-                best_idx = det_i
-
-        # ── Step 4: 更新列 ─────────────────────────────────────────────────
-        if best_idx >= 0:
-            final_col = [best_idx] + list(best_remaining)
-            pts_all = centers[np.array(final_col, dtype=np.int32)]
-            final_line = fit_line_kb_positive(pts_all, min_k=0.02)
-            final_mean = float(np.mean(
-                [point_line_distance_kb(centers[i], final_line) for i in final_col]
-            ))
-            hit_type = "角点" if best_score < corner_proximity else "线距"
-            LOGGER.info(
-                "  C%d 找到真实第一点 det[%d]（%s，score=%.1f）| 均值残差 %.1f→%.1f | 点数 %d",
-                bad_c + 1, best_idx, hit_type, best_score,
-                mean_res[bad_c], final_mean, len(final_col),
-            )
-            new_columns[bad_c] = final_col
-            new_lines[bad_c] = final_line
+        
+        # 获取结果
+        result = results[0]
+        boxes = result.boxes
+        
+        # 读取原图
+        img = cv2.imread(image_path)
+        
+        # 如果启用桌子排列策略
+        if self.enable_desk_layout and len(boxes) > 0:
+            # 提取中心点
+            centers = []
+            for box in boxes:
+                x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                centers.append([cx, cy])
+            centers = np.array(centers, dtype=np.float32)
+            
+            # 执行分列算法
+            columns, lines, seeds = split_into_columns_by_origin_walk(centers, num_cols=self.num_cols)
+            
+            # 绘制带排列策略的结果
+            annotated_img = self._draw_boxes_with_layout(img, boxes, columns, lines)
+            
+            # 打印分列信息
+            for c, idxs in enumerate(columns):
+                print(f"第{c+1}列: {len(idxs)}个桌子")
         else:
-            final_mean = float(np.mean(
-                [point_line_distance_kb(centers[i], best_refit_line) for i in best_remaining]
-            ))
-            LOGGER.info(
-                "  C%d 未找到匹配点，保留去头点结果 | 均值残差 %.1f→%.1f | 点数 %d→%d",
-                bad_c + 1,
-                mean_res[bad_c], final_mean,
-                len(col), len(best_remaining),
+            # 绘制普通检测框
+            annotated_img = self._draw_boxes(img, boxes)
+        
+        # 保存结果
+        filename = Path(image_path).name
+        suffix = "_layout" if self.enable_desk_layout else ""
+        output_path = os.path.join(save_dir, f"detected{suffix}_{filename}")
+        cv2.imwrite(output_path, annotated_img)
+        
+        # 打印检测信息
+        num_detections = len(boxes)
+        print(f"检测到 {num_detections} 个目标 - 保存至: {output_path}")
+        
+        return annotated_img, boxes
+    
+    def detect_video(self, video_path, save_dir="output", display=False):
+        """
+        检测视频
+        
+        Args:
+            video_path: 视频路径 (或摄像头ID, 如0)
+            save_dir: 结果保存目录
+            display: 是否实时显示
+        """
+        # 打开视频
+        if isinstance(video_path, int) or video_path.isdigit():
+            cap = cv2.VideoCapture(int(video_path))
+            video_name = f"camera_{video_path}"
+        else:
+            if not os.path.exists(video_path):
+                print(f"警告: 视频不存在 - {video_path}")
+                return
+            cap = cv2.VideoCapture(video_path)
+            video_name = Path(video_path).stem
+        
+        if not cap.isOpened():
+            print(f"错误: 无法打开视频 - {video_path}")
+            return
+        
+        # 获取视频属性
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        print(f"视频信息: {width}x{height} @ {fps}fps, 总帧数: {total_frames}")
+        
+        # 创建输出目录
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 设置视频写入器
+        output_path = os.path.join(save_dir, f"detected_{video_name}.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        frame_count = 0
+        
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                frame_count += 1
+                
+                # 运行检测
+                try:
+                    results = self.model.predict(
+                        source=frame,
+                        conf=self.conf_threshold,
+                        iou=self.iou_threshold,
+                        save=False,
+                        verbose=False,
+                        device=self.device,
+                        imgsz=self.img_size or 640,
+                        half=self.half
+                    )
+                except Exception as e:
+                    print(f"\n检测失败 (Frame {frame_count}): {e}")
+                    print("提示: 如果是CUDA内存错误,请尝试:")
+                    print("  1. 使用 --device cpu 切换到CPU")
+                    print("  2. 使用 --img-size 640 或更小的值来缩放图像")
+                    print("  3. 使用 --half 启用FP16半精度推理")
+                    raise
+                
+                # 获取结果并绘制
+                result = results[0]
+                boxes = result.boxes
+                annotated_frame = self._draw_boxes(frame, boxes)
+                
+                # 添加帧信息
+                num_detections = len(boxes)
+                info_text = f"Frame: {frame_count}/{total_frames} | Detections: {num_detections}"
+                cv2.putText(annotated_frame, info_text, (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                # 写入视频
+                out.write(annotated_frame)
+                
+                # 显示
+                if display:
+                    cv2.imshow('Detection', annotated_frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        print("用户中断检测")
+                        break
+                
+                # 打印进度
+                if frame_count % 30 == 0:
+                    progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+                    print(f"处理进度: {frame_count}/{total_frames} ({progress:.1f}%)")
+        
+        finally:
+            cap.release()
+            out.release()
+            if display:
+                cv2.destroyAllWindows()
+        
+        print(f"视频检测完成! 保存至: {output_path}")
+    
+    def detect_folder(self, folder_path, save_dir="output"):
+        """
+        检测文件夹中的所有图片
+        
+        Args:
+            folder_path: 图片文件夹路径
+            save_dir: 结果保存目录
+        """
+        if not os.path.exists(folder_path):
+            print(f"错误: 文件夹不存在 - {folder_path}")
+            return
+        
+        # 支持的图片格式
+        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+        
+        # 获取所有图片
+        image_files = []
+        for ext in image_extensions:
+            image_files.extend(Path(folder_path).glob(f"*{ext}"))
+            image_files.extend(Path(folder_path).glob(f"*{ext.upper()}"))
+        
+        if not image_files:
+            print(f"警告: 文件夹中没有找到图片文件 - {folder_path}")
+            return
+        
+        print(f"找到 {len(image_files)} 张图片")
+        
+        # 批量检测
+        for idx, image_file in enumerate(image_files, 1):
+            print(f"\n处理 [{idx}/{len(image_files)}]: {image_file.name}")
+            self.detect_image(str(image_file), save_dir)
+        
+        print(f"\n所有图片检测完成! 结果保存至: {save_dir}")
+    
+    def _draw_boxes(self, img, boxes):
+        """
+        在图片上绘制检测框
+        
+        Args:
+            img: 原始图片
+            boxes: 检测框
+        """
+        annotated_img = img.copy()
+        
+        for box in boxes:
+            # 获取坐标
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            conf = float(box.conf[0])
+            cls = int(box.cls[0])
+            
+            # 获取类别名称
+            class_name = self.model.names[cls] if hasattr(self.model, 'names') else str(cls)
+            
+            # 绘制框
+            color = (0, 255, 0)  # 绿色
+            cv2.rectangle(annotated_img, (x1, y1), (x2, y2), color, 2)
+            
+            # 绘制标签
+            label = f"{class_name}: {conf:.2f}"
+            (label_width, label_height), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
             )
-            new_columns[bad_c] = list(best_remaining)
-            new_lines[bad_c] = best_refit_line
-
-        repaired.append(bad_c)
-
-    return new_columns, new_lines, repaired
-
-
-def draw_visualization(
-    image,
-    dets: List[Dict],
-    columns: List[List[int]],
-    lines: List[Tuple[float, float]] = None,
-    repaired_cols: List[int] = None,
-    line_thickness: int = 2,
-):
-    """绘制方框、座位编号、列内方框连线，以及拟合/修复列线。"""
-    vis = image.copy()
-    h, w = vis.shape[:2]
-    repaired_cols = repaired_cols or []
-
-    col_colors = [
-        (255, 80, 80),
-        (80, 255, 80),
-        (80, 80, 255),
-        (255, 200, 80),
-        (220, 80, 255),
-    ]
-
-    # 绘制拟合直线（修复列用加粗半透明线条并标注 "R"，正常列用细线）
-    if lines:
-        for c, line_kb in enumerate(lines):
-            color = col_colors[c % len(col_colors)]
-            pt1, pt2 = clip_line_kb_to_image(line_kb, w, h)
-            if c in repaired_cols:
-                overlay = vis.copy()
-                cv2.line(overlay, pt1, pt2, color, 4)
-                cv2.addWeighted(overlay, 0.55, vis, 0.45, 0, vis)
-                mid_x = (pt1[0] + pt2[0]) // 2
-                mid_y = (pt1[1] + pt2[1]) // 2
-                cv2.putText(
-                    vis, "R", (mid_x - 10, mid_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3, cv2.LINE_AA,
-                )
-            else:
-                cv2.line(vis, pt1, pt2, color, 1)
-
-    # 先画灰色底框
-    for i, det in enumerate(dets):
-        x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (120, 120, 120), 1)
-
-    # 按列绘制
-    for col_id, idxs in enumerate(columns):
-        if len(idxs) == 0:
-            continue
-        color = col_colors[col_id % len(col_colors)]
-        sorted_idxs = sorted(idxs, key=lambda idx: dets[idx]["center"][1], reverse=True)
-
-        # 座位编号：第1列 1~6；第2列 7~12；...
-        for row_id, idx in enumerate(sorted_idxs):
-            seat_no = col_id * 6 + (row_id + 1)
-            x1, y1, x2, y2 = [int(v) for v in dets[idx]["bbox"]]
-            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                vis,
-                f"{seat_no}",
-                (x1 + 3, max(16, y1 - 4)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+            
+            # 标签背景
+            cv2.rectangle(
+                annotated_img,
+                (x1, y1 - label_height - baseline - 5),
+                (x1 + label_width, y1),
                 color,
-                2,
-                cv2.LINE_AA,
+                -1
             )
+            
+            # 标签文字
+            cv2.putText(
+                annotated_img,
+                label,
+                (x1, y1 - baseline - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),
+                1
+            )
+        
+        return annotated_img
+    
+    def _draw_boxes_with_layout(self, img, boxes, columns, lines):
+        """绘制带桌子排列策略的检测框"""
+        annotated_img = img.copy()
+        h, w = annotated_img.shape[:2]
+        
+        col_colors = [
+            (255, 80, 80),   # 红色
+            (80, 255, 80),   # 绿色
+            (80, 80, 255),   # 蓝色
+            (255, 200, 80),  # 橙色
+            (220, 80, 255),  # 紫色
+        ]
+        
+        # 先画灰色底框
+        for box in boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (120, 120, 120), 1)
+        
+        # 绘制拟合直线
+        for c, line_kb in enumerate(lines):
+            if len(columns[c]) > 0:
+                color = col_colors[c % len(col_colors)]
+                pt1, pt2 = clip_line_kb_to_image(line_kb, w, h)
+                cv2.line(annotated_img, pt1, pt2, color, 1)
+        
+        # 按列绘制
+        for col_id, idxs in enumerate(columns):
+            if len(idxs) == 0:
+                continue
+            color = col_colors[col_id % len(col_colors)]
+            
+            # 获取排序后的索引（从底到顶）
+            boxes_list = list(boxes)
+            centers = []
+            for idx in idxs:
+                box = boxes_list[idx]
+                x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                centers.append(cy)
+            
+            sorted_pairs = sorted(zip(idxs, centers), key=lambda p: p[1], reverse=True)
+            sorted_idxs = [p[0] for p in sorted_pairs]
+            
+            # 座位编号：第1列 1~6；第2列 7~12；...
+            for row_id, idx in enumerate(sorted_idxs):
+                seat_no = col_id * 6 + (row_id + 1)
+                box = boxes_list[idx]
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                conf = float(box.conf[0])
+                cls = int(box.cls[0])
+                
+                # 获取类别名称
+                class_name = self.model.names[cls] if hasattr(self.model, 'names') else str(cls)
+                
+                # 绘制框
+                cv2.rectangle(annotated_img, (x1, y1), (x2, y2), color, 2)
+                
+                # 绘制座位编号和置信度
+                label = f"{seat_no}: {conf:.2f}"
+                (label_width, label_height), baseline = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                )
+                
+                # 标签背景
+                cv2.rectangle(
+                    annotated_img,
+                    (x1, y1 - label_height - baseline - 5),
+                    (x1 + label_width, y1),
+                    color,
+                    -1
+                )
+                
+                # 标签文字
+                cv2.putText(
+                    annotated_img,
+                    label,
+                    (x1, y1 - baseline - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 0),
+                    1
+                )
+            
+            # 相邻方框连线（左上角->左上角、右下角->右下角）
+            for j in range(len(sorted_idxs) - 1):
+                idx_a = sorted_idxs[j]
+                idx_b = sorted_idxs[j + 1]
+                
+                box_a = boxes_list[idx_a]
+                box_b = boxes_list[idx_b]
+                
+                ax1, ay1, ax2, ay2 = map(int, box_a.xyxy[0].tolist())
+                bx1, by1, bx2, by2 = map(int, box_b.xyxy[0].tolist())
+                
+                cv2.line(annotated_img, (ax1, ay1), (bx1, by1), color, 2)
+                cv2.line(annotated_img, (ax2, ay2), (bx2, by2), color, 2)
+            
+            # 列名标注
+            if len(sorted_idxs) > 0:
+                top_idx = sorted_idxs[-1]
+                box_top = boxes_list[top_idx]
+                x1, y1, x2, y2 = map(int, box_top.xyxy[0].tolist())
+                tx = (x1 + x2) // 2
+                ty = y1
+                label = f"C{col_id + 1}({len(sorted_idxs)})"
+                cv2.putText(
+                    annotated_img,
+                    label,
+                    (tx + 8, max(20, ty - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+        
+        return annotated_img
 
-        # 相邻方框：左上角->左上角、右下角->右下角
-        for j in range(len(sorted_idxs) - 1):
-            idx_a = sorted_idxs[j]
-            idx_b = sorted_idxs[j + 1]
 
-            ax1, ay1, ax2, ay2 = [int(v) for v in dets[idx_a]["bbox"]]
-            bx1, by1, bx2, by2 = [int(v) for v in dets[idx_b]["bbox"]]
-
-            cv2.line(vis, (ax1, ay1), (bx1, by1), color, line_thickness)
-            cv2.line(vis, (ax2, ay2), (bx2, by2), color, line_thickness)
-
-        # 列名标注（修复列加 "[R]" 后缀）
-        top_idx = sorted_idxs[-1]
-        tx, ty = [int(v) for v in dets[top_idx]["center"]]
-        label = f"C{col_id + 1}({len(sorted_idxs)})"
-        if col_id in repaired_cols:
-            label += "[R]"
-        cv2.putText(
-            vis,
-            label,
-            (tx + 8, max(20, ty - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
-
-    return vis
-
-
-def run(
-    image_path: str,
-    output_dir: str,
-    model_path: str,
-    device: str,
-    conf: float,
-    iou: float,
-    imgsz: int,
-    num_cols: int,
-    show: bool,
-):
-    ensure_dir(output_dir)
-
-    image = cv2.imread(image_path)
-    if image is None:
-        raise FileNotFoundError(f"无法读取图像: {image_path}")
-
-    dets = detect_desks(
-        image=image,
-        model_path=model_path,
-        conf=conf,
-        iou=iou,
-        device=device,
-        imgsz=imgsz,
+def main():
+    parser = argparse.ArgumentParser(description="YOLO11独立检测脚本")
+    parser.add_argument(
+        "--source",
+        type=str,
+        required=True,
+        help="检测源: 图片路径/视频路径/文件夹路径/摄像头ID(0)"
     )
-    LOGGER.info("检测到桌子数量: %d", len(dets))
-
-    centers = np.array([d["center"] for d in dets], dtype=np.float32) if len(dets) > 0 else np.zeros((0, 2), dtype=np.float32)
-
-    columns, lines, _ = split_into_columns_by_origin_walk(
-        centers,
-        num_cols=num_cols,
-        expected_per_col=6,
+    parser.add_argument(
+        "--weights",
+        type=str,
+        default="best.pt",
+        help="模型权重文件路径 (默认: best.pt)"
     )
-
-    # 误检测列修复
-    # 策略1（主）：去首点重拟合 + 延长线找真实第一个点
-    # 策略2（兜底）：若修复后仍有坏列，用相邻好列平移直线
-    if len(centers) > 0:
-        columns, lines, repaired_cols = repair_columns_by_drop_refit(
-            centers, dets, columns, lines, num_cols=num_cols
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.7,
+        help="置信度阈值 (默认: 0.25)"
+    )
+    parser.add_argument(
+        "--iou",
+        type=float,
+        default=0.45,
+        help="NMS的IOU阈值 (默认: 0.45)"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="output",
+        help="结果保存目录 (默认: output)"
+    )
+    parser.add_argument(
+        "--display",
+        action="store_true",
+        help="实时显示检测结果(仅视频)"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="",
+        help="运行设备: cpu, cuda, 0, 1 等 (默认: 自动选择)"
+    )
+    parser.add_argument(
+        "--img-size",
+        type=int,
+        default=None,
+        help="推理图像尺寸，缩放以节省内存 (如: 640, 1280)"
+    )
+    parser.add_argument(
+        "--half",
+        action="store_true",
+        help="使用FP16半精度推理(仅GPU,可减少显存并可能避免某些CUDA错误)"
+    )
+    parser.add_argument(
+        "--enable-desk-layout",
+        action="store_true",
+        help="启用桌子排列策略（自动分列、编号和连线）"
+    )
+    parser.add_argument(
+        "--num-cols",
+        type=int,
+        default=5,
+        help="桌子列数 (默认: 5)"
+    )
+    
+    args = parser.parse_args()
+    
+    # 检查权重文件
+    if not os.path.exists(args.weights):
+        print(f"错误: 权重文件不存在 - {args.weights}")
+        print(f"\n提示: 请确保权重文件在当前目录或提供完整路径")
+        print(f"例如: python {sys.argv[0]} --source image.jpg --weights /path/to/best.pt")
+        return
+    
+    # 创建检测器
+    try:
+        detector = StandaloneDetector(
+            weights_path=args.weights,
+            conf_threshold=args.conf,
+            iou_threshold=args.iou,
+            device=args.device,
+            img_size=args.img_size,
+            half=args.half,
+            enable_desk_layout=args.enable_desk_layout,
+            num_cols=args.num_cols
         )
-        # 兜底：对 drop-refit 后仍残差过大的列，再走平移修复
-        columns, lines, extra_repaired = repair_columns_by_translation(
-            centers, columns, lines, num_cols=num_cols
-        )
-        # 合并两次修复的列索引（去重）
-        repaired_cols = list(dict.fromkeys(repaired_cols + extra_repaired))
+    except Exception as e:
+        print(f"\n初始化检测器失败: {e}")
+        return
+    
+    # 判断输入类型并执行检测
+    source = args.source
+    
+    # 检查是否为摄像头
+    if source.isdigit():
+        print(f"\n开始检测摄像头: {source}")
+        detector.detect_video(source, args.output, args.display)
+    
+    # 检查是否为文件夹
+    elif os.path.isdir(source):
+        print(f"\n开始检测文件夹: {source}")
+        detector.detect_folder(source, args.output)
+    
+    # 检查是否为视频文件
+    elif source.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')):
+        print(f"\n开始检测视频: {source}")
+        detector.detect_video(source, args.output, args.display)
+    
+    # 否则作为图片处理
+    elif os.path.isfile(source):
+        print(f"\n开始检测图片: {source}")
+        detector.detect_image(source, args.output)
+    
     else:
-        repaired_cols = []
-
-    for c, idxs in enumerate(columns):
-        LOGGER.info("C%d 点数: %d", c + 1, len(idxs))
-
-    vis = draw_visualization(image, dets, columns, lines=lines, repaired_cols=repaired_cols)
-
-    out_img = os.path.join(output_dir, "desk_detection_origin_walk_numbered.jpg")
-    cv2.imwrite(out_img, vis)
-    LOGGER.info("已保存可视化结果: %s", out_img)
-
-    if show:
-        cv2.imshow("desk detection origin_walk numbered", vis)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-
-
-def parse_args():
-    default_model = os.path.join(os.path.dirname(__file__), "weight", "yolov11_desk_model.pt")
-    default_output = os.path.join(os.path.dirname(__file__), "outputs")
-
-    parser = argparse.ArgumentParser(description="桌子检测可视化（原点距离+方向约束，含座位编号）")
-    parser.add_argument("--image", type=str, required=True, help="输入图像路径")
-    parser.add_argument("--model", type=str, default=default_model, help="桌子模型路径")
-    parser.add_argument("--output-dir", type=str, default=default_output, help="输出目录")
-    parser.add_argument("--device", type=str, default="0", help="推理设备，如 0/cpu")
-    parser.add_argument("--conf", type=float, default=0.6, help="置信度阈值")
-    parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU 阈值")
-    parser.add_argument("--imgsz", type=int, default=1280, help="推理尺寸")
-    parser.add_argument("--num-cols", type=int, default=5, help="列数（默认5）")
-    parser.add_argument("--show", action="store_true", help="显示窗口")
-    return parser.parse_args()
+        print(f"错误: 无法识别的输入源 - {source}")
+        print("支持的输入:")
+        print("  - 图片文件: .jpg, .png, .bmp 等")
+        print("  - 视频文件: .mp4, .avi, .mov 等")
+        print("  - 文件夹: 包含图片的文件夹")
+        print("  - 摄像头: 数字ID (如 0)")
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    args = parse_args()
-    run(
-        image_path=args.image,
-        output_dir=args.output_dir,
-        model_path=args.model,
-        device=args.device,
-        conf=args.conf,
-        iou=args.iou,
-        imgsz=args.imgsz,
-        num_cols=args.num_cols,
-        show=args.show,
-    )
+    main()
