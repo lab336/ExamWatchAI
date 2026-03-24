@@ -4,7 +4,7 @@
 只需要: pip install ultralytics opencv-python
 
 使用方法:
-1. 检测图片: python exam_seat_binding/standalone_detect.py --source data/desk/originimages/room_first_frame.png --weights exam_seat_binding/weight/yolo11desk.pt
+1. 检测图片: python exam_seat_binding/visualize_desk_detection2.py --source data/my_screenshots/screenshot_00m00s400ms_frame000010.png --weights exam_seat_binding/weight/yolo11desk.pt
 2. 检测视频: python exam_seat_binding/standalone_detect.py --source video.mp4 --weights exam_seat_binding/weight/yolo11desk.pt
 3. 检测摄像头: python exam_seat_binding/standalone_detect.py --source 0 --weights exam_seat_binding/weight/yolo11desk.pt
 4. 检测文件夹: python exam_seat_binding/standalone_detect.py --source data/desk/originimages --weights exam_seat_binding/weight/yolo11desk.pt
@@ -105,26 +105,35 @@ def _pick_first_column_head(centers: np.ndarray, remaining: set) -> int:
     return cand_sorted[0]
 
 
+def _pick_max_y_head(centers: np.ndarray, remaining: set) -> int:
+    """按 y 值降序选择列头（y 最大为底部），y 相同时 x 最小作为备选。"""
+    if len(remaining) == 0:
+        return -1
+    cand = list(remaining)
+    # 按 y 降序（底部优先），y 相等时按 x 升序（更左优先）
+    cand_sorted = sorted(cand, key=lambda i: (-float(centers[i, 1]), float(centers[i, 0])))
+    return cand_sorted[0]
+
+
 def _pick_next_in_same_column(centers: np.ndarray, remaining: set, cur_idx: int) -> int:
-    """同列找下一个点：优先 x 变小且 y 变小，并且离原点近。"""
+    """同列找下一个点：严格要求 x 变小且 y 变小。
+
+    选择规则更新为：在满足 x<cx 且 y<cy 的候选中，优先选择 y 与当前点差值最小的点（即垂直方向上距离最近的上方点），
+    若 y 差值相同再按欧氏距离排序，最后按 x 值升序（更左优先）。"""
     cx, cy = centers[cur_idx]
 
     # 严格条件：x<cx 且 y<cy
     cand = [i for i in remaining if centers[i, 0] < cx and centers[i, 1] < cy]
     if len(cand) > 0:
-        cand = sorted(cand, key=lambda i: (_dist_to_origin(centers[i]), np.linalg.norm(centers[i] - centers[cur_idx])))
-        return cand[0]
-
-    # 放宽1：y<cy 且 x<=cx
-    cand = [i for i in remaining if centers[i, 1] < cy and centers[i, 0] <= cx]
-    if len(cand) > 0:
-        cand = sorted(cand, key=lambda i: (_dist_to_origin(centers[i]), np.linalg.norm(centers[i] - centers[cur_idx])))
-        return cand[0]
-
-    # 放宽2：只要求 y<cy
-    cand = [i for i in remaining if centers[i, 1] < cy]
-    if len(cand) > 0:
-        cand = sorted(cand, key=lambda i: (_dist_to_origin(centers[i]), np.linalg.norm(centers[i] - centers[cur_idx])))
+        # 计算 y 差值 dy = cy - yi（>0），优先 dy 最小；再按距离；再按 x 更小优先
+        cand = sorted(
+            cand,
+            key=lambda i: (
+                float(cy - centers[i, 1]),
+                np.linalg.norm(centers[i] - centers[cur_idx]),
+                float(centers[i, 0]),
+            ),
+        )
         return cand[0]
 
     return -1
@@ -168,8 +177,8 @@ def split_into_columns_by_origin_walk(
     columns: List[List[int]] = [[] for _ in range(num_cols)]
     seeds: List[int] = []
 
-    # 第一列头点
-    head = _pick_first_column_head(centers, remaining)
+    # 第一列头点：从所有点中取 y 最大者（画面最底端的点）
+    head = _pick_max_y_head(centers, remaining)
 
     for c in range(num_cols):
         if head < 0:
@@ -180,7 +189,7 @@ def split_into_columns_by_origin_walk(
             remaining.remove(head)
 
         cur = head
-        # 同列补到 expected_per_col 点
+        # 同列补到 expected_per_col 点 (查找方向：y 减小，x 减小)
         for _ in range(expected_per_col - 1):
             nxt = _pick_next_in_same_column(centers, remaining, cur)
             if nxt < 0:
@@ -192,9 +201,9 @@ def split_into_columns_by_origin_walk(
         columns[c] = col
         seeds.append(col[0])
 
-        # 下一列头点
+        # 下一列头点：从剩余点中继续选出 y 最大者
         if c < num_cols - 1:
-            head = _pick_next_column_head(centers, remaining, seeds[-1])
+            head = _pick_max_y_head(centers, remaining)
 
     # 将剩余点分配到最近列线
     lines: List[Tuple[float, float]] = []
@@ -217,21 +226,12 @@ def split_into_columns_by_origin_walk(
                 best_c = c
         columns[best_c].append(idx)
 
-    # 列内排序：底->顶
+    # 列内排序：底->顶（当 y 减小时，x 也应随之减小）
+    # 优先按 y 降序（底->顶），同 y 时按 x 降序，保证从底到顶 x 也呈减小趋势
     for c in range(num_cols):
-        columns[c] = sorted(columns[c], key=lambda i: centers[i, 1], reverse=True)
+        columns[c] = sorted(columns[c], key=lambda i: (centers[i, 1], centers[i, 0]), reverse=True)
 
-    # 左到右重排（按底部点 x）
-    bottoms = []
-    for c in range(num_cols):
-        if len(columns[c]) > 0:
-            b = columns[c][0]
-            bottoms.append((centers[b, 0], c))
-        else:
-            bottoms.append((1e9, c))
-    order = [c for _, c in sorted(bottoms, key=lambda t: t[0])]
-    columns = [columns[c] for c in order]
-    lines = [lines[c] for c in order]
+    # 保持列顺序：按“列头 y 从大到小”构建出来的自然顺序，不再按 x 二次重排
 
     seeds = []
     for c in range(num_cols):
@@ -627,9 +627,11 @@ class StandaloneDetector:
                 x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
                 cx = (x1 + x2) / 2.0
                 cy = (y1 + y2) / 2.0
-                centers.append(cy)
-            
-            sorted_pairs = sorted(zip(idxs, centers), key=lambda p: p[1], reverse=True)
+                # 存为 (cy, cx)，便于按 (y, x) 组合排序
+                centers.append((cy, cx))
+
+            # 按 y 降序（底->顶），同 y 时按 x 降序，保证 y 减小时 x 也随之减小
+            sorted_pairs = sorted(zip(idxs, centers), key=lambda p: (p[1][0], p[1][1]), reverse=True)
             sorted_idxs = [p[0] for p in sorted_pairs]
             
             # 座位编号：第1列 1~6；第2列 7~12；...
@@ -672,7 +674,7 @@ class StandaloneDetector:
                     1
                 )
             
-            # 相邻方框连线（左上角->左上角、右下角->右下角）
+            # 相邻方框连线（前框左下角 -> 后框右上角）
             for j in range(len(sorted_idxs) - 1):
                 idx_a = sorted_idxs[j]
                 idx_b = sorted_idxs[j + 1]
@@ -683,8 +685,10 @@ class StandaloneDetector:
                 ax1, ay1, ax2, ay2 = map(int, box_a.xyxy[0].tolist())
                 bx1, by1, bx2, by2 = map(int, box_b.xyxy[0].tolist())
                 
-                cv2.line(annotated_img, (ax1, ay1), (bx1, by1), color, 2)
-                cv2.line(annotated_img, (ax2, ay2), (bx2, by2), color, 2)
+                # 从当前框的左下角连到下一个框的左下角
+                cv2.line(annotated_img, (ax1, ay2), (bx1, by2), color, 2)
+                # 从当前框的右上角连到下一个框的右上角
+                cv2.line(annotated_img, (ax2, ay1), (bx2, by1), color, 2)
             
             # 列名标注
             if len(sorted_idxs) > 0:
