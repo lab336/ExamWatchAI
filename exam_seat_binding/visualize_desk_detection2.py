@@ -21,10 +21,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
-import logging
-from typing import List, Dict, Tuple
-
-LOGGER = logging.getLogger(__name__)
+from typing import List, Tuple
 
 
 # ========== 桌子排列策略相关函数 ==========
@@ -94,17 +91,6 @@ def clip_line_kb_to_image(line_kb: Tuple[float, float], w: int, h: int):
     return (x1, y1), (x2, y2)
 
 
-def _dist_to_origin(pt: np.ndarray) -> float:
-    return float(np.sqrt(float(pt[0]) * float(pt[0]) + float(pt[1]) * float(pt[1])))
-
-
-def _pick_first_column_head(centers: np.ndarray, remaining: set) -> int:
-    """第一列头点：x 最小，且距离原点最近。"""
-    cand = list(remaining)
-    cand_sorted = sorted(cand, key=lambda i: (centers[i, 0], _dist_to_origin(centers[i])))
-    return cand_sorted[0]
-
-
 def _pick_max_y_head(centers: np.ndarray, remaining: set) -> int:
     """按 y 值降序选择列头（y 最大为底部），y 相同时 x 最小作为备选。"""
     if len(remaining) == 0:
@@ -134,30 +120,6 @@ def _pick_next_in_same_column(centers: np.ndarray, remaining: set, cur_idx: int)
                 float(centers[i, 0]),
             ),
         )
-        return cand[0]
-
-    return -1
-
-
-def _pick_next_column_head(centers: np.ndarray, remaining: set, prev_head_idx: int) -> int:
-    """下一列头点：相对上一列头点，x 增大且 y 增大，且离原点最近。"""
-    px, py = centers[prev_head_idx]
-
-    # 严格条件：x>px 且 y>py
-    cand = [i for i in remaining if centers[i, 0] > px and centers[i, 1] > py]
-    if len(cand) > 0:
-        cand = sorted(cand, key=lambda i: _dist_to_origin(centers[i]))
-        return cand[0]
-
-    # 放宽1：只要求 x>px
-    cand = [i for i in remaining if centers[i, 0] > px]
-    if len(cand) > 0:
-        cand = sorted(cand, key=lambda i: (_dist_to_origin(centers[i]), abs(float(centers[i, 1] - py))))
-        return cand[0]
-
-    # 放宽2：剩余里离原点最近
-    if len(remaining) > 0:
-        cand = sorted(list(remaining), key=lambda i: _dist_to_origin(centers[i]))
         return cand[0]
 
     return -1
@@ -309,7 +271,7 @@ class StandaloneDetector:
                 import gc
                 gc.collect()
                 print("已清理CUDA缓存")
-        except Exception as e:
+        except Exception:
             pass
     
     def _print_gpu_info(self):
@@ -326,7 +288,7 @@ class StandaloneDetector:
                 print(f"总显存: {total_memory:.2f} GB")
                 print(f"已分配: {allocated:.2f} GB")
                 print(f"已缓存: {cached:.2f} GB")
-        except Exception as e:
+        except Exception:
             pass
         
     def detect_image(self, image_path, save_dir="output"):
@@ -375,7 +337,7 @@ class StandaloneDetector:
             centers = np.array(centers, dtype=np.float32)
             
             # 执行分列算法
-            columns, lines, seeds = split_into_columns_by_origin_walk(centers, num_cols=self.num_cols)
+            columns, lines, _ = split_into_columns_by_origin_walk(centers, num_cols=self.num_cols)
             
             # 绘制带排列策略的结果
             annotated_img = self._draw_boxes_with_layout(img, boxes, columns, lines)
@@ -640,10 +602,6 @@ class StandaloneDetector:
                 box = boxes_list[idx]
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 conf = float(box.conf[0])
-                cls = int(box.cls[0])
-                
-                # 获取类别名称
-                class_name = self.model.names[cls] if hasattr(self.model, 'names') else str(cls)
                 
                 # 绘制框
                 cv2.rectangle(annotated_img, (x1, y1), (x2, y2), color, 2)

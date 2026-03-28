@@ -21,10 +21,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
-import logging
-from typing import List, Dict, Tuple
-
-LOGGER = logging.getLogger(__name__)
+from typing import List, Tuple
 
 
 # ========== 桌子排列策略相关函数 ==========
@@ -309,7 +306,7 @@ class StandaloneDetector:
                 import gc
                 gc.collect()
                 print("已清理CUDA缓存")
-        except Exception as e:
+        except Exception:
             pass
     
     def _print_gpu_info(self):
@@ -326,7 +323,7 @@ class StandaloneDetector:
                 print(f"总显存: {total_memory:.2f} GB")
                 print(f"已分配: {allocated:.2f} GB")
                 print(f"已缓存: {cached:.2f} GB")
-        except Exception as e:
+        except Exception:
             pass
         
     def detect_image(self, image_path, save_dir="output"):
@@ -375,7 +372,7 @@ class StandaloneDetector:
             centers = np.array(centers, dtype=np.float32)
             
             # 执行分列算法
-            columns, lines, seeds = split_into_columns_by_origin_walk(centers, num_cols=self.num_cols)
+            columns, lines, _ = split_into_columns_by_origin_walk(centers, num_cols=self.num_cols)
             
             # 绘制带排列策略的结果
             annotated_img = self._draw_boxes_with_layout(img, boxes, columns, lines)
@@ -638,10 +635,6 @@ class StandaloneDetector:
                 box = boxes_list[idx]
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 conf = float(box.conf[0])
-                cls = int(box.cls[0])
-                
-                # 获取类别名称
-                class_name = self.model.names[cls] if hasattr(self.model, 'names') else str(cls)
                 
                 # 绘制框
                 cv2.rectangle(annotated_img, (x1, y1), (x2, y2), color, 2)
