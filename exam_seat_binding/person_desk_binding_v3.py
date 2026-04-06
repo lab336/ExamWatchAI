@@ -1,0 +1,1161 @@
+"""
+人桌绑定 V3 —— 基于相邻桌子区间绑定
+
+核心思路:
+  分好每列后, 第 i 个座位的绑定区域 = 第 i 张桌子与第 i+1 张桌子之间的
+  梯形区域。人框中心落入哪个区间, 就绑定到哪个座位。
+
+  绑定区域由当前桌子的左上角/右下角 与 下一个桌子的左上角/右下角连线形成
+  的四边形构成, 天然适应透视畸变。
+
+流水线:
+  桌子检测 → 按列排序得 6×5 网格 → 相邻桌子间建梯形区域
+  → 人框中心点落区判定 → 贪心一对一分配 → 时序平滑
+
+用法:
+python exam_seat_binding/person_desk_binding_v3.py --source data/ideotest/merged_output.mp4
+python exam_seat_binding/person_desk_binding_v3.py --source data/ideotest/merged_output.mp4 --display
+"""
+
+import argparse
+import csv
+import importlib.util
+import json
+import os
+from collections import Counter, deque
+from pathlib import Path
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+
+# ─── 加载桌子检测模块 ────────────────────────────────────────
+
+def _load_module_from_file(name: str, filename: str):
+    path = os.path.join(os.path.dirname(__file__), filename)
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+try:
+    from exam_seat_binding import desk_layout_detector as desk_layout_mod
+except Exception:
+    desk_layout_mod = _load_module_from_file(
+        "desk_layout_detector", "desk_layout_detector.py"
+    )
+
+
+# ─── 常量 ────────────────────────────────────────────────────
+
+VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv")
+
+
+# ─── 几何工具函数 ─────────────────────────────────────────────
+
+def xyxy_center(box):
+    x1, y1, x2, y2 = box
+    return np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float32)
+
+
+def head_point(box):
+    x1, y1, x2, y2 = box
+    return np.array([(x1 + x2) / 2.0, y1], dtype=np.float32)
+
+
+def l2(a, b):
+    return float(np.linalg.norm(
+        np.asarray(a, dtype=np.float32) - np.asarray(b, dtype=np.float32)
+    ))
+
+
+# ─── 相邻桌子区间构建 ────────────────────────────────────────
+
+class InterDeskZoneBuilder:
+    """
+    在同一列相邻桌子之间构建梯形绑定区域。
+
+    原理 (以某一列为例, 桌子从下往上排列: d0, d1, d2, ..., d5):
+      - 座位 i 的绑定区域 = 从 d_i 到 d_{i+1} 的四边形
+      - 四边形由 d_i 的左上角/右下角 连线到 d_{i+1} 的左上角/右下角 构成
+      - 最后一个座位的区域向远端(图像上方)延伸
+      - 第一个座位的区域向近端(图像下方)略做扩展
+
+    该四边形自然适应透视畸变:
+      近处桌子大, 远处桌子小, 四边形即为梯形。
+    """
+
+    def __init__(self, first_extend_ratio: float = 0.3,
+                 last_extend_ratio: float = 0.8):
+        """
+        Args:
+            first_extend_ratio: 第一个座位(最近相机)向下延伸比例
+            last_extend_ratio: 最后一个座位(最远相机)向上延伸比例
+        """
+        self.first_extend_ratio = first_extend_ratio
+        self.last_extend_ratio = last_extend_ratio
+
+    def build(self, desks: list) -> list:
+        """
+        从已排好列和行的桌子列表, 构建所有座位绑定区域。
+
+        Args:
+            desks: 桌子列表 (含 desk_id, desk_no, column_index, row_index, xyxy, center ...)
+
+        Returns:
+            zones: 绑定区域列表, 每项含 polygon (4点四边形), zone_center 等
+        """
+        # 按列分组
+        columns: dict[int, list] = {}
+        for d in desks:
+            col = d["column_index"]
+            columns.setdefault(col, []).append(d)
+
+        # 每列按 row_index 排序 (row 0 = 图像底部, 最近相机)
+        for col in columns:
+            columns[col].sort(key=lambda d: d["row_index"])
+
+        zones = []
+        for col_id in sorted(columns.keys()):
+            col_desks = columns[col_id]
+            n = len(col_desks)
+
+            for i in range(n):
+                curr = col_desks[i]
+                x1_c, y1_c, x2_c, y2_c = curr["xyxy"]
+
+                if i < n - 1:
+                    # ── 中间座位: 当前桌子 → 下一桌子的四边形 ──
+                    nxt = col_desks[i + 1]
+                    x1_n, y1_n, x2_n, y2_n = nxt["xyxy"]
+
+                    # 四边形顶点 (顺时针):
+                    #   A = 当前桌 TL    B = 当前桌 BR
+                    #   D = 下一桌 BR    C = 下一桌 TL
+                    poly = np.array([
+                        [x1_c, y1_c],   # A: 当前桌左上
+                        [x2_c, y2_c],   # B: 当前桌右下
+                        [x2_n, y2_n],   # D: 下一桌右下
+                        [x1_n, y1_n],   # C: 下一桌左上
+                    ], dtype=np.float32)
+
+                    # 第一个座位: 向下(近相机方向)扩展
+                    if i == 0:
+                        gap_h = y2_c - y2_n  # 两桌底边间距
+                        ext = max(gap_h * self.first_extend_ratio,
+                                  (y2_c - y1_c) * 0.3)
+                        poly[0][1] += ext   # A.y 向下
+                        poly[1][1] += ext   # B.y 向下
+
+                else:
+                    # ── 最后一个座位: 向远端延伸 ──
+                    if i > 0:
+                        prev = col_desks[i - 1]
+                        gap_h = prev["xyxy"][3] - y2_c
+                    else:
+                        gap_h = y2_c - y1_c
+
+                    ext = max(gap_h * self.last_extend_ratio,
+                              (y2_c - y1_c) * 0.5)
+
+                    # 透视缩放: 远处桌子窄些
+                    desk_w = x2_c - x1_c
+                    cx = (x1_c + x2_c) / 2.0
+                    shrink = 0.85
+                    half_w = desk_w * shrink / 2.0
+
+                    poly = np.array([
+                        [x1_c, y1_c],                   # A: 桌左上
+                        [x2_c, y2_c],                   # B: 桌右下
+                        [cx + half_w, y1_c - ext],      # D: 延伸右上
+                        [cx - half_w, y1_c - ext],      # C: 延伸左上
+                    ], dtype=np.float32)
+
+                zone_cx = float(np.mean(poly[:, 0]))
+                zone_cy = float(np.mean(poly[:, 1]))
+
+                zones.append({
+                    "desk_id": curr["desk_id"],
+                    "desk_no": curr["desk_no"],
+                    "column_index": curr["column_index"],
+                    "row_index": curr["row_index"],
+                    "desk_xyxy": curr["xyxy"],
+                    "desk_center": curr["center"],
+                    "polygon": poly,
+                    "zone_center": [zone_cx, zone_cy],
+                })
+
+        return zones
+
+
+# ─── 区间绑定器 ──────────────────────────────────────────────
+
+class ZoneBinder:
+    """
+    基于区间落点的人-座位绑定器。
+
+    规则:
+    1. 对每个人, 取人框中心作为锚点
+    2. 判断锚点落入哪个梯形绑定区域 (cv2.pointPolygonTest)
+    3. 如果同一区域有多人, 选最接近区域中心的
+    4. 一个区域最多绑定一个人, 一个人最多绑定一个区域
+    """
+
+    def __init__(self, zones: list):
+        self.zones = zones
+        self.zone_lookup = {z["desk_id"]: z for z in zones}
+
+    def assign_batch(self, people: list):
+        """
+        批量绑定。
+
+        Args:
+            people: 列表, 每项含 track_id, xyxy
+
+        Returns:
+            assignments: {track_id: assignment_dict}
+            anchor_points: {track_id: ndarray (ax, ay)}
+        """
+        if not people or not self.zones:
+            return {}, {}
+
+        # 提取锚点 (人框中心)
+        anchor_pts = {}
+        for person in people:
+            tid = person["track_id"]
+            anchor_pts[tid] = xyxy_center(person["xyxy"])
+
+        # 对每个人, 找它落入的区域
+        candidates = []  # (dist_to_center, track_id, zone_idx)
+        for person in people:
+            tid = person["track_id"]
+            anchor = anchor_pts[tid]
+            ax, ay = float(anchor[0]), float(anchor[1])
+
+            for z_idx, zone in enumerate(self.zones):
+                poly = zone["polygon"].reshape(-1, 1, 2).astype(np.float32)
+                dist = cv2.pointPolygonTest(poly, (ax, ay), measureDist=True)
+                if dist >= 0:  # 在区域内或边上
+                    d_center = l2(anchor, zone["zone_center"])
+                    candidates.append((d_center, tid, z_idx))
+
+        # 贪心分配: 距中心近的优先, 一区一人
+        candidates.sort(key=lambda x: x[0])
+        used_zones: set[int] = set()
+        used_people: set[int] = set()
+        assignments = {}
+
+        for d_center, tid, z_idx in candidates:
+            if tid in used_people or z_idx in used_zones:
+                continue
+
+            zone = self.zones[z_idx]
+            anchor = anchor_pts[tid]
+
+            assignments[tid] = {
+                "desk_id": zone["desk_id"],
+                "desk_no": zone["desk_no"],
+                "col_idx": zone["column_index"],
+                "row_idx": zone["row_index"],
+                "cost": round(d_center, 4),
+                "in_zone": True,
+                "anchor_x": round(float(anchor[0]), 2),
+                "anchor_y": round(float(anchor[1]), 2),
+                "zone_cx": round(zone["zone_center"][0], 2),
+                "zone_cy": round(zone["zone_center"][1], 2),
+            }
+            used_zones.add(z_idx)
+            used_people.add(tid)
+
+        return assignments, anchor_pts
+
+
+# ─── 时间确认器 ──────────────────────────────────────────────
+
+class TemporalConfirmer:
+    """
+    时间窗口绑定确认。
+
+    规则:
+    - 维护每个 track_id 最近 window 内的帧级座位分配
+    - 同一座位在窗口内占比 >= confirm_ratio → 确认绑定
+    - 确认后短时丢失仍保持 (hold)
+    - 已确认后需连续 re_confirm_frames 帧指向新座位才切换 (防跳变)
+    """
+
+    def __init__(
+        self,
+        fps: float,
+        confirm_seconds: float = 10.0,
+        confirm_ratio: float = 0.65,
+        hold_seconds: float = 5.0,
+        max_students: int = 30,
+        max_teachers: int = 2,
+        re_confirm_seconds: float = 5.0,
+    ):
+        self.fps = max(1.0, fps)
+        self.confirm_frames = int(confirm_seconds * self.fps)
+        self.confirm_ratio = confirm_ratio
+        self.hold_frames = int(hold_seconds * self.fps)
+        self.re_confirm_frames = int(re_confirm_seconds * self.fps)
+        self.max_students = max_students
+        self.max_teachers = max_teachers
+
+        self.states: dict = {}
+        self._desk_owner: dict = {}
+
+    def _get_state(self, track_id):
+        if track_id not in self.states:
+            self.states[track_id] = {
+                "history": deque(maxlen=self.confirm_frames),
+                "confirmed_desk_id": None,
+                "last_seen_frame": -1,
+                "total_move": 0.0,
+                "last_center": None,
+                "consecutive_new_desk": 0,
+                "consecutive_new_desk_id": None,
+            }
+        return self.states[track_id]
+
+    def update(self, track_id, frame_idx, desk_id, box):
+        st = self._get_state(track_id)
+        st["history"].append(desk_id)
+        st["last_seen_frame"] = frame_idx
+
+        center = xyxy_center(box)
+        if st["last_center"] is not None:
+            st["total_move"] += l2(center, st["last_center"])
+        st["last_center"] = center
+
+        # 已确认: 防跳变逻辑
+        if st["confirmed_desk_id"] is not None:
+            if desk_id is not None and desk_id != st["confirmed_desk_id"]:
+                if desk_id == st["consecutive_new_desk_id"]:
+                    st["consecutive_new_desk"] += 1
+                else:
+                    st["consecutive_new_desk"] = 1
+                    st["consecutive_new_desk_id"] = desk_id
+                if st["consecutive_new_desk"] >= self.re_confirm_frames:
+                    self._try_confirm(track_id, desk_id,
+                                      st["consecutive_new_desk"])
+                    st["consecutive_new_desk"] = 0
+                    st["consecutive_new_desk_id"] = None
+            else:
+                st["consecutive_new_desk"] = 0
+                st["consecutive_new_desk_id"] = None
+            return
+
+        # 未确认: 常规确认
+        history = st["history"]
+        if len(history) >= min(self.confirm_frames, int(self.fps * 3)):
+            votes = [d for d in history if d is not None]
+            if votes:
+                best_desk, count = Counter(votes).most_common(1)[0]
+                if count / len(history) >= self.confirm_ratio:
+                    self._try_confirm(track_id, best_desk, count)
+
+    def _try_confirm(self, track_id: int, desk_id: str, vote_count: int):
+        st = self.states[track_id]
+        if st["confirmed_desk_id"] == desk_id:
+            return
+
+        current_owner = self._desk_owner.get(desk_id)
+        if current_owner is not None and current_owner != track_id:
+            owner_st = self.states.get(current_owner)
+            if owner_st is not None:
+                owner_votes = sum(1 for d in owner_st["history"] if d == desk_id)
+                if vote_count <= owner_votes:
+                    return
+                owner_st["confirmed_desk_id"] = None
+            del self._desk_owner[desk_id]
+        elif current_owner == track_id:
+            return
+
+        if len(self._desk_owner) >= self.max_students:
+            weakest_desk = None
+            weakest_votes = vote_count
+            for d_id, t_id in list(self._desk_owner.items()):
+                t_st = self.states.get(t_id)
+                if t_st is None:
+                    weakest_desk = d_id
+                    weakest_votes = -1
+                    break
+                t_votes = sum(1 for d in t_st["history"] if d == d_id)
+                if t_votes < weakest_votes:
+                    weakest_votes = t_votes
+                    weakest_desk = d_id
+            if weakest_desk is None:
+                return
+            evicted_tid = self._desk_owner[weakest_desk]
+            if evicted_tid in self.states:
+                self.states[evicted_tid]["confirmed_desk_id"] = None
+            del self._desk_owner[weakest_desk]
+
+        old_desk = st["confirmed_desk_id"]
+        if old_desk is not None and self._desk_owner.get(old_desk) == track_id:
+            del self._desk_owner[old_desk]
+
+        st["confirmed_desk_id"] = desk_id
+        self._desk_owner[desk_id] = track_id
+
+    def get_confirmed(self, track_id, current_frame):
+        if track_id not in self.states:
+            return None
+        st = self.states[track_id]
+        if st["confirmed_desk_id"] is None:
+            return None
+        if current_frame - st["last_seen_frame"] > self.hold_frames:
+            desk_id = st["confirmed_desk_id"]
+            if self._desk_owner.get(desk_id) == track_id:
+                del self._desk_owner[desk_id]
+            st["confirmed_desk_id"] = None
+            return None
+        return st["confirmed_desk_id"]
+
+    def get_current_vote(self, track_id):
+        if track_id not in self.states:
+            return None
+        history = self.states[track_id]["history"]
+        votes = [d for d in history if d is not None]
+        if not votes:
+            return None
+        return Counter(votes).most_common(1)[0][0]
+
+    def get_display_desk_id(self, track_id, current_frame):
+        confirmed = self.get_confirmed(track_id, current_frame)
+        return confirmed if confirmed is not None else self.get_current_vote(track_id)
+
+    def is_confirmed(self, track_id, current_frame):
+        return self.get_confirmed(track_id, current_frame) is not None
+
+    def _get_teacher_set(self, current_frame) -> set:
+        candidates = []
+        for tid, st in self.states.items():
+            if self.is_confirmed(tid, current_frame):
+                continue
+            if len(st["history"]) >= self.confirm_frames:
+                candidates.append((st["total_move"], tid))
+        candidates.sort(reverse=True)
+        return {tid for _, tid in candidates[:self.max_teachers]}
+
+    def role(self, track_id, current_frame, min_observe_frames=None):
+        if min_observe_frames is None:
+            min_observe_frames = self.confirm_frames
+        if self.is_confirmed(track_id, current_frame):
+            return "student"
+        if track_id not in self.states:
+            return "unknown"
+        st = self.states[track_id]
+        if len(st["history"]) >= min_observe_frames:
+            if track_id in self._get_teacher_set(current_frame):
+                return "teacher"
+        return "unknown"
+
+    def summary(self, track_id, current_frame):
+        if track_id not in self.states:
+            return {
+                "track_id": track_id,
+                "confirmed_desk_id": None,
+                "role": "unknown",
+                "total_move": 0.0,
+            }
+        st = self.states[track_id]
+        return {
+            "track_id": track_id,
+            "confirmed_desk_id": st["confirmed_desk_id"],
+            "current_vote": self.get_current_vote(track_id),
+            "role": self.role(track_id, current_frame),
+            "total_move": round(st["total_move"], 3),
+            "observed_frames": len(st["history"]),
+        }
+
+
+# ─── 可视化 ──────────────────────────────────────────────────
+
+def draw_text(img, text, org, color, scale=0.55, thickness=2):
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX,
+                scale, color, thickness, cv2.LINE_AA)
+
+
+def color_for_desk(desk_no):
+    palette = [
+        (255, 80, 80), (80, 255, 80), (80, 80, 255),
+        (255, 200, 80), (220, 80, 255), (80, 220, 255),
+    ]
+    return palette[(desk_no - 1) % len(palette)]
+
+
+def draw_column_lines(img, column_lines, img_h):
+    vis = img.copy()
+    colors = [
+        (255, 80, 80), (80, 255, 80), (80, 80, 255),
+        (255, 200, 80), (220, 80, 255),
+    ]
+    for col_line in column_lines:
+        col_idx = col_line["column_index"]
+        color = colors[col_idx % len(colors)]
+        start = tuple(map(int, col_line["segment_start"]))
+        end = tuple(map(int, col_line["segment_end"]))
+        cv2.line(vis, start, end, color, 2)
+        cv2.putText(vis, f"Col{col_idx}", (start[0] + 5, start[1] - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    return vis
+
+
+# ─── 主管线 V3 ───────────────────────────────────────────────
+
+class PersonDeskBindingPipelineV3:
+    def __init__(
+        self,
+        source: str,
+        person_weights: str,
+        desk_weights: str,
+        output_dir: str,
+        person_conf: float,
+        person_iou: float,
+        desk_conf: float,
+        desk_iou: float,
+        device: str,
+        img_size: int | None,
+        half: bool,
+        tracker: str,
+        person_classes: list[int] | None,
+        desk_mode: str,
+        desk_num_cols: int,
+        desk_required_per_col: int,
+        reference_max_frames: int,
+        reference_sample_step: int,
+        confirm_seconds: float,
+        confirm_ratio: float,
+        hold_seconds: float,
+        re_confirm_seconds: float,
+        first_extend_ratio: float,
+        last_extend_ratio: float,
+        outputs: set[str],
+        display: bool,
+        max_students: int = 30,
+        max_teachers: int = 2,
+    ):
+        if not os.path.isfile(source):
+            raise FileNotFoundError(f"视频不存在: {source}")
+        if not os.path.isfile(person_weights):
+            raise FileNotFoundError(f"人物模型不存在: {person_weights}")
+        if not os.path.isfile(desk_weights):
+            raise FileNotFoundError(f"桌子模型不存在: {desk_weights}")
+
+        self.source = source
+        self.output_dir = output_dir
+        self.person_conf = person_conf
+        self.person_iou = person_iou
+        self.device = device
+        self.img_size = img_size
+        self.half = half
+        self.tracker = tracker
+        self.person_classes = person_classes
+        self.reference_max_frames = reference_max_frames
+        self.reference_sample_step = max(1, reference_sample_step)
+        self.confirm_seconds = confirm_seconds
+        self.confirm_ratio = confirm_ratio
+        self.hold_seconds = hold_seconds
+        self.re_confirm_seconds = re_confirm_seconds
+        self.first_extend_ratio = first_extend_ratio
+        self.last_extend_ratio = last_extend_ratio
+        self.outputs = set(outputs)
+        self.display = display
+        self.max_students = max_students
+        self.max_teachers = max_teachers
+
+        self.person_model = YOLO(person_weights)
+        self.person_names = getattr(self.person_model, "names", None)
+        self.desk_detector = desk_layout_mod.DeskLayoutDetector(
+            weights_path=desk_weights,
+            conf_threshold=desk_conf,
+            iou_threshold=desk_iou,
+            device=device,
+            img_size=img_size,
+            half=half,
+            mode=desk_mode,
+            num_cols=desk_num_cols,
+            required_per_col=desk_required_per_col,
+        )
+
+    # ── 参考帧桌子检测 ───────────────────────────────────────
+
+    def _select_reference_desks(self):
+        cap = cv2.VideoCapture(self.source)
+        if not cap.isOpened():
+            raise RuntimeError(f"无法打开视频: {self.source}")
+        best = None
+        frame_idx = 0
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if frame_idx >= self.reference_max_frames:
+                    break
+                if frame_idx % self.reference_sample_step == 0:
+                    result = self.desk_detector.detect_desks(
+                        frame, tag=f"ref:{frame_idx}", annotate=False, log=False,
+                    )
+                    desks = result["layout"]["desks"]
+                    score = sum(d["conf"] for d in desks)
+                    if desks and (
+                        best is None
+                        or len(desks) > best["desk_count"]
+                        or (len(desks) == best["desk_count"]
+                            and score > best["score"])
+                    ):
+                        best = {
+                            "frame_idx": frame_idx,
+                            "frame": frame.copy(),
+                            "layout": result["layout"],
+                            "desk_count": len(desks),
+                            "score": score,
+                        }
+                frame_idx += 1
+        finally:
+            cap.release()
+
+        if best is None:
+            raise RuntimeError("桌子检测失败，未找到可用桌子布局。")
+        return best
+
+    # ── 人物提取 ─────────────────────────────────────────────
+
+    def _extract_people(self, boxes, frame_idx):
+        people = []
+        ids = None
+        if hasattr(boxes, "id") and boxes.id is not None:
+            ids = boxes.id.int().cpu().tolist()
+        for idx, box in enumerate(boxes):
+            xyxy = list(map(float, box.xyxy[0].tolist()))
+            conf = float(box.conf[0])
+            cls = int(box.cls[0])
+            track_id = ids[idx] if ids is not None else frame_idx * 10000 + idx
+            people.append({
+                "track_id": int(track_id),
+                "xyxy": xyxy,
+                "conf": conf,
+                "cls": cls,
+            })
+        return people
+
+    # ── 绘制 ─────────────────────────────────────────────────
+
+    def _draw_zones(self, frame, zones):
+        """绘制梯形绑定区域 + 桌子框 + 区域中心."""
+        annotated = frame.copy()
+        overlay = annotated.copy()
+
+        for zone in zones:
+            poly_int = zone["polygon"].astype(np.int32)
+            color = color_for_desk(zone["desk_no"])
+
+            # 半透明填充区域
+            cv2.fillPoly(overlay, [poly_int], color)
+
+            # 区域边框
+            cv2.polylines(annotated, [poly_int], True, color, 2)
+
+            # 桌子实框
+            dx1, dy1, dx2, dy2 = map(int, zone["desk_xyxy"])
+            cv2.rectangle(annotated, (dx1, dy1), (dx2, dy2), color, 2)
+
+            # 标签
+            draw_text(annotated, zone["desk_id"],
+                      (dx1, max(20, dy1 - 6)), color, scale=0.55)
+
+            # 区域中心标记
+            zcx = int(zone["zone_center"][0])
+            zcy = int(zone["zone_center"][1])
+            cv2.drawMarker(annotated, (zcx, zcy), color,
+                           cv2.MARKER_CROSS, 10, 1)
+
+        # 混合叠加
+        cv2.addWeighted(overlay, 0.15, annotated, 0.85, 0, annotated)
+        return annotated
+
+    def _draw_person(self, frame, person, anchor, role, display_desk_id,
+                     is_confirmed, assignment, zone_lookup):
+        x1, y1, x2, y2 = map(int, person["xyxy"])
+
+        if is_confirmed:
+            color = (0, 255, 0)
+        elif display_desk_id is not None:
+            color = (0, 255, 255)
+        elif role == "teacher":
+            color = (0, 0, 255)
+        else:
+            color = (180, 180, 180)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        # 锚点 (人框中心)
+        ax, ay = int(anchor[0]), int(anchor[1])
+        cv2.circle(frame, (ax, ay), 5, (0, 255, 255), -1)
+
+        # 到区域中心连线
+        if assignment is not None:
+            zcx = int(assignment["zone_cx"])
+            zcy = int(assignment["zone_cy"])
+            cv2.line(frame, (ax, ay), (zcx, zcy), (255, 0, 255), 1)
+
+        # 到桌子中心连线
+        if display_desk_id and display_desk_id in zone_lookup:
+            dc = zone_lookup[display_desk_id]["desk_center"]
+            dcx, dcy = int(dc[0]), int(dc[1])
+            cv2.line(frame, (ax, ay), (dcx, dcy), color, 2)
+
+        tid = person["track_id"]
+        mark = "✓" if is_confirmed else "?"
+        label1 = f"ID{tid} {role}"
+        label2 = f"{display_desk_id or '-'}{mark}"
+        draw_text(frame, label1, (x1, max(20, y1 - 20)), color, scale=0.50)
+        draw_text(frame, label2, (x1, max(36, y1 - 2)), color, scale=0.50)
+
+    # ── 主运行 ───────────────────────────────────────────────
+
+    def run(self):
+        os.makedirs(self.output_dir, exist_ok=True)
+        video_name = Path(self.source).stem
+
+        output_video_path = os.path.join(
+            self.output_dir, f"bound_v3_{video_name}.mp4")
+        output_csv_path = os.path.join(
+            self.output_dir, f"binding_v3_{video_name}.csv")
+        output_json_path = os.path.join(
+            self.output_dir, f"binding_v3_{video_name}.json")
+        output_zone_map_path = os.path.join(
+            self.output_dir, f"zone_map_v3_{video_name}.jpg")
+
+        # ── Step 1: 桌子检测 → 6×5 网格 ─────────────────────
+        print("=" * 60)
+        print("Step 1: 建立桌子布局...")
+        reference = self._select_reference_desks()
+        layout = reference["layout"]
+        desks = layout["desks"]
+        column_lines = layout.get("column_lines", [])
+
+        print(f"  桌子参考帧: {reference['frame_idx']}")
+        print(f"  检测到桌子: {len(desks)} 个")
+        print(f"  列直线: {len(column_lines)} 条")
+        print(f"  布局方案: {layout.get('chosen_mode', 'unknown')}")
+
+        # ── Step 2: 构建相邻桌子区间 ─────────────────────────
+        print("=" * 60)
+        print("Step 2: 构建相邻桌子绑定区间 (梯形区域)...")
+        zone_builder = InterDeskZoneBuilder(
+            first_extend_ratio=self.first_extend_ratio,
+            last_extend_ratio=self.last_extend_ratio,
+        )
+        zones = zone_builder.build(desks)
+        zone_lookup = {z["desk_id"]: z for z in zones}
+
+        print(f"  绑定区域数: {len(zones)}")
+        for z in zones:
+            print(f"    {z['desk_id']}: col={z['column_index']} "
+                  f"row={z['row_index']} "
+                  f"center=({z['zone_center'][0]:.0f},"
+                  f"{z['zone_center'][1]:.0f})")
+
+        # 保存区间可视化
+        if "zone_map" in self.outputs:
+            zone_frame = self._draw_zones(reference["frame"], zones)
+            if column_lines:
+                zone_frame = draw_column_lines(
+                    zone_frame, column_lines, reference["frame"].shape[0])
+            cv2.imwrite(output_zone_map_path, zone_frame)
+            print(f"  区间可视化: {output_zone_map_path}")
+
+        # ── Step 3: 构建区间绑定器 ───────────────────────────
+        print("=" * 60)
+        print("Step 3: 构建区间绑定器...")
+        binder = ZoneBinder(zones=zones)
+        print(f"  绑定方法: 人框中心落入梯形区间")
+        print(f"  冲突解决: 最近区域中心优先 (贪心)")
+
+        # ── 打开视频 ─────────────────────────────────────────
+        cap = cv2.VideoCapture(self.source)
+        if not cap.isOpened():
+            raise RuntimeError(f"无法打开视频: {self.source}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 1e-6:
+            fps = 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # ── Step 4: 时间确认器 ───────────────────────────────
+        print("=" * 60)
+        print("Step 4: 逐帧处理 (区间绑定 + 时序稳定)...")
+        confirmer = TemporalConfirmer(
+            fps=fps,
+            confirm_seconds=self.confirm_seconds,
+            confirm_ratio=self.confirm_ratio,
+            hold_seconds=self.hold_seconds,
+            max_students=self.max_students,
+            max_teachers=self.max_teachers,
+            re_confirm_seconds=self.re_confirm_seconds,
+        )
+        print(f"  确认: {self.confirm_seconds}s, "
+              f"保持: {self.hold_seconds}s, "
+              f"防跳变: {self.re_confirm_seconds}s")
+        print(f"  视频: {width}x{height} @ {fps:.1f}fps, "
+              f"总帧: {total_frames}")
+
+        # ── 输出准备 ─────────────────────────────────────────
+        video_writer = None
+        if "binding_video" in self.outputs:
+            video_writer = cv2.VideoWriter(
+                output_video_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                float(fps), (width, height),
+            )
+
+        csv_file = None
+        csv_writer = None
+        if "csv" in self.outputs:
+            csv_file = open(output_csv_path, "w", newline="",
+                            encoding="utf-8-sig")
+            csv_writer = csv.DictWriter(csv_file, fieldnames=[
+                "frame_idx", "track_id", "role", "is_confirmed",
+                "person_conf",
+                "desk_id_current", "desk_id_confirmed", "desk_id_display",
+                "in_zone",
+                "anchor_x", "anchor_y",
+                "zone_cx", "zone_cy",
+                "x1", "y1", "x2", "y2", "total_move",
+            ])
+            csv_writer.writeheader()
+
+        # ── 逐帧处理 ─────────────────────────────────────────
+        frame_idx = 0
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                track_kwargs = {
+                    "source": frame,
+                    "conf": self.person_conf,
+                    "iou": self.person_iou,
+                    "half": self.half,
+                    "verbose": False,
+                    "persist": True,
+                    "tracker": self.tracker,
+                    "classes": self.person_classes,
+                }
+                if self.device:
+                    track_kwargs["device"] = self.device
+                if self.img_size is not None:
+                    track_kwargs["imgsz"] = self.img_size
+
+                results = self.person_model.track(**track_kwargs)
+                boxes = results[0].boxes
+                people = self._extract_people(boxes, frame_idx)
+
+                # 区间绑定
+                assignments, anchor_pts = binder.assign_batch(people)
+
+                # 更新时间确认器
+                for person in people:
+                    tid = person["track_id"]
+                    desk_id = (assignments[tid]["desk_id"]
+                               if tid in assignments else None)
+                    confirmer.update(tid, frame_idx, desk_id, person["xyxy"])
+
+                # 绘制
+                annotated = None
+                if video_writer is not None or self.display:
+                    annotated = self._draw_zones(frame, zones)
+                    if column_lines:
+                        annotated = draw_column_lines(
+                            annotated, column_lines, height)
+
+                student_count = 0
+                teacher_count = 0
+                unknown_count = 0
+
+                for person in people:
+                    tid = person["track_id"]
+                    anchor = anchor_pts.get(
+                        tid, xyxy_center(person["xyxy"]))
+                    assignment = assignments.get(tid)
+                    display_desk = confirmer.get_display_desk_id(
+                        tid, frame_idx)
+                    is_conf = confirmer.is_confirmed(tid, frame_idx)
+                    r = confirmer.role(tid, frame_idx)
+
+                    if r == "student":
+                        student_count += 1
+                    elif r == "teacher":
+                        teacher_count += 1
+                    else:
+                        unknown_count += 1
+
+                    if annotated is not None:
+                        self._draw_person(
+                            annotated, person, anchor, r, display_desk,
+                            is_conf, assignment, zone_lookup,
+                        )
+
+                    if csv_writer is not None:
+                        csv_writer.writerow({
+                            "frame_idx": frame_idx,
+                            "track_id": tid,
+                            "role": r,
+                            "is_confirmed": is_conf,
+                            "person_conf": round(person["conf"], 4),
+                            "desk_id_current": (
+                                assignment["desk_id"]
+                                if assignment else None),
+                            "desk_id_confirmed": confirmer.get_confirmed(
+                                tid, frame_idx),
+                            "desk_id_display": display_desk,
+                            "in_zone": (assignment["in_zone"]
+                                        if assignment else False),
+                            "anchor_x": round(float(anchor[0]), 2),
+                            "anchor_y": round(float(anchor[1]), 2),
+                            "zone_cx": (assignment["zone_cx"]
+                                        if assignment else None),
+                            "zone_cy": (assignment["zone_cy"]
+                                        if assignment else None),
+                            "x1": round(person["xyxy"][0], 2),
+                            "y1": round(person["xyxy"][1], 2),
+                            "x2": round(person["xyxy"][2], 2),
+                            "y2": round(person["xyxy"][3], 2),
+                            "total_move": round(
+                                confirmer.states.get(tid, {}).get(
+                                    "total_move", 0.0), 2),
+                        })
+
+                info = (
+                    f"Frame {frame_idx}/{total_frames or '?'} | "
+                    f"S={student_count} T={teacher_count} ?={unknown_count}"
+                )
+                if annotated is not None:
+                    draw_text(annotated, info, (10, 28),
+                              (255, 255, 255), scale=0.8)
+                    if video_writer is not None:
+                        video_writer.write(annotated)
+
+                if self.display and annotated is not None:
+                    cv2.imshow("V3 Zone Binding", annotated)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        print("用户中断")
+                        break
+
+                if frame_idx % 30 == 0 and total_frames > 0:
+                    pct = 100.0 * frame_idx / total_frames
+                    print(f"  {frame_idx}/{total_frames} ({pct:.1f}%) "
+                          f"S={student_count} T={teacher_count}")
+
+                frame_idx += 1
+
+        finally:
+            cap.release()
+            if video_writer is not None:
+                video_writer.release()
+            if csv_file is not None:
+                csv_file.close()
+            if self.display:
+                cv2.destroyAllWindows()
+
+        # ── 输出 JSON ────────────────────────────────────────
+        print("=" * 60)
+        print("输出汇总:")
+
+        occupied_seats = set()
+        for tid, st in confirmer.states.items():
+            if st["confirmed_desk_id"] is not None:
+                occupied_seats.add(st["confirmed_desk_id"])
+
+        summary = {
+            "source": self.source,
+            "version": "v3_zone_binding",
+            "reference_frame_idx": reference["frame_idx"],
+            "desk_count": len(desks),
+            "zone_count": len(zones),
+            "occupied_seats": len(occupied_seats),
+            "config": {
+                "binding_method": "inter_desk_zone",
+                "anchor_point": "bbox_center",
+                "first_extend_ratio": self.first_extend_ratio,
+                "last_extend_ratio": self.last_extend_ratio,
+                "confirm_seconds": self.confirm_seconds,
+                "confirm_ratio": self.confirm_ratio,
+                "hold_seconds": self.hold_seconds,
+                "re_confirm_seconds": self.re_confirm_seconds,
+            },
+            "desks": desks,
+            "zones": [
+                {
+                    "desk_id": z["desk_id"],
+                    "desk_no": z["desk_no"],
+                    "column_index": z["column_index"],
+                    "row_index": z["row_index"],
+                    "desk_xyxy": z["desk_xyxy"],
+                    "polygon": z["polygon"].tolist(),
+                    "zone_center": z["zone_center"],
+                }
+                for z in zones
+            ],
+            "column_lines": column_lines,
+            "tracks": [
+                confirmer.summary(tid, frame_idx)
+                for tid in sorted(confirmer.states.keys())
+            ],
+            "seat_occupancy": {
+                z["desk_id"]: z["desk_id"] in occupied_seats
+                for z in zones
+            },
+            "saved_outputs": {},
+        }
+
+        if "binding_video" in self.outputs:
+            summary["saved_outputs"]["binding_video"] = output_video_path
+            print(f"  绑定视频: {output_video_path}")
+        if "zone_map" in self.outputs:
+            summary["saved_outputs"]["zone_map"] = output_zone_map_path
+            print(f"  区间可视化: {output_zone_map_path}")
+        if "csv" in self.outputs:
+            summary["saved_outputs"]["csv"] = output_csv_path
+            print(f"  CSV: {output_csv_path}")
+        if "json" in self.outputs:
+            output_json_dir = os.path.dirname(output_json_path)
+            if output_json_dir:
+                os.makedirs(output_json_dir, exist_ok=True)
+            with open(output_json_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+            summary["saved_outputs"]["json"] = output_json_path
+            print(f"  JSON: {output_json_path}")
+
+        print("=" * 60)
+        print(f"完成! {frame_idx} 帧, "
+              f"确认学生 {len(occupied_seats)}/{len(zones)} 个座位")
+
+
+# ─── CLI ─────────────────────────────────────────────────────
+
+def parse_classes(s: str | None):
+    if not s:
+        return None
+    return [int(p.strip()) for p in s.split(",") if p.strip()]
+
+
+def parse_outputs(raw: str | None):
+    valid = {"binding_video", "zone_map", "csv", "json"}
+    if not raw:
+        return valid
+    parts = {p.strip() for p in raw.split(",") if p.strip()}
+    if "all" in parts:
+        return valid
+    unknown = parts - valid
+    if unknown:
+        raise ValueError(
+            f"未知输出: {', '.join(unknown)}。"
+            f"可选: {', '.join(sorted(valid))}")
+    return parts
+
+
+def main():
+    p = argparse.ArgumentParser(
+        "人桌绑定 V3 (相邻桌子区间绑定)")
+
+    p.add_argument("--source", required=True, help="输入视频路径")
+    p.add_argument("--weights",
+                   default="exam_seat_binding/weight/yolo11speopel.pt",
+                   help="人物模型权重")
+    p.add_argument("--desk-weights",
+                   default="exam_seat_binding/weight/yolo11desk.pt",
+                   help="桌子模型权重")
+    p.add_argument("--output", default="exam_seat_binding/output",
+                   help="输出目录")
+    p.add_argument("--outputs",
+                   default="binding_video,zone_map,csv,json",
+                   help="输出: binding_video,zone_map,csv,json 或 all")
+
+    # 检测参数
+    p.add_argument("--conf", type=float, default=0.18)
+    p.add_argument("--iou", type=float, default=0.60)
+    p.add_argument("--desk-conf", type=float, default=0.7)
+    p.add_argument("--desk-iou", type=float, default=0.45)
+    p.add_argument("--device", default="")
+    p.add_argument("--img-size", type=int, default=None)
+    p.add_argument("--half", action="store_true")
+    p.add_argument("--tracker", default="bytetrack.yaml")
+    p.add_argument("--classes", default=None)
+    p.add_argument("--display", action="store_true")
+
+    # 桌子布局参数
+    p.add_argument("--desk-mode", default="auto",
+                   choices=["normal", "scheme1", "scheme2", "auto"])
+    p.add_argument("--desk-num-cols", type=int, default=5)
+    p.add_argument("--desk-required-per-col", type=int, default=6)
+    p.add_argument("--reference-max-frames", type=int, default=120)
+    p.add_argument("--reference-sample-step", type=int, default=5)
+
+    # V3 核心: 区间构建参数
+    p.add_argument("--first-extend", type=float, default=0.3,
+                   help="第一排座位向下(近相机)延伸比例 (基于间距)")
+    p.add_argument("--last-extend", type=float, default=0.8,
+                   help="最后排座位向上(远相机)延伸比例 (基于间距)")
+
+    # 时间确认参数
+    p.add_argument("--confirm-seconds", type=float, default=10.0)
+    p.add_argument("--confirm-ratio", type=float, default=0.65)
+    p.add_argument("--hold-seconds", type=float, default=5.0)
+    p.add_argument("--re-confirm-seconds", type=float, default=5.0,
+                   help="已确认后切换座位所需连续帧时间")
+
+    # 教室规模
+    p.add_argument("--max-students", type=int, default=30)
+    p.add_argument("--max-teachers", type=int, default=2)
+
+    args = p.parse_args()
+
+    try:
+        outputs = parse_outputs(args.outputs)
+    except ValueError as exc:
+        p.error(str(exc))
+
+    pipeline = PersonDeskBindingPipelineV3(
+        source=args.source,
+        person_weights=args.weights,
+        desk_weights=args.desk_weights,
+        output_dir=args.output,
+        person_conf=args.conf,
+        person_iou=args.iou,
+        desk_conf=args.desk_conf,
+        desk_iou=args.desk_iou,
+        device=args.device,
+        img_size=args.img_size,
+        half=args.half,
+        tracker=args.tracker,
+        person_classes=parse_classes(args.classes),
+        desk_mode=args.desk_mode,
+        desk_num_cols=args.desk_num_cols,
+        desk_required_per_col=args.desk_required_per_col,
+        reference_max_frames=args.reference_max_frames,
+        reference_sample_step=args.reference_sample_step,
+        confirm_seconds=args.confirm_seconds,
+        confirm_ratio=args.confirm_ratio,
+        hold_seconds=args.hold_seconds,
+        re_confirm_seconds=args.re_confirm_seconds,
+        first_extend_ratio=args.first_extend,
+        last_extend_ratio=args.last_extend,
+        outputs=outputs,
+        display=args.display,
+        max_students=args.max_students,
+        max_teachers=args.max_teachers,
+    )
+    pipeline.run()
+
+
+if __name__ == "__main__":
+    main()
