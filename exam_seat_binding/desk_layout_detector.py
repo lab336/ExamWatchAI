@@ -1,18 +1,20 @@
 """
-统一版桌椅检测可视化脚本，合并以下功能：
-1) visualize_desk_detection.py（分列方案1）
-2) visualize_desk_detection2.py（分列方案2）
-3) visualize_desk_detection_auto.py（自动选择方案）
+桌子布局检测器。
+
+职责：
+1. 使用 YOLO 检测桌子
+2. 通过两种分列方案完成桌子编号
+3. 支持 normal / scheme1 / scheme2 / auto 四种模式
 
 示例：
 1. 普通检测:
-   python exam_seat_binding/visualize_desk_detection_merged.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode normal
+   python exam_seat_binding/desk_layout_detector.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode normal
 2. 分列方案1:
-   python exam_seat_binding/visualize_desk_detection_merged.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode scheme1
+   python exam_seat_binding/desk_layout_detector.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode scheme1
 3. 分列方案2:
-   python exam_seat_binding/visualize_desk_detection_merged.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode scheme2
+   python exam_seat_binding/desk_layout_detector.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode scheme2
 4. 自动选择方案:
-   python exam_seat_binding/visualize_desk_detection_merged.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode auto
+   python exam_seat_binding/desk_layout_detector.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode auto
 """
 
 import argparse
@@ -26,6 +28,117 @@ import numpy as np
 from ultralytics import YOLO
 
 
+def box_xyxy(box):
+    return tuple(map(float, box.xyxy[0].tolist()))
+
+
+def box_center(box):
+    x1, y1, x2, y2 = box_xyxy(box)
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
+def order_column_indices(boxes, columns, style=1):
+    ordered_columns = []
+    boxes_list = list(boxes)
+
+    for idxs in columns:
+        centers_list = []
+        for idx in idxs:
+            cx, cy = box_center(boxes_list[idx])
+            centers_list.append((idx, cx, cy))
+
+        if style == 1:
+            sorted_pairs = sorted(centers_list, key=lambda p: p[2], reverse=True)
+        else:
+            sorted_pairs = sorted(centers_list, key=lambda p: (p[2], p[1]), reverse=True)
+        ordered_columns.append([p[0] for p in sorted_pairs])
+
+    return ordered_columns
+
+
+def build_layout_entries(boxes, columns, style=1, num_per_col=6):
+    boxes_list = list(boxes)
+    ordered_columns = order_column_indices(boxes_list, columns, style=style)
+    entries = []
+
+    for col_id, sorted_idxs in enumerate(ordered_columns):
+        for row_id, idx in enumerate(sorted_idxs):
+            box = boxes_list[idx]
+            x1, y1, x2, y2 = box_xyxy(box)
+            cx, cy = box_center(box)
+            conf = float(box.conf[0])
+            cls = int(box.cls[0])
+            desk_no = col_id * num_per_col + (row_id + 1)
+            entries.append(
+                {
+                    "index": idx,
+                    "desk_no": desk_no,
+                    "desk_id": f"D{desk_no:02d}",
+                    "column_index": col_id,
+                    "row_index": row_id,
+                    "xyxy": [x1, y1, x2, y2],
+                    "center": [cx, cy],
+                    "conf": conf,
+                    "cls": cls,
+                }
+            )
+
+    entries.sort(key=lambda item: item["desk_no"])
+    return ordered_columns, entries
+
+
+def build_column_line_entries(boxes, ordered_columns, layout_entries):
+    boxes_list = list(boxes)
+    column_lines = []
+
+    for col_id, sorted_idxs in enumerate(ordered_columns):
+        if not sorted_idxs:
+            continue
+
+        points = []
+        widths = []
+        heights = []
+        ordered_centers = []
+        for idx in sorted_idxs:
+            box = boxes_list[idx]
+            x1, y1, x2, y2 = box_xyxy(box)
+            center = list(box_center(box))
+            points.append(center)
+            ordered_centers.append(center)
+            widths.append(x2 - x1)
+            heights.append(y2 - y1)
+
+        points_np = np.asarray(points, dtype=np.float32)
+        line_kb = vd1.fit_line_kb_positive(points_np, min_k=0.02)
+        column_desks = sorted(
+            [item for item in layout_entries if item["column_index"] == col_id],
+            key=lambda item: item["row_index"],
+        )
+        step_lengths = []
+        for point_a, point_b in zip(ordered_centers[:-1], ordered_centers[1:]):
+            step_lengths.append(float(np.linalg.norm(np.asarray(point_a) - np.asarray(point_b))))
+        avg_step = float(np.mean(step_lengths)) if step_lengths else float(np.mean(heights))
+
+        column_lines.append(
+            {
+                "column_index": col_id,
+                "line_kb": [float(line_kb[0]), float(line_kb[1])],
+                "x_min": float(np.min(points_np[:, 0])),
+                "x_max": float(np.max(points_np[:, 0])),
+                "y_min": float(np.min(points_np[:, 1])),
+                "y_max": float(np.max(points_np[:, 1])),
+                "avg_box_width": float(np.mean(widths)),
+                "avg_box_height": float(np.mean(heights)),
+                "avg_step": avg_step,
+                "segment_start": [float(ordered_centers[0][0]), float(ordered_centers[0][1])],
+                "segment_end": [float(ordered_centers[-1][0]), float(ordered_centers[-1][1])],
+                "desk_ids": [item["desk_id"] for item in column_desks],
+            }
+        )
+
+    return column_lines
+
+
 def _load_module_from_file(name: str, filename: str):
     path = os.path.join(os.path.dirname(__file__), filename)
     spec = importlib.util.spec_from_file_location(name, path)
@@ -35,11 +148,11 @@ def _load_module_from_file(name: str, filename: str):
 
 
 try:
-    from exam_seat_binding import visualize_desk_detection as vd1
-    from exam_seat_binding import visualize_desk_detection2 as vd2
+    from exam_seat_binding import desk_layout_scheme1 as vd1
+    from exam_seat_binding import desk_layout_scheme2 as vd2
 except Exception:
-    vd1 = _load_module_from_file("visualize_desk_detection", "visualize_desk_detection.py")
-    vd2 = _load_module_from_file("visualize_desk_detection2", "visualize_desk_detection2.py")
+    vd1 = _load_module_from_file("desk_layout_scheme1", "desk_layout_scheme1.py")
+    vd2 = _load_module_from_file("desk_layout_scheme2", "desk_layout_scheme2.py")
 
 
 def avg_point_line_distance(centers: np.ndarray, columns, lines) -> float:
@@ -119,36 +232,30 @@ def draw_layout(img, boxes, columns, style=1, num_per_col=6):
         (220, 80, 255),
     ]
     boxes_list = list(boxes)
+    ordered_columns, layout_entries = build_layout_entries(
+        boxes_list,
+        columns,
+        style=style,
+        num_per_col=num_per_col,
+    )
 
     for box in boxes_list:
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
         cv2.rectangle(annotated, (x1, y1), (x2, y2), (120, 120, 120), 1)
 
-    for col_id, idxs in enumerate(columns):
-        if len(idxs) == 0:
+    for col_id, sorted_idxs in enumerate(ordered_columns):
+        if len(sorted_idxs) == 0:
             continue
         color = col_colors[col_id % len(col_colors)]
 
-        centers_list = []
-        for idx in idxs:
-            box = boxes_list[idx]
-            x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
-            centers_list.append((idx, (x1 + x2) / 2.0, (y1 + y2) / 2.0))
-
-        if style == 1:
-            sorted_pairs = sorted(centers_list, key=lambda p: p[2], reverse=True)
-        else:
-            sorted_pairs = sorted(centers_list, key=lambda p: (p[2], p[1]), reverse=True)
-        sorted_idxs = [p[0] for p in sorted_pairs]
-
-        for row_id, idx in enumerate(sorted_idxs):
-            seat_no = col_id * num_per_col + (row_id + 1)
-            box = boxes_list[idx]
+        col_entries = [item for item in layout_entries if item["column_index"] == col_id]
+        for item in col_entries:
+            box = boxes_list[item["index"]]
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            conf = float(box.conf[0])
+            conf = item["conf"]
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            label = f"{seat_no}: {conf:.2f}"
+            label = f"{item['desk_no']}: {conf:.2f}"
             (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(annotated, (x1, y1 - label_h - baseline - 5), (x1 + label_w, y1), color, -1)
             cv2.putText(annotated, label, (x1, y1 - baseline - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
@@ -179,7 +286,7 @@ def draw_layout(img, boxes, columns, style=1, num_per_col=6):
     return annotated
 
 
-class UnifiedDeskDetector:
+class DeskLayoutDetector:
     def __init__(
         self,
         weights_path,
@@ -274,8 +381,7 @@ class UnifiedDeskDetector:
     def _extract_centers(self, boxes):
         centers = []
         for box in boxes:
-            x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
-            centers.append([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
+            centers.append(list(box_center(box)))
         return np.array(centers, dtype=np.float32)
 
     def _select_layout(self, centers_np: np.ndarray, tag="", log=True):
@@ -318,6 +424,86 @@ class UnifiedDeskDetector:
             print(f"[AUTO] 五列拟合不足，回退整体误差比较: s1={score1:.4f}, s2={score2:.4f}, 选择方案{chosen}: {tag}")
         return chosen, (cols1 if chosen == 1 else cols2)
 
+    def get_layout_info(self, boxes, tag="", log=True):
+        if len(boxes) == 0:
+            return {
+                "chosen_scheme": 0,
+                "chosen_mode": "normal",
+                "style": 0,
+                "columns": [],
+                "ordered_columns": [],
+                "column_lines": [],
+                "desks": [],
+            }
+
+        if self.mode == "normal":
+            desks = []
+            for idx, box in enumerate(list(boxes), 1):
+                x1, y1, x2, y2 = box_xyxy(box)
+                cx, cy = box_center(box)
+                desks.append(
+                    {
+                        "index": idx - 1,
+                        "desk_no": idx,
+                        "desk_id": f"D{idx:02d}",
+                        "column_index": -1,
+                        "row_index": idx - 1,
+                        "xyxy": [x1, y1, x2, y2],
+                        "center": [cx, cy],
+                        "conf": float(box.conf[0]),
+                        "cls": int(box.cls[0]),
+                    }
+                )
+            return {
+                "chosen_scheme": 0,
+                "chosen_mode": "normal",
+                "style": 0,
+                "columns": [],
+                "ordered_columns": [],
+                "column_lines": [],
+                "desks": desks,
+            }
+
+        centers_np = self._extract_centers(boxes)
+        chosen, columns = self._select_layout(centers_np, tag=tag, log=log)
+        style = 1 if chosen == 1 else 2
+        ordered_columns, desks = build_layout_entries(
+            boxes,
+            columns,
+            style=style,
+            num_per_col=self.required_per_col,
+        )
+        column_lines = build_column_line_entries(boxes, ordered_columns, desks)
+        chosen_mode = "scheme1" if chosen == 1 else "scheme2"
+        return {
+            "chosen_scheme": chosen,
+            "chosen_mode": chosen_mode,
+            "style": style,
+            "columns": columns,
+            "ordered_columns": ordered_columns,
+            "column_lines": column_lines,
+            "desks": desks,
+        }
+
+    def detect_desks(self, source, tag="", annotate=False, log=True):
+        results = self._predict(source)
+        boxes = results[0].boxes
+        layout_info = self.get_layout_info(boxes, tag=tag, log=log)
+
+        annotated = None
+        if annotate:
+            if isinstance(source, str):
+                image = cv2.imread(source)
+            else:
+                image = source.copy()
+            annotated = self._annotate(image, boxes, tag=tag, log=log)
+
+        return {
+            "boxes": boxes,
+            "layout": layout_info,
+            "annotated": annotated,
+        }
+
     def _annotate(self, img, boxes, tag="", log=True):
         if len(boxes) == 0:
             return img.copy()
@@ -325,15 +511,13 @@ class UnifiedDeskDetector:
         if self.mode == "normal":
             return draw_normal(img, boxes, self.model.names if hasattr(self.model, "names") else None)
 
-        centers_np = self._extract_centers(boxes)
-        chosen, columns = self._select_layout(centers_np, tag=tag, log=log)
-        style = 1 if chosen == 1 else 2
+        layout_info = self.get_layout_info(boxes, tag=tag, log=log)
         return draw_layout(
             img,
             boxes,
-            columns,
-            style=style,
-            num_per_col=6,
+            layout_info["columns"],
+            style=layout_info["style"],
+            num_per_col=self.required_per_col,
         )
 
     def _output_suffix(self):
@@ -463,7 +647,7 @@ def _resolve_mode(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="统一版YOLO桌椅检测与可视化脚本")
+    parser = argparse.ArgumentParser(description="桌子布局检测脚本")
     parser.add_argument("--source", type=str, required=True, help="检测源: 图片/视频/文件夹/摄像头ID(0)")
     parser.add_argument("--weights", type=str, default="exam_seat_binding/weight/yolo11desk.pt", help="模型权重文件路径")
     parser.add_argument("--conf", type=float, default=0.7, help="置信度阈值")
@@ -503,7 +687,7 @@ def main():
         return
 
     try:
-        detector = UnifiedDeskDetector(
+        detector = DeskLayoutDetector(
             weights_path=args.weights,
             conf_threshold=args.conf,
             iou_threshold=args.iou,
@@ -538,3 +722,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+UnifiedDeskDetector = DeskLayoutDetector
