@@ -71,6 +71,44 @@ def l2(a, b):
     ))
 
 
+def build_classroom_polygon_from_desks(desks: list, padding: float = 0.0):
+    """根据 5x6 桌子整体外轮廓构建包围多边形(凸包)."""
+    if not desks:
+        return None
+
+    pts = []
+    for d in desks:
+        x1, y1, x2, y2 = d["xyxy"]
+        pts.append([x1, y1])
+        pts.append([x2, y1])
+        pts.append([x2, y2])
+        pts.append([x1, y2])
+
+    pts_np = np.asarray(pts, dtype=np.float32)
+    hull = cv2.convexHull(pts_np).reshape(-1, 2)
+
+    if padding > 0:
+        cx = float(np.mean(hull[:, 0]))
+        cy = float(np.mean(hull[:, 1]))
+        padded = []
+        for px, py in hull:
+            vx = float(px) - cx
+            vy = float(py) - cy
+            norm = max(1e-6, float(np.sqrt(vx * vx + vy * vy)))
+            padded.append([px + padding * vx / norm, py + padding * vy / norm])
+        hull = np.asarray(padded, dtype=np.float32)
+
+    return hull
+
+
+def point_in_polygon(point_xy, polygon: np.ndarray | None) -> bool:
+    """判断点是否在多边形内或边上."""
+    if polygon is None or len(polygon) < 3:
+        return False
+    poly = polygon.reshape(-1, 1, 2).astype(np.float32)
+    return cv2.pointPolygonTest(poly, (float(point_xy[0]), float(point_xy[1])), False) >= 0
+
+
 # ─── 相邻桌子区间构建 ────────────────────────────────────────
 
 class InterDeskZoneBuilder:
@@ -645,7 +683,7 @@ class PersonDeskBindingPipelineV3:
 
     # ── 绘制 ─────────────────────────────────────────────────
 
-    def _draw_zones(self, frame, zones):
+    def _draw_zones(self, frame, zones, classroom_polygon=None):
         """绘制梯形绑定区域 + 桌子框 + 区域中心."""
         annotated = frame.copy()
         overlay = annotated.copy()
@@ -676,6 +714,14 @@ class PersonDeskBindingPipelineV3:
 
         # 混合叠加
         cv2.addWeighted(overlay, 0.15, annotated, 0.85, 0, annotated)
+
+        if classroom_polygon is not None and len(classroom_polygon) >= 3:
+            cp = classroom_polygon.astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(annotated, [cp], True, (255, 255, 255), 2)
+            tl = tuple(np.min(classroom_polygon, axis=0).astype(np.int32))
+            draw_text(annotated, "SEAT_AREA", (int(tl[0]), max(20, int(tl[1]) - 8)),
+                      (255, 255, 255), scale=0.55)
+
         return annotated
 
     def _draw_person(self, frame, person, anchor, role, display_desk_id,
@@ -753,6 +799,7 @@ class PersonDeskBindingPipelineV3:
         )
         zones = zone_builder.build(desks)
         zone_lookup = {z["desk_id"]: z for z in zones}
+        classroom_polygon = build_classroom_polygon_from_desks(desks, padding=20.0)
 
         print(f"  绑定区域数: {len(zones)}")
         for z in zones:
@@ -763,7 +810,7 @@ class PersonDeskBindingPipelineV3:
 
         # 保存区间可视化
         if "zone_map" in self.outputs:
-            zone_frame = self._draw_zones(reference["frame"], zones)
+            zone_frame = self._draw_zones(reference["frame"], zones, classroom_polygon)
             if column_lines:
                 zone_frame = draw_column_lines(
                     zone_frame, column_lines, reference["frame"].shape[0])
@@ -825,6 +872,7 @@ class PersonDeskBindingPipelineV3:
                 "frame_idx", "track_id", "role", "is_confirmed",
                 "person_conf",
                 "desk_id_current", "desk_id_confirmed", "desk_id_display",
+                "inside_classroom",
                 "in_zone",
                 "anchor_x", "anchor_y",
                 "zone_cx", "zone_cy",
@@ -834,6 +882,7 @@ class PersonDeskBindingPipelineV3:
 
         # ── 逐帧处理 ─────────────────────────────────────────
         frame_idx = 0
+        track_region_role = {}
         try:
             while True:
                 ret, frame = cap.read()
@@ -872,7 +921,7 @@ class PersonDeskBindingPipelineV3:
                 # 绘制
                 annotated = None
                 if video_writer is not None or self.display:
-                    annotated = self._draw_zones(frame, zones)
+                    annotated = self._draw_zones(frame, zones, classroom_polygon)
                     if column_lines:
                         annotated = draw_column_lines(
                             annotated, column_lines, height)
@@ -889,7 +938,9 @@ class PersonDeskBindingPipelineV3:
                     display_desk = confirmer.get_display_desk_id(
                         tid, frame_idx)
                     is_conf = confirmer.is_confirmed(tid, frame_idx)
-                    r = confirmer.role(tid, frame_idx)
+                    inside_classroom = point_in_polygon(anchor, classroom_polygon)
+                    r = "student" if inside_classroom else "teacher"
+                    track_region_role[tid] = r
 
                     if r == "student":
                         student_count += 1
@@ -917,6 +968,7 @@ class PersonDeskBindingPipelineV3:
                             "desk_id_confirmed": confirmer.get_confirmed(
                                 tid, frame_idx),
                             "desk_id_display": display_desk,
+                            "inside_classroom": inside_classroom,
                             "in_zone": (assignment["in_zone"]
                                         if assignment else False),
                             "anchor_x": round(float(anchor[0]), 2),
@@ -985,6 +1037,8 @@ class PersonDeskBindingPipelineV3:
             "config": {
                 "binding_method": "inter_desk_zone",
                 "anchor_point": "bbox_center",
+                "teacher_rule": "outside_classroom_polygon",
+                "student_rule": "inside_classroom_polygon",
                 "first_extend_ratio": self.first_extend_ratio,
                 "last_extend_ratio": self.last_extend_ratio,
                 "confirm_seconds": self.confirm_seconds,
@@ -992,6 +1046,8 @@ class PersonDeskBindingPipelineV3:
                 "hold_seconds": self.hold_seconds,
                 "re_confirm_seconds": self.re_confirm_seconds,
             },
+            "classroom_polygon": (classroom_polygon.tolist()
+                                  if classroom_polygon is not None else None),
             "desks": desks,
             "zones": [
                 {
@@ -1007,8 +1063,12 @@ class PersonDeskBindingPipelineV3:
             ],
             "column_lines": column_lines,
             "tracks": [
-                confirmer.summary(tid, frame_idx)
+                {
+                    **item,
+                    "role": track_region_role.get(tid, item.get("role", "unknown")),
+                }
                 for tid in sorted(confirmer.states.keys())
+                for item in [confirmer.summary(tid, frame_idx)]
             ],
             "seat_occupancy": {
                 z["desk_id"]: z["desk_id"] in occupied_seats
