@@ -60,6 +60,12 @@ def xyxy_center(box):
     return np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float32)
 
 
+def foot_point(box):
+    """人框底部中心点（脚部位置），更接近桌子位置"""
+    x1, y1, x2, y2 = box
+    return np.array([(x1 + x2) / 2.0, y2], dtype=np.float32)
+
+
 def head_point(box):
     x1, y1, x2, y2 = box
     return np.array([(x1 + x2) / 2.0, y1], dtype=np.float32)
@@ -92,6 +98,7 @@ def build_classroom_polygon_from_desks(desks: list, padding: float = 0.0):
     pts_np = np.asarray(pts, dtype=np.float32)
     hull = cv2.convexHull(pts_np).reshape(-1, 2)
 
+    # 扩大padding以包含更多边缘学生
     if padding > 0:
         cx = float(np.mean(hull[:, 0]))
         cy = float(np.mean(hull[:, 1]))
@@ -100,7 +107,8 @@ def build_classroom_polygon_from_desks(desks: list, padding: float = 0.0):
             vx = float(px) - cx
             vy = float(py) - cy
             norm = max(1e-6, float(np.sqrt(vx * vx + vy * vy)))
-            padded.append([px + padding * vx / norm, py + padding * vy / norm])
+            # 增加padding系数，确保边缘学生也在包围区内
+            padded.append([px + padding * 1.5 * vx / norm, py + padding * 1.5 * vy / norm])
         hull = np.asarray(padded, dtype=np.float32)
 
     return hull
@@ -174,21 +182,27 @@ class InterDeskZoneBuilder:
                     nxt = col_desks[i + 1]
                     x1_n, y1_n, x2_n, y2_n = nxt["xyxy"]
 
+                    # 扩展区域以确保覆盖，向左右扩展
+                    desk_w_c = x2_c - x1_c
+                    desk_w_n = x2_n - x1_n
+                    lateral_expand_c = desk_w_c * 0.15  # 左右扩展15%
+                    lateral_expand_n = desk_w_n * 0.15
+                    
                     # 四边形顶点 (顺时针):
                     #   A = 当前桌 TL    B = 当前桌 BR
                     #   D = 下一桌 BR    C = 下一桌 TL
                     poly = np.array([
-                        [x1_c, y1_c],   # A: 当前桌左上
-                        [x2_c, y2_c],   # B: 当前桌右下
-                        [x2_n, y2_n],   # D: 下一桌右下
-                        [x1_n, y1_n],   # C: 下一桌左上
+                        [x1_c - lateral_expand_c, y1_c],   # A: 当前桌左上（左扩）
+                        [x2_c + lateral_expand_c, y2_c],   # B: 当前桌右下（右扩）
+                        [x2_n + lateral_expand_n, y2_n],   # D: 下一桌右下（右扩）
+                        [x1_n - lateral_expand_n, y1_n],   # C: 下一桌左上（左扩）
                     ], dtype=np.float32)
 
                     # 第一个座位: 向下(近相机方向)扩展
                     if i == 0:
-                        gap_h = y2_c - y2_n  # 两桌底边间距
+                        gap_h = abs(y2_c - y1_n)  # 两桌间距
                         ext = max(gap_h * self.first_extend_ratio,
-                                  (y2_c - y1_c) * 0.3)
+                                  (y2_c - y1_c) * 0.5)  # 增加扩展
                         poly[0][1] += ext   # A.y 向下
                         poly[1][1] += ext   # B.y 向下
 
@@ -196,24 +210,25 @@ class InterDeskZoneBuilder:
                     # ── 最后一个座位: 向远端延伸 ──
                     if i > 0:
                         prev = col_desks[i - 1]
-                        gap_h = prev["xyxy"][3] - y2_c
+                        gap_h = abs(prev["xyxy"][1] - y1_c)
                     else:
                         gap_h = y2_c - y1_c
 
                     ext = max(gap_h * self.last_extend_ratio,
-                              (y2_c - y1_c) * 0.5)
+                              (y2_c - y1_c) * 1.0)  # 增加扩展
 
-                    # 透视缩放: 远处桌子窄些
+                    # 透视缩放: 远处桌子窄些，但也要扩展
                     desk_w = x2_c - x1_c
                     cx = (x1_c + x2_c) / 2.0
-                    shrink = 0.85
+                    lateral_expand = desk_w * 0.15
+                    shrink = 1.0  # 不缩小，保持宽度
                     half_w = desk_w * shrink / 2.0
 
                     poly = np.array([
-                        [x1_c, y1_c],                   # A: 桌左上
-                        [x2_c, y2_c],                   # B: 桌右下
-                        [cx + half_w, y1_c - ext],      # D: 延伸右上
-                        [cx - half_w, y1_c - ext],      # C: 延伸左上
+                        [x1_c - lateral_expand, y1_c],      # A: 桌左上（左扩）
+                        [x2_c + lateral_expand, y2_c],      # B: 桌右下（右扩）
+                        [cx + half_w, y1_c - ext],          # D: 延伸右上
+                        [cx - half_w, y1_c - ext],          # C: 延伸左上
                     ], dtype=np.float32)
 
                 zone_cx = float(np.mean(poly[:, 0]))
@@ -264,11 +279,11 @@ class ZoneBinder:
         if not people or not self.zones:
             return {}, {}
 
-        # 提取锚点 (人框中心)
+        # 提取锚点 (人框底部中心 - 脚部位置，更接近桌子)
         anchor_pts = {}
         for person in people:
             tid = person["track_id"]
-            anchor_pts[tid] = xyxy_center(person["xyxy"])
+            anchor_pts[tid] = foot_point(person["xyxy"])
 
         # 对每个人, 找它落入的区域
         candidates = []  # (dist_to_center, track_id, zone_idx)
@@ -423,6 +438,7 @@ class TemporalConfirmer:
     - 同一座位在窗口内占比 >= confirm_ratio → 确认绑定
     - 确认后短时丢失仍保持 (hold)
     - 已确认后需连续 re_confirm_frames 帧指向新座位才切换 (防跳变)
+    - 场景切换检测：当突然出现大量学生时，启用快速确认模式
     """
 
     def __init__(
@@ -438,6 +454,9 @@ class TemporalConfirmer:
         release_miss_seconds: float = 12.0,
         pending_switch_seconds: float = 1.2,
         pending_hold_seconds: float = 2.0,
+        scene_switch_threshold: int = 10,  # 新增学生数阈值
+        quick_confirm_seconds: float = 1.5,  # 快速确认时间：1.5秒
+        quick_confirm_ratio: float = 0.65,   # 快速确认比例：65%
     ):
         self.fps = max(1.0, fps)
         self.confirm_frames = int(confirm_seconds * self.fps)
@@ -450,6 +469,15 @@ class TemporalConfirmer:
         self.pending_hold_frames = max(1, int(pending_hold_seconds * self.fps))
         self.max_students = max_students
         self.max_teachers = max_teachers
+        
+        # 场景切换检测
+        self.scene_switch_threshold = scene_switch_threshold
+        self.quick_confirm_frames = int(quick_confirm_seconds * self.fps)
+        self.quick_confirm_ratio = quick_confirm_ratio
+        self.scene_switch_frame = -1
+        self.last_student_count = 0
+        self.quick_confirm_mode = False
+        self.quick_confirm_window = int(15.0 * self.fps)  # 快速确认窗口15秒
 
         self.states: dict = {}
         self._desk_owner: dict = {}
@@ -539,8 +567,19 @@ class TemporalConfirmer:
                 st["consecutive_new_desk_id"] = None
             return
 
-        # 未确认: 常规确认
+        # 未确认: 常规确认或快速确认
         history = st["history"]
+        
+        # 快速确认模式：场景切换后快速绑定稳定学生
+        if self.quick_confirm_mode and len(history) >= self.quick_confirm_frames:
+            votes = [d for d in history if d is not None]
+            if votes:
+                best_desk, count = Counter(votes).most_common(1)[0]
+                if count / len(history) >= self.quick_confirm_ratio:
+                    self._try_confirm(track_id, best_desk, count, frame_idx)
+                    return
+        
+        # 常规确认模式
         if len(history) >= min(self.confirm_frames, int(self.fps * 3)):
             votes = [d for d in history if d is not None]
             if votes:
@@ -681,6 +720,29 @@ class TemporalConfirmer:
             "total_move": round(st["total_move"], 3),
             "observed_frames": len(st["history"]),
         }
+    
+    def detect_scene_switch(self, current_student_count: int, frame_idx: int):
+        """
+        检测场景切换：当学生数突然大幅增加时（如视频拼接）
+        
+        Args:
+            current_student_count: 当前帧的学生数量
+            frame_idx: 当前帧索引
+        """
+        # 学生数突然增加超过阈值，判定为场景切换
+        if current_student_count - self.last_student_count >= self.scene_switch_threshold:
+            self.scene_switch_frame = frame_idx
+            self.quick_confirm_mode = True
+            print(f"\n[场景切换检测] 帧{frame_idx}: 学生数从{self.last_student_count}增至{current_student_count}")
+            print(f"  启用快速确认模式: {self.quick_confirm_frames}帧({self.quick_confirm_frames/self.fps:.1f}秒) @ {self.quick_confirm_ratio*100:.0f}%")
+            print(f"  快速确认窗口: {self.quick_confirm_window/self.fps:.1f}秒")
+        
+        # 场景切换后一段时间，退出快速确认模式
+        if self.quick_confirm_mode and frame_idx - self.scene_switch_frame > self.quick_confirm_window:
+            self.quick_confirm_mode = False
+            print(f"\n[场景切换] 帧{frame_idx}: 退出快速确认模式，恢复常规确认")
+        
+        self.last_student_count = current_student_count
 
 
 # ─── 可视化 ──────────────────────────────────────────────────
@@ -947,10 +1009,11 @@ class PersonDeskBindingPipelineV3:
 
         tid = person["track_id"]
         mark = "✓" if is_confirmed else "?"
-        sid = display_physical_desk_id if display_physical_desk_id else f"ID{tid}"
+        # 优先显示desk_id，统一ID体系
+        sid = display_physical_desk_id if display_physical_desk_id else f"#{tid}"
         label1 = f"{sid} {role}"
         if is_confirmed:
-            label2 = f"{display_seat_id or '-'}{mark}" if not self.simple_vis else f"{sid}"
+            label2 = f"{mark}" if not self.simple_vis else f"{sid}"
         else:
             label2 = "PENDING" if display_desk_id is not None else "UNBOUND"
         draw_text(frame, label1, (x1, max(20, y1 - 20)), color, scale=0.50)
@@ -994,7 +1057,8 @@ class PersonDeskBindingPipelineV3:
         )
         zones = zone_builder.build(desks)
         zone_lookup = {z["desk_id"]: z for z in zones}
-        classroom_polygon = build_classroom_polygon_from_desks(desks, padding=20.0)
+        # 增大padding确保边缘学生在包围区内
+        classroom_polygon = build_classroom_polygon_from_desks(desks, padding=80.0)
 
         print(f"  绑定区域数: {len(zones)}")
         for z in zones:
@@ -1139,7 +1203,7 @@ class PersonDeskBindingPipelineV3:
                 # 更新时间确认器
                 for person in people:
                     tid = person["track_id"]
-                    anchor = anchor_pts.get(tid, xyxy_center(person["xyxy"]))
+                    anchor = anchor_pts.get(tid, foot_point(person["xyxy"]))
                     inside_classroom = point_in_polygon(anchor, classroom_polygon)
                     physical_desk_id = (assignments[tid]["desk_id"]
                                         if tid in assignments else None)
@@ -1149,9 +1213,18 @@ class PersonDeskBindingPipelineV3:
                     if physical_desk_id is None and inside_classroom and old_confirmed is not None:
                         physical_desk_id = old_confirmed
 
+                    # 持久化绑定映射：一旦绑定就保持
                     if physical_desk_id is not None:
                         track_physical_desk[tid] = physical_desk_id
                     confirmer.update(tid, frame_idx, physical_desk_id, person["xyxy"])
+
+                # 场景切换检测（在更新后）
+                current_student_count = sum(1 for p in people 
+                                           if point_in_polygon(
+                                               anchor_pts.get(p["track_id"], 
+                                                            foot_point(p["xyxy"])), 
+                                               classroom_polygon))
+                confirmer.detect_scene_switch(current_student_count, frame_idx)
 
                 # 绘制
                 annotated = None
@@ -1168,17 +1241,19 @@ class PersonDeskBindingPipelineV3:
                 for person in people:
                     tid = person["track_id"]
                     anchor = anchor_pts.get(
-                        tid, xyxy_center(person["xyxy"]))
+                        tid, foot_point(person["xyxy"]))
                     assignment = assignments.get(tid)
                     display_desk = confirmer.get_display_desk_id(
                         tid, frame_idx)
                     display_physical_desk = display_desk if display_desk is not None else track_physical_desk.get(tid)
-                    display_seat_id = seat_id_from_track(tid) if display_desk is not None else None
+                    # 使用desk_id作为座位ID，而不是track_id
+                    display_seat_id = display_physical_desk if display_physical_desk is not None else None
                     is_conf = confirmer.is_confirmed(tid, frame_idx)
                     inside_classroom = point_in_polygon(anchor, classroom_polygon)
                     r = "student" if inside_classroom else "teacher"
                     track_region_role[tid] = r
 
+                    # 统一使用desk_id作为学生ID
                     aligned_student_id = None
                     if r == "student":
                         if display_desk is not None:
@@ -1206,7 +1281,7 @@ class PersonDeskBindingPipelineV3:
                     if csv_writer is not None:
                         csv_writer.writerow({
                             "frame_idx": frame_idx,
-                            "track_id": aligned_student_id if aligned_student_id is not None else tid,
+                            "track_id": aligned_student_id if aligned_student_id is not None else f"#{tid}",
                             "track_id_raw": tid,
                             "role": r,
                             "is_confirmed": is_conf,
@@ -1222,7 +1297,7 @@ class PersonDeskBindingPipelineV3:
                                 assignment["desk_id"] if assignment else None
                             ),
                             "physical_desk_id_display": display_physical_desk,
-                            "student_id_aligned": aligned_student_id,
+                            "student_id_aligned": aligned_student_id if aligned_student_id is not None else f"#{tid}",
                             "seat_id_same_as_track": display_seat_id,
                             "inside_classroom": inside_classroom,
                             "in_zone": (assignment["in_zone"]
@@ -1296,7 +1371,7 @@ class PersonDeskBindingPipelineV3:
             "occupied_seats": len(occupied_bind_ids),
             "config": {
                 "binding_method": "inter_desk_zone",
-                "anchor_point": "bbox_center",
+                "anchor_point": "bbox_bottom_center",  # 人框底部中心（脚部位置）
                 "teacher_rule": "outside_classroom_polygon",
                 "student_rule": "inside_classroom_polygon",
                 "first_extend_ratio": self.first_extend_ratio,
@@ -1309,6 +1384,9 @@ class PersonDeskBindingPipelineV3:
                 "release_miss_seconds": self.release_miss_seconds,
                 "pending_switch_seconds": self.pending_switch_seconds,
                 "pending_hold_seconds": self.pending_hold_seconds,
+                "scene_switch_detection": True,
+                "scene_switch_frame": confirmer.scene_switch_frame,
+                "quick_confirm_enabled": confirmer.scene_switch_frame >= 0,
                 "simple_vis": self.simple_vis,
             },
             "classroom_polygon": (classroom_polygon.tolist()
@@ -1332,16 +1410,17 @@ class PersonDeskBindingPipelineV3:
                     **item,
                     "role": track_region_role.get(tid, item.get("role", "unknown")),
                     "student_id_aligned": track_physical_desk.get(tid),
-                    "seat_id_same_as_track": seat_id_from_track(tid),
+                    "seat_id_unified": track_physical_desk.get(tid),  # 统一使用desk_id
+                    "original_track_id": tid,
                 }
                 for tid in sorted(confirmer.states.keys())
                 for item in [confirmer.summary(tid, frame_idx)]
             ],
             "seat_track_bindings": {
                 desk_id: {
-                    "track_id": tid,
-                    "seat_id_same_as_track": seat_id_from_track(tid),
-                    "physical_desk_id": track_physical_desk.get(tid),
+                    "original_track_id": tid,
+                    "unified_student_id": desk_id,  # 统一学生ID即为desk_id
+                    "physical_desk_id": desk_id,
                 }
                 for desk_id, tid in sorted(confirmer._desk_owner.items(), key=lambda kv: kv[0])
             },
@@ -1436,14 +1515,14 @@ def main():
     p.add_argument("--reference-sample-step", type=int, default=5)
 
     # V3 核心: 区间构建参数
-    p.add_argument("--first-extend", type=float, default=0.3,
+    p.add_argument("--first-extend", type=float, default=0.6,
                    help="第一排座位向下(近相机)延伸比例 (基于间距)")
-    p.add_argument("--last-extend", type=float, default=0.8,
+    p.add_argument("--last-extend", type=float, default=1.2,
                    help="最后排座位向上(远相机)延伸比例 (基于间距)")
 
     # 时间确认参数
-    p.add_argument("--confirm-seconds", type=float, default=10.0)
-    p.add_argument("--confirm-ratio", type=float, default=0.65)
+    p.add_argument("--confirm-seconds", type=float, default=3.0)
+    p.add_argument("--confirm-ratio", type=float, default=0.50)
     p.add_argument("--hold-seconds", type=float, default=5.0)
     p.add_argument("--re-confirm-seconds", type=float, default=5.0,
                    help="已确认后切换座位所需连续帧时间")
