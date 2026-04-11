@@ -71,6 +71,11 @@ def l2(a, b):
     ))
 
 
+def seat_id_from_track(track_id: int) -> str:
+    """生成与跟踪ID一致的座位ID表示."""
+    return f"T{int(track_id)}"
+
+
 def build_classroom_polygon_from_desks(desks: list, padding: float = 0.0):
     """根据 5x6 桌子整体外轮廓构建包围多边形(凸包)."""
     if not desks:
@@ -310,6 +315,103 @@ class ZoneBinder:
         return assignments, anchor_pts
 
 
+class GridIntervalAssigner:
+    """
+    包围区内强制分配器。
+
+    逻辑:
+    1. 用各行桌子中心 y 构造“相邻两行之间”的边界带
+    2. 用各列桌子中心 x 构造列中心
+    3. 人点在包围区内时, 先定行带, 再定最近列, 映射到 (col,row) 座位
+    """
+
+    def __init__(self, desks: list):
+        self.desk_by_rc = {}
+        row_map = {}
+        col_map = {}
+
+        for d in desks:
+            r = int(d["row_index"])
+            c = int(d["column_index"])
+            self.desk_by_rc[(c, r)] = d
+            row_map.setdefault(r, []).append(float(d["center"][1]))
+            col_map.setdefault(c, []).append(float(d["center"][0]))
+
+        # 按图像坐标排序: y 大在下(近), x 小在左
+        self.rows_desc = sorted(row_map.keys(), key=lambda r: np.median(row_map[r]), reverse=True)
+        self.row_center_y = {r: float(np.median(row_map[r])) for r in self.rows_desc}
+        self.cols_asc = sorted(col_map.keys(), key=lambda c: np.median(col_map[c]))
+        self.col_center_x = {c: float(np.median(col_map[c])) for c in self.cols_asc}
+
+        self.row_intervals = self._build_row_intervals()
+
+    def _build_row_intervals(self):
+        intervals = {}
+        n = len(self.rows_desc)
+        if n == 0:
+            return intervals
+
+        ys = [self.row_center_y[r] for r in self.rows_desc]
+
+        for i, r in enumerate(self.rows_desc):
+            # 上边界(更小的 y)
+            if i < n - 1:
+                upper = 0.5 * (ys[i] + ys[i + 1])
+            else:
+                gap = abs(ys[i - 1] - ys[i]) if i > 0 else 80.0
+                upper = ys[i] - 0.5 * gap
+
+            # 下边界(更大的 y)
+            if i > 0:
+                lower = 0.5 * (ys[i - 1] + ys[i])
+            else:
+                gap = abs(ys[i] - ys[i + 1]) if i < n - 1 else 80.0
+                lower = ys[i] + 0.5 * gap
+
+            intervals[r] = (float(upper), float(lower))
+
+        return intervals
+
+    def _pick_row(self, ay: float):
+        # 优先按行带区间命中
+        for r in self.rows_desc:
+            upper, lower = self.row_intervals[r]
+            if upper <= ay <= lower:
+                return r
+
+        # 若在外侧, 回退到最近行中心
+        return min(self.rows_desc, key=lambda r: abs(ay - self.row_center_y[r]))
+
+    def _pick_col(self, ax: float):
+        return min(self.cols_asc, key=lambda c: abs(ax - self.col_center_x[c]))
+
+    def assign_point(self, anchor_xy):
+        """给定点坐标, 返回 fallback 座位分配或 None."""
+        if not self.rows_desc or not self.cols_asc:
+            return None
+
+        ax, ay = float(anchor_xy[0]), float(anchor_xy[1])
+        row = self._pick_row(ay)
+        col = self._pick_col(ax)
+        desk = self.desk_by_rc.get((col, row))
+        if desk is None:
+            return None
+
+        return {
+            "desk_id": desk["desk_id"],
+            "desk_no": desk["desk_no"],
+            "col_idx": col,
+            "row_idx": row,
+            "cost": round(abs(ay - self.row_center_y[row]) + abs(ax - self.col_center_x[col]), 4),
+            "in_zone": False,
+            "fallback_grid": True,
+            "anchor_x": round(ax, 2),
+            "anchor_y": round(ay, 2),
+            "zone_cx": round(float(desk["center"][0]), 2),
+            "zone_cy": round(float(desk["center"][1]), 2),
+        }
+
+
 # ─── 时间确认器 ──────────────────────────────────────────────
 
 class TemporalConfirmer:
@@ -332,12 +434,20 @@ class TemporalConfirmer:
         max_students: int = 30,
         max_teachers: int = 2,
         re_confirm_seconds: float = 5.0,
+        lock_seconds: float = 20.0,
+        release_miss_seconds: float = 12.0,
+        pending_switch_seconds: float = 1.2,
+        pending_hold_seconds: float = 2.0,
     ):
         self.fps = max(1.0, fps)
         self.confirm_frames = int(confirm_seconds * self.fps)
         self.confirm_ratio = confirm_ratio
         self.hold_frames = int(hold_seconds * self.fps)
         self.re_confirm_frames = int(re_confirm_seconds * self.fps)
+        self.lock_frames = int(lock_seconds * self.fps)
+        self.release_miss_frames = int(release_miss_seconds * self.fps)
+        self.pending_switch_frames = max(1, int(pending_switch_seconds * self.fps))
+        self.pending_hold_frames = max(1, int(pending_hold_seconds * self.fps))
         self.max_students = max_students
         self.max_teachers = max_teachers
 
@@ -354,8 +464,48 @@ class TemporalConfirmer:
                 "last_center": None,
                 "consecutive_new_desk": 0,
                 "consecutive_new_desk_id": None,
+                "confirmed_at_frame": -1,
+                # 未确认阶段用于显示去抖的状态
+                "pending_display_desk_id": None,
+                "pending_candidate_desk_id": None,
+                "pending_candidate_count": 0,
+                "pending_last_seen_frame": -1,
             }
         return self.states[track_id]
+
+    def _update_pending_display(self, track_id, frame_idx):
+        """未确认座位显示去抖: 切换需持续若干帧一致，短时丢失保留显示。"""
+        st = self.states[track_id]
+        vote = self.get_current_vote(track_id)
+
+        if vote is None:
+            return
+
+        if st["pending_display_desk_id"] is None:
+            st["pending_display_desk_id"] = vote
+            st["pending_last_seen_frame"] = frame_idx
+            st["pending_candidate_desk_id"] = None
+            st["pending_candidate_count"] = 0
+            return
+
+        if vote == st["pending_display_desk_id"]:
+            st["pending_last_seen_frame"] = frame_idx
+            st["pending_candidate_desk_id"] = None
+            st["pending_candidate_count"] = 0
+            return
+
+        # 与当前显示不一致, 需要持续若干帧才切换
+        if vote == st["pending_candidate_desk_id"]:
+            st["pending_candidate_count"] += 1
+        else:
+            st["pending_candidate_desk_id"] = vote
+            st["pending_candidate_count"] = 1
+
+        if st["pending_candidate_count"] >= self.pending_switch_frames:
+            st["pending_display_desk_id"] = vote
+            st["pending_last_seen_frame"] = frame_idx
+            st["pending_candidate_desk_id"] = None
+            st["pending_candidate_count"] = 0
 
     def update(self, track_id, frame_idx, desk_id, box):
         st = self._get_state(track_id)
@@ -369,6 +519,10 @@ class TemporalConfirmer:
 
         # 已确认: 防跳变逻辑
         if st["confirmed_desk_id"] is not None:
+            # 锁定期内不允许换座，避免轻易丢失绑定
+            if frame_idx - st["confirmed_at_frame"] <= self.lock_frames:
+                return
+
             if desk_id is not None and desk_id != st["confirmed_desk_id"]:
                 if desk_id == st["consecutive_new_desk_id"]:
                     st["consecutive_new_desk"] += 1
@@ -377,7 +531,7 @@ class TemporalConfirmer:
                     st["consecutive_new_desk_id"] = desk_id
                 if st["consecutive_new_desk"] >= self.re_confirm_frames:
                     self._try_confirm(track_id, desk_id,
-                                      st["consecutive_new_desk"])
+                                      st["consecutive_new_desk"], frame_idx)
                     st["consecutive_new_desk"] = 0
                     st["consecutive_new_desk_id"] = None
             else:
@@ -392,9 +546,12 @@ class TemporalConfirmer:
             if votes:
                 best_desk, count = Counter(votes).most_common(1)[0]
                 if count / len(history) >= self.confirm_ratio:
-                    self._try_confirm(track_id, best_desk, count)
+                    self._try_confirm(track_id, best_desk, count, frame_idx)
 
-    def _try_confirm(self, track_id: int, desk_id: str, vote_count: int):
+        # 更新未确认显示座位(去抖)
+        self._update_pending_display(track_id, frame_idx)
+
+    def _try_confirm(self, track_id: int, desk_id: str, vote_count: int, frame_idx: int):
         st = self.states[track_id]
         if st["confirmed_desk_id"] == desk_id:
             return
@@ -436,6 +593,7 @@ class TemporalConfirmer:
             del self._desk_owner[old_desk]
 
         st["confirmed_desk_id"] = desk_id
+        st["confirmed_at_frame"] = frame_idx
         self._desk_owner[desk_id] = track_id
 
     def get_confirmed(self, track_id, current_frame):
@@ -444,7 +602,8 @@ class TemporalConfirmer:
         st = self.states[track_id]
         if st["confirmed_desk_id"] is None:
             return None
-        if current_frame - st["last_seen_frame"] > self.hold_frames:
+        # 使用更长的释放阈值，避免绑定轻易丢失
+        if current_frame - st["last_seen_frame"] > self.release_miss_frames:
             desk_id = st["confirmed_desk_id"]
             if self._desk_owner.get(desk_id) == track_id:
                 del self._desk_owner[desk_id]
@@ -463,7 +622,21 @@ class TemporalConfirmer:
 
     def get_display_desk_id(self, track_id, current_frame):
         confirmed = self.get_confirmed(track_id, current_frame)
-        return confirmed if confirmed is not None else self.get_current_vote(track_id)
+        if confirmed is not None:
+            return confirmed
+
+        if track_id not in self.states:
+            return None
+
+        st = self.states[track_id]
+        pending = st.get("pending_display_desk_id")
+        if pending is None:
+            return None
+
+        # 短时无票时保留显示，过期后隐藏
+        if current_frame - st.get("pending_last_seen_frame", -1) <= self.pending_hold_frames:
+            return pending
+        return None
 
     def is_confirmed(self, track_id, current_frame):
         return self.get_confirmed(track_id, current_frame) is not None
@@ -569,10 +742,15 @@ class PersonDeskBindingPipelineV3:
         confirm_ratio: float,
         hold_seconds: float,
         re_confirm_seconds: float,
+        lock_seconds: float,
+        release_miss_seconds: float,
+        pending_switch_seconds: float,
+        pending_hold_seconds: float,
         first_extend_ratio: float,
         last_extend_ratio: float,
         outputs: set[str],
         display: bool,
+        simple_vis: bool,
         max_students: int = 30,
         max_teachers: int = 2,
     ):
@@ -598,10 +776,15 @@ class PersonDeskBindingPipelineV3:
         self.confirm_ratio = confirm_ratio
         self.hold_seconds = hold_seconds
         self.re_confirm_seconds = re_confirm_seconds
+        self.lock_seconds = lock_seconds
+        self.release_miss_seconds = release_miss_seconds
+        self.pending_switch_seconds = pending_switch_seconds
+        self.pending_hold_seconds = pending_hold_seconds
         self.first_extend_ratio = first_extend_ratio
         self.last_extend_ratio = last_extend_ratio
         self.outputs = set(outputs)
         self.display = display
+        self.simple_vis = simple_vis
         self.max_students = max_students
         self.max_teachers = max_teachers
 
@@ -692,28 +875,31 @@ class PersonDeskBindingPipelineV3:
             poly_int = zone["polygon"].astype(np.int32)
             color = color_for_desk(zone["desk_no"])
 
-            # 半透明填充区域
-            cv2.fillPoly(overlay, [poly_int], color)
-
-            # 区域边框
-            cv2.polylines(annotated, [poly_int], True, color, 2)
+            if not self.simple_vis:
+                # 半透明填充区域
+                cv2.fillPoly(overlay, [poly_int], color)
+                # 区域边框
+                cv2.polylines(annotated, [poly_int], True, color, 2)
 
             # 桌子实框
             dx1, dy1, dx2, dy2 = map(int, zone["desk_xyxy"])
-            cv2.rectangle(annotated, (dx1, dy1), (dx2, dy2), color, 2)
+            cv2.rectangle(annotated, (dx1, dy1), (dx2, dy2), color, 1 if self.simple_vis else 2)
 
             # 标签
-            draw_text(annotated, zone["desk_id"],
-                      (dx1, max(20, dy1 - 6)), color, scale=0.55)
+            if not self.simple_vis:
+                draw_text(annotated, zone["desk_id"],
+                          (dx1, max(20, dy1 - 6)), color, scale=0.55)
 
             # 区域中心标记
-            zcx = int(zone["zone_center"][0])
-            zcy = int(zone["zone_center"][1])
-            cv2.drawMarker(annotated, (zcx, zcy), color,
-                           cv2.MARKER_CROSS, 10, 1)
+            if not self.simple_vis:
+                zcx = int(zone["zone_center"][0])
+                zcy = int(zone["zone_center"][1])
+                cv2.drawMarker(annotated, (zcx, zcy), color,
+                               cv2.MARKER_CROSS, 10, 1)
 
         # 混合叠加
-        cv2.addWeighted(overlay, 0.15, annotated, 0.85, 0, annotated)
+        if not self.simple_vis:
+            cv2.addWeighted(overlay, 0.15, annotated, 0.85, 0, annotated)
 
         if classroom_polygon is not None and len(classroom_polygon) >= 3:
             cp = classroom_polygon.astype(np.int32).reshape(-1, 1, 2)
@@ -725,6 +911,8 @@ class PersonDeskBindingPipelineV3:
         return annotated
 
     def _draw_person(self, frame, person, anchor, role, display_desk_id,
+                     display_physical_desk_id,
+                     display_seat_id,
                      is_confirmed, assignment, zone_lookup):
         x1, y1, x2, y2 = map(int, person["xyxy"])
 
@@ -741,26 +929,33 @@ class PersonDeskBindingPipelineV3:
 
         # 锚点 (人框中心)
         ax, ay = int(anchor[0]), int(anchor[1])
-        cv2.circle(frame, (ax, ay), 5, (0, 255, 255), -1)
+        if not self.simple_vis:
+            cv2.circle(frame, (ax, ay), 5, (0, 255, 255), -1)
 
         # 到区域中心连线
-        if assignment is not None:
+        if assignment is not None and not self.simple_vis:
             zcx = int(assignment["zone_cx"])
             zcy = int(assignment["zone_cy"])
             cv2.line(frame, (ax, ay), (zcx, zcy), (255, 0, 255), 1)
 
-        # 到桌子中心连线
-        if display_desk_id and display_desk_id in zone_lookup:
-            dc = zone_lookup[display_desk_id]["desk_center"]
+        # 到物理桌子中心连线
+        if (display_physical_desk_id and display_physical_desk_id in zone_lookup
+                and not self.simple_vis):
+            dc = zone_lookup[display_physical_desk_id]["desk_center"]
             dcx, dcy = int(dc[0]), int(dc[1])
             cv2.line(frame, (ax, ay), (dcx, dcy), color, 2)
 
         tid = person["track_id"]
         mark = "✓" if is_confirmed else "?"
-        label1 = f"ID{tid} {role}"
-        label2 = f"{display_desk_id or '-'}{mark}"
+        sid = display_physical_desk_id if display_physical_desk_id else f"ID{tid}"
+        label1 = f"{sid} {role}"
+        if is_confirmed:
+            label2 = f"{display_seat_id or '-'}{mark}" if not self.simple_vis else f"{sid}"
+        else:
+            label2 = "PENDING" if display_desk_id is not None else "UNBOUND"
         draw_text(frame, label1, (x1, max(20, y1 - 20)), color, scale=0.50)
-        draw_text(frame, label2, (x1, max(36, y1 - 2)), color, scale=0.50)
+        if not self.simple_vis:
+            draw_text(frame, label2, (x1, max(36, y1 - 2)), color, scale=0.50)
 
     # ── 主运行 ───────────────────────────────────────────────
 
@@ -821,8 +1016,10 @@ class PersonDeskBindingPipelineV3:
         print("=" * 60)
         print("Step 3: 构建区间绑定器...")
         binder = ZoneBinder(zones=zones)
+        grid_fallback = GridIntervalAssigner(desks)
         print(f"  绑定方法: 人框中心落入梯形区间")
         print(f"  冲突解决: 最近区域中心优先 (贪心)")
+        print(f"  包围区内兜底: 行间带 + 最近列 强制入座")
 
         # ── 打开视频 ─────────────────────────────────────────
         cap = cv2.VideoCapture(self.source)
@@ -847,10 +1044,15 @@ class PersonDeskBindingPipelineV3:
             max_students=self.max_students,
             max_teachers=self.max_teachers,
             re_confirm_seconds=self.re_confirm_seconds,
+            lock_seconds=self.lock_seconds,
+            release_miss_seconds=self.release_miss_seconds,
+            pending_switch_seconds=self.pending_switch_seconds,
+            pending_hold_seconds=self.pending_hold_seconds,
         )
         print(f"  确认: {self.confirm_seconds}s, "
               f"保持: {self.hold_seconds}s, "
               f"防跳变: {self.re_confirm_seconds}s")
+        print(f"  绑定锁定: {self.lock_seconds}s, 释放阈值: {self.release_miss_seconds}s")
         print(f"  视频: {width}x{height} @ {fps:.1f}fps, "
               f"总帧: {total_frames}")
 
@@ -869,11 +1071,16 @@ class PersonDeskBindingPipelineV3:
             csv_file = open(output_csv_path, "w", newline="",
                             encoding="utf-8-sig")
             csv_writer = csv.DictWriter(csv_file, fieldnames=[
-                "frame_idx", "track_id", "role", "is_confirmed",
+                "frame_idx", "track_id", "track_id_raw", "role", "is_confirmed",
                 "person_conf",
                 "desk_id_current", "desk_id_confirmed", "desk_id_display",
+                "bind_track_id",
+                "physical_desk_id_current", "physical_desk_id_display",
+                "student_id_aligned",
+                "seat_id_same_as_track",
                 "inside_classroom",
                 "in_zone",
+                "fallback_grid",
                 "anchor_x", "anchor_y",
                 "zone_cx", "zone_cy",
                 "x1", "y1", "x2", "y2", "total_move",
@@ -883,6 +1090,7 @@ class PersonDeskBindingPipelineV3:
         # ── 逐帧处理 ─────────────────────────────────────────
         frame_idx = 0
         track_region_role = {}
+        track_physical_desk = {}
         try:
             while True:
                 ret, frame = cap.read()
@@ -911,18 +1119,45 @@ class PersonDeskBindingPipelineV3:
                 # 区间绑定
                 assignments, anchor_pts = binder.assign_batch(people)
 
+                # 包围区内兜底: 未落入区间的人, 按行间带+列中心强制分座
+                used_desks = {a["desk_id"] for a in assignments.values()}
+                for person in people:
+                    tid = person["track_id"]
+                    if tid in assignments:
+                        continue
+                    anchor = anchor_pts.get(tid, xyxy_center(person["xyxy"]))
+                    if not point_in_polygon(anchor, classroom_polygon):
+                        continue
+                    fb = grid_fallback.assign_point(anchor)
+                    if fb is None:
+                        continue
+                    if fb["desk_id"] in used_desks:
+                        continue
+                    assignments[tid] = fb
+                    used_desks.add(fb["desk_id"])
+
                 # 更新时间确认器
                 for person in people:
                     tid = person["track_id"]
-                    desk_id = (assignments[tid]["desk_id"]
-                               if tid in assignments else None)
-                    confirmer.update(tid, frame_idx, desk_id, person["xyxy"])
+                    anchor = anchor_pts.get(tid, xyxy_center(person["xyxy"]))
+                    inside_classroom = point_in_polygon(anchor, classroom_polygon)
+                    physical_desk_id = (assignments[tid]["desk_id"]
+                                        if tid in assignments else None)
+
+                    # 已确认且人在包围区内时，优先保持旧绑定，避免轻易丢失
+                    old_confirmed = confirmer.get_confirmed(tid, frame_idx)
+                    if physical_desk_id is None and inside_classroom and old_confirmed is not None:
+                        physical_desk_id = old_confirmed
+
+                    if physical_desk_id is not None:
+                        track_physical_desk[tid] = physical_desk_id
+                    confirmer.update(tid, frame_idx, physical_desk_id, person["xyxy"])
 
                 # 绘制
                 annotated = None
                 if video_writer is not None or self.display:
                     annotated = self._draw_zones(frame, zones, classroom_polygon)
-                    if column_lines:
+                    if column_lines and not self.simple_vis:
                         annotated = draw_column_lines(
                             annotated, column_lines, height)
 
@@ -937,10 +1172,21 @@ class PersonDeskBindingPipelineV3:
                     assignment = assignments.get(tid)
                     display_desk = confirmer.get_display_desk_id(
                         tid, frame_idx)
+                    display_physical_desk = display_desk if display_desk is not None else track_physical_desk.get(tid)
+                    display_seat_id = seat_id_from_track(tid) if display_desk is not None else None
                     is_conf = confirmer.is_confirmed(tid, frame_idx)
                     inside_classroom = point_in_polygon(anchor, classroom_polygon)
                     r = "student" if inside_classroom else "teacher"
                     track_region_role[tid] = r
+
+                    aligned_student_id = None
+                    if r == "student":
+                        if display_desk is not None:
+                            aligned_student_id = display_desk
+                        elif display_physical_desk is not None:
+                            aligned_student_id = display_physical_desk
+                        elif assignment is not None:
+                            aligned_student_id = assignment.get("desk_id")
 
                     if r == "student":
                         student_count += 1
@@ -952,13 +1198,16 @@ class PersonDeskBindingPipelineV3:
                     if annotated is not None:
                         self._draw_person(
                             annotated, person, anchor, r, display_desk,
+                            display_physical_desk,
+                            display_seat_id,
                             is_conf, assignment, zone_lookup,
                         )
 
                     if csv_writer is not None:
                         csv_writer.writerow({
                             "frame_idx": frame_idx,
-                            "track_id": tid,
+                            "track_id": aligned_student_id if aligned_student_id is not None else tid,
+                            "track_id_raw": tid,
                             "role": r,
                             "is_confirmed": is_conf,
                             "person_conf": round(person["conf"], 4),
@@ -968,9 +1217,18 @@ class PersonDeskBindingPipelineV3:
                             "desk_id_confirmed": confirmer.get_confirmed(
                                 tid, frame_idx),
                             "desk_id_display": display_desk,
+                            "bind_track_id": tid,
+                            "physical_desk_id_current": (
+                                assignment["desk_id"] if assignment else None
+                            ),
+                            "physical_desk_id_display": display_physical_desk,
+                            "student_id_aligned": aligned_student_id,
+                            "seat_id_same_as_track": display_seat_id,
                             "inside_classroom": inside_classroom,
                             "in_zone": (assignment["in_zone"]
                                         if assignment else False),
+                            "fallback_grid": (assignment.get("fallback_grid", False)
+                                              if assignment else False),
                             "anchor_x": round(float(anchor[0]), 2),
                             "anchor_y": round(float(anchor[1]), 2),
                             "zone_cx": (assignment["zone_cx"]
@@ -1022,10 +1280,12 @@ class PersonDeskBindingPipelineV3:
         print("=" * 60)
         print("输出汇总:")
 
-        occupied_seats = set()
+        occupied_bind_ids = set()
         for tid, st in confirmer.states.items():
             if st["confirmed_desk_id"] is not None:
-                occupied_seats.add(st["confirmed_desk_id"])
+                occupied_bind_ids.add(st["confirmed_desk_id"])
+
+        occupied_physical_desks = set(track_physical_desk.values())
 
         summary = {
             "source": self.source,
@@ -1033,7 +1293,7 @@ class PersonDeskBindingPipelineV3:
             "reference_frame_idx": reference["frame_idx"],
             "desk_count": len(desks),
             "zone_count": len(zones),
-            "occupied_seats": len(occupied_seats),
+            "occupied_seats": len(occupied_bind_ids),
             "config": {
                 "binding_method": "inter_desk_zone",
                 "anchor_point": "bbox_center",
@@ -1045,6 +1305,11 @@ class PersonDeskBindingPipelineV3:
                 "confirm_ratio": self.confirm_ratio,
                 "hold_seconds": self.hold_seconds,
                 "re_confirm_seconds": self.re_confirm_seconds,
+                "lock_seconds": self.lock_seconds,
+                "release_miss_seconds": self.release_miss_seconds,
+                "pending_switch_seconds": self.pending_switch_seconds,
+                "pending_hold_seconds": self.pending_hold_seconds,
+                "simple_vis": self.simple_vis,
             },
             "classroom_polygon": (classroom_polygon.tolist()
                                   if classroom_polygon is not None else None),
@@ -1066,12 +1331,22 @@ class PersonDeskBindingPipelineV3:
                 {
                     **item,
                     "role": track_region_role.get(tid, item.get("role", "unknown")),
+                    "student_id_aligned": track_physical_desk.get(tid),
+                    "seat_id_same_as_track": seat_id_from_track(tid),
                 }
                 for tid in sorted(confirmer.states.keys())
                 for item in [confirmer.summary(tid, frame_idx)]
             ],
+            "seat_track_bindings": {
+                desk_id: {
+                    "track_id": tid,
+                    "seat_id_same_as_track": seat_id_from_track(tid),
+                    "physical_desk_id": track_physical_desk.get(tid),
+                }
+                for desk_id, tid in sorted(confirmer._desk_owner.items(), key=lambda kv: kv[0])
+            },
             "seat_occupancy": {
-                z["desk_id"]: z["desk_id"] in occupied_seats
+                z["desk_id"]: z["desk_id"] in occupied_physical_desks
                 for z in zones
             },
             "saved_outputs": {},
@@ -1097,7 +1372,7 @@ class PersonDeskBindingPipelineV3:
 
         print("=" * 60)
         print(f"完成! {frame_idx} 帧, "
-              f"确认学生 {len(occupied_seats)}/{len(zones)} 个座位")
+              f"确认学生 {len(occupied_bind_ids)}/{len(zones)} 个座位")
 
 
 # ─── CLI ─────────────────────────────────────────────────────
@@ -1172,6 +1447,17 @@ def main():
     p.add_argument("--hold-seconds", type=float, default=5.0)
     p.add_argument("--re-confirm-seconds", type=float, default=5.0,
                    help="已确认后切换座位所需连续帧时间")
+    p.add_argument("--lock-seconds", type=float, default=20.0,
+                   help="确认后绑定锁定时长，锁定期内不允许换座")
+    p.add_argument("--release-miss-seconds", type=float, default=12.0,
+                   help="连续丢失超过该时长才释放绑定")
+    p.add_argument("--pending-switch-seconds", type=float, default=1.2,
+                   help="未确认显示座位切换所需持续时间(去抖)")
+    p.add_argument("--pending-hold-seconds", type=float, default=2.0,
+                   help="未确认短时丢失时显示保留时长")
+    p.add_argument("--simple-vis", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="是否使用简洁可视化（默认开启）")
 
     # 教室规模
     p.add_argument("--max-students", type=int, default=30)
@@ -1207,10 +1493,15 @@ def main():
         confirm_ratio=args.confirm_ratio,
         hold_seconds=args.hold_seconds,
         re_confirm_seconds=args.re_confirm_seconds,
+        lock_seconds=args.lock_seconds,
+        release_miss_seconds=args.release_miss_seconds,
+        pending_switch_seconds=args.pending_switch_seconds,
+        pending_hold_seconds=args.pending_hold_seconds,
         first_extend_ratio=args.first_extend,
         last_extend_ratio=args.last_extend,
         outputs=outputs,
         display=args.display,
+        simple_vis=args.simple_vis,
         max_students=args.max_students,
         max_teachers=args.max_teachers,
     )
