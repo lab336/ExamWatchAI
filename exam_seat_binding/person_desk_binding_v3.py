@@ -377,6 +377,157 @@ class ZoneBinder:
         return assignments, anchor_pts
 
 
+class StableSeatManager:
+    """
+    轻量级稳定绑定器。
+
+    目标:
+    1. 一旦某个 track 绑定座位, 不因单帧抖动轻易换座
+    2. 检测短时丢失或单帧未落入梯形区时, 保留旧座位
+    3. 一个座位同一时刻只允许一个活跃 track 占用
+    """
+
+    def __init__(self, fps: float,
+                 switch_seconds: float = 1.0,
+                 miss_hold_seconds: float = 2.0):
+        self.fps = max(1.0, fps)
+        self.switch_confirm_frames = max(1, int(round(switch_seconds * self.fps)))
+        self.miss_hold_frames = max(1, int(round(miss_hold_seconds * self.fps)))
+        self.states: dict[int, dict] = {}
+        self.seat_owner: dict[int, int] = {}
+
+    def _get_state(self, track_id: int):
+        if track_id not in self.states:
+            self.states[track_id] = {
+                "bound_seat_no": None,
+                "last_seen_frame": -1,
+                "last_bound_frame": -1,
+                "pending_switch_seat_no": None,
+                "pending_switch_count": 0,
+            }
+        return self.states[track_id]
+
+    def _clear_pending(self, track_id: int):
+        st = self._get_state(track_id)
+        st["pending_switch_seat_no"] = None
+        st["pending_switch_count"] = 0
+
+    def _is_track_active(self, track_id: int, frame_idx: int) -> bool:
+        st = self.states.get(track_id)
+        if st is None:
+            return False
+        return frame_idx - st["last_seen_frame"] <= self.miss_hold_frames
+
+    def _release_track(self, track_id: int):
+        st = self.states.get(track_id)
+        if st is None:
+            return
+        seat_no = st.get("bound_seat_no")
+        if seat_no is not None and self.seat_owner.get(seat_no) == track_id:
+            del self.seat_owner[seat_no]
+        st["bound_seat_no"] = None
+        st["last_bound_frame"] = -1
+        self._clear_pending(track_id)
+
+    def _cleanup_expired(self, frame_idx: int):
+        expired = []
+        for seat_no, owner_tid in list(self.seat_owner.items()):
+            if not self._is_track_active(owner_tid, frame_idx):
+                expired.append((seat_no, owner_tid))
+        for seat_no, owner_tid in expired:
+            if self.seat_owner.get(seat_no) == owner_tid:
+                del self.seat_owner[seat_no]
+            owner_st = self.states.get(owner_tid)
+            if owner_st is not None and owner_st.get("bound_seat_no") == seat_no:
+                owner_st["bound_seat_no"] = None
+                owner_st["last_bound_frame"] = -1
+                owner_st["pending_switch_seat_no"] = None
+                owner_st["pending_switch_count"] = 0
+
+    def _seat_is_available(self, seat_no: int, track_id: int, frame_idx: int) -> bool:
+        owner_tid = self.seat_owner.get(seat_no)
+        if owner_tid is None or owner_tid == track_id:
+            return True
+        if not self._is_track_active(owner_tid, frame_idx):
+            self._release_track(owner_tid)
+            return True
+        return False
+
+    def _bind(self, track_id: int, seat_no: int, frame_idx: int):
+        st = self._get_state(track_id)
+        old_seat_no = st.get("bound_seat_no")
+        if old_seat_no is not None and self.seat_owner.get(old_seat_no) == track_id:
+            del self.seat_owner[old_seat_no]
+
+        owner_tid = self.seat_owner.get(seat_no)
+        if owner_tid is not None and owner_tid != track_id:
+            self._release_track(owner_tid)
+
+        st["bound_seat_no"] = seat_no
+        st["last_bound_frame"] = frame_idx
+        self.seat_owner[seat_no] = track_id
+        self._clear_pending(track_id)
+
+    def has_active_binding(self, track_id: int, frame_idx: int) -> bool:
+        return self.get_display_seat(track_id, frame_idx) is not None
+
+    def update(self, track_id: int, frame_idx: int, proposed_seat_no: int | None):
+        """
+        输入当前帧 raw IoU 绑座结果, 返回稳定后的座位号.
+        """
+        self._cleanup_expired(frame_idx)
+        st = self._get_state(track_id)
+        st["last_seen_frame"] = frame_idx
+        current_seat_no = st.get("bound_seat_no")
+
+        if current_seat_no is None:
+            if proposed_seat_no is None:
+                self._clear_pending(track_id)
+                return None
+            if not self._seat_is_available(proposed_seat_no, track_id, frame_idx):
+                self._clear_pending(track_id)
+                return None
+            self._bind(track_id, proposed_seat_no, frame_idx)
+            return proposed_seat_no
+
+        if proposed_seat_no is None:
+            return current_seat_no
+
+        if proposed_seat_no == current_seat_no:
+            st["last_bound_frame"] = frame_idx
+            self._clear_pending(track_id)
+            return current_seat_no
+
+        if not self._seat_is_available(proposed_seat_no, track_id, frame_idx):
+            self._clear_pending(track_id)
+            return current_seat_no
+
+        if st["pending_switch_seat_no"] == proposed_seat_no:
+            st["pending_switch_count"] += 1
+        else:
+            st["pending_switch_seat_no"] = proposed_seat_no
+            st["pending_switch_count"] = 1
+
+        if st["pending_switch_count"] >= self.switch_confirm_frames:
+            self._bind(track_id, proposed_seat_no, frame_idx)
+            return proposed_seat_no
+
+        return current_seat_no
+
+    def get_display_seat(self, track_id: int, frame_idx: int):
+        self._cleanup_expired(frame_idx)
+        st = self.states.get(track_id)
+        if st is None:
+            return None
+        seat_no = st.get("bound_seat_no")
+        if seat_no is None:
+            return None
+        if frame_idx - st["last_seen_frame"] > self.miss_hold_frames:
+            self._release_track(track_id)
+            return None
+        return seat_no
+
+
 class GridIntervalAssigner:
     """
     包围区内强制分配器。
@@ -1150,9 +1301,15 @@ class PersonDeskBindingPipelineV3:
         # ── Step 4: 逐帧绑定 ────────────────────────────────
         print("=" * 60)
         print("Step 4: 逐帧处理 (梯形 IoU 绑定)...")
-        display_hold_frames = max(1, int(1.0 * fps))
-        print(f"  短时保持: {display_hold_frames} 帧 "
-              f"({display_hold_frames / fps:.2f}s)")
+        stable_manager = StableSeatManager(
+            fps=fps,
+            switch_seconds=1.0,
+            miss_hold_seconds=2.0,
+        )
+        print(f"  换座确认: {stable_manager.switch_confirm_frames} 帧 "
+              f"({stable_manager.switch_confirm_frames / fps:.2f}s)")
+        print(f"  丢检保持: {stable_manager.miss_hold_frames} 帧 "
+              f"({stable_manager.miss_hold_frames / fps:.2f}s)")
         print(f"  视频: {width}x{height} @ {fps:.1f}fps, "
               f"总帧: {total_frames}")
 
@@ -1194,8 +1351,6 @@ class PersonDeskBindingPipelineV3:
         frame_idx = 0
         track_region_role = {}
         track_physical_desk = {}
-        track_seat_no = {}
-        track_last_bound_frame = {}
         track_seat_votes: dict[int, Counter] = {}
         seat_track_votes: dict[int, Counter] = {
             int(z["desk_no"]): Counter() for z in zones
@@ -1236,18 +1391,6 @@ class PersonDeskBindingPipelineV3:
                 assignments, student_anchor_pts = binder.assign_batch(student_people)
                 anchor_pts.update(student_anchor_pts)
 
-                for tid, assignment in assignments.items():
-                    seat_no = int(assignment["desk_no"])
-                    desk_id = assignment["desk_id"]
-                    track_seat_votes.setdefault(tid, Counter())[seat_no] += 1
-                    seat_track_votes.setdefault(seat_no, Counter())[tid] += 1
-
-                    best_seat_no, _ = track_seat_votes[tid].most_common(1)[0]
-                    best_seat_no = int(best_seat_no)
-                    track_seat_no[tid] = best_seat_no
-                    track_physical_desk[tid] = seat_no_to_desk[best_seat_no]
-                    track_last_bound_frame[tid] = frame_idx
-
                 # 绘制
                 annotated = None
                 if video_writer is not None or self.display:
@@ -1266,24 +1409,33 @@ class PersonDeskBindingPipelineV3:
                         tid, foot_point(person["xyxy"]))
                     assignment = assignments.get(tid)
                     inside_classroom = point_in_polygon(anchor, classroom_polygon)
-                    r = "student" if inside_classroom else "teacher"
-                    track_region_role[tid] = r
 
                     current_seat_no = int(assignment["desk_no"]) if assignment else None
                     current_desk_id = assignment["desk_id"] if assignment else None
 
-                    display_seat_id = current_seat_no
-                    if display_seat_id is None and inside_classroom:
-                        last_frame = track_last_bound_frame.get(tid, -10**9)
-                        if frame_idx - last_frame <= display_hold_frames:
-                            display_seat_id = track_seat_no.get(tid)
+                    should_update_binding = inside_classroom or stable_manager.has_active_binding(
+                        tid, frame_idx
+                    )
+                    if should_update_binding:
+                        display_seat_id = stable_manager.update(
+                            tid, frame_idx, current_seat_no
+                        )
+                    else:
+                        display_seat_id = None
 
                     display_physical_desk = (
                         seat_no_to_desk.get(display_seat_id)
                         if display_seat_id is not None else None
                     )
                     display_desk = display_physical_desk
-                    is_bound = inside_classroom and display_seat_id is not None
+                    if display_seat_id is not None:
+                        track_physical_desk[tid] = display_physical_desk
+                        track_seat_votes.setdefault(tid, Counter())[display_seat_id] += 1
+                        seat_track_votes.setdefault(display_seat_id, Counter())[tid] += 1
+
+                    is_bound = display_seat_id is not None
+                    r = "student" if is_bound or inside_classroom else "teacher"
+                    track_region_role[tid] = r
 
                     if r == "student" and is_bound:
                         student_count += 1
@@ -1439,7 +1591,12 @@ class PersonDeskBindingPipelineV3:
                 "teacher_rule": "outside_classroom_polygon",
                 "student_rule": "inside_classroom_polygon",
                 "matching_rule": "bbox_zone_iou_greedy",
-                "display_hold_seconds": round(display_hold_frames / fps, 3),
+                "switch_confirm_seconds": round(
+                    stable_manager.switch_confirm_frames / fps, 3
+                ),
+                "miss_hold_seconds": round(
+                    stable_manager.miss_hold_frames / fps, 3
+                ),
                 "first_extend_ratio": self.first_extend_ratio,
                 "last_extend_ratio": self.last_extend_ratio,
                 "simple_vis": self.simple_vis,
