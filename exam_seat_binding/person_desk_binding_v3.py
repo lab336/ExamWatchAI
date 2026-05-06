@@ -116,6 +116,16 @@ def convex_polygon_iou(poly_a, poly_b):
     return inter_area / union_area, inter_area
 
 
+def point_line_distance_kb(point_xy, line_kb):
+    """点到直线 y = kx + b 的距离."""
+    x = float(point_xy[0])
+    y = float(point_xy[1])
+    k, b = line_kb
+    return abs(float(k) * x - y + float(b)) / max(
+        1e-6, float(np.sqrt(float(k) * float(k) + 1.0))
+    )
+
+
 def seat_id_from_track(track_id: int) -> str:
     """生成与跟踪ID一致的座位ID表示."""
     return f"T{int(track_id)}"
@@ -388,13 +398,16 @@ class StableSeatManager:
     """
 
     def __init__(self, fps: float,
-                 switch_seconds: float = 1.0,
-                 miss_hold_seconds: float = 2.0):
+                 switch_seconds: float = 4.5,
+                 miss_hold_seconds: float = 5.0,
+                 initial_bind_seconds: float = 1.0):
         self.fps = max(1.0, fps)
         self.switch_confirm_frames = max(1, int(round(switch_seconds * self.fps)))
         self.miss_hold_frames = max(1, int(round(miss_hold_seconds * self.fps)))
+        self.initial_confirm_frames = max(1, int(round(initial_bind_seconds * self.fps)))
         self.states: dict[int, dict] = {}
         self.seat_owner: dict[int, int] = {}
+        self.ever_bound_seats: set[int] = set()
 
     def _get_state(self, track_id: int):
         if track_id not in self.states:
@@ -411,6 +424,15 @@ class StableSeatManager:
         st = self._get_state(track_id)
         st["pending_switch_seat_no"] = None
         st["pending_switch_count"] = 0
+
+    def _push_pending(self, track_id: int, seat_no: int) -> int:
+        st = self._get_state(track_id)
+        if st["pending_switch_seat_no"] == seat_no:
+            st["pending_switch_count"] += 1
+        else:
+            st["pending_switch_seat_no"] = seat_no
+            st["pending_switch_count"] = 1
+        return st["pending_switch_count"]
 
     def _is_track_active(self, track_id: int, frame_idx: int) -> bool:
         st = self.states.get(track_id)
@@ -466,10 +488,14 @@ class StableSeatManager:
         st["bound_seat_no"] = seat_no
         st["last_bound_frame"] = frame_idx
         self.seat_owner[seat_no] = track_id
+        self.ever_bound_seats.add(seat_no)
         self._clear_pending(track_id)
 
     def has_active_binding(self, track_id: int, frame_idx: int) -> bool:
         return self.get_display_seat(track_id, frame_idx) is not None
+
+    def force_release(self, track_id: int):
+        self._release_track(track_id)
 
     def update(self, track_id: int, frame_idx: int, proposed_seat_no: int | None):
         """
@@ -487,8 +513,16 @@ class StableSeatManager:
             if not self._seat_is_available(proposed_seat_no, track_id, frame_idx):
                 self._clear_pending(track_id)
                 return None
-            self._bind(track_id, proposed_seat_no, frame_idx)
-            return proposed_seat_no
+            pending_count = self._push_pending(track_id, proposed_seat_no)
+            required_frames = (
+                self.switch_confirm_frames
+                if proposed_seat_no in self.ever_bound_seats
+                else self.initial_confirm_frames
+            )
+            if pending_count >= required_frames:
+                self._bind(track_id, proposed_seat_no, frame_idx)
+                return proposed_seat_no
+            return None
 
         if proposed_seat_no is None:
             return current_seat_no
@@ -502,13 +536,8 @@ class StableSeatManager:
             self._clear_pending(track_id)
             return current_seat_no
 
-        if st["pending_switch_seat_no"] == proposed_seat_no:
-            st["pending_switch_count"] += 1
-        else:
-            st["pending_switch_seat_no"] = proposed_seat_no
-            st["pending_switch_count"] = 1
-
-        if st["pending_switch_count"] >= self.switch_confirm_frames:
+        pending_count = self._push_pending(track_id, proposed_seat_no)
+        if pending_count >= self.switch_confirm_frames:
             self._bind(track_id, proposed_seat_no, frame_idx)
             return proposed_seat_no
 
@@ -526,6 +555,203 @@ class StableSeatManager:
             self._release_track(track_id)
             return None
         return seat_no
+
+    def active_seat_count(self, frame_idx: int) -> int:
+        self._cleanup_expired(frame_idx)
+        return len(self.seat_owner)
+
+    def active_seat_numbers(self, frame_idx: int) -> set[int]:
+        self._cleanup_expired(frame_idx)
+        return {int(seat_no) for seat_no in self.seat_owner.keys()}
+
+    def get_bound_seat(self, track_id: int, frame_idx: int):
+        return self.get_display_seat(track_id, frame_idx)
+
+
+class ColumnFallbackAssigner:
+    """
+    同列空位兜底分配器。
+    """
+
+    def __init__(self, zones: list, column_lines: list | None):
+        self.zones = zones
+        self.column_lines = column_lines or []
+        self.zones_by_col: dict[int, list] = {}
+        self.col_center_x: dict[int, float] = {}
+        self.col_distance_limit: dict[int, float] = {}
+
+        for zone in zones:
+            col = int(zone["column_index"])
+            self.zones_by_col.setdefault(col, []).append(zone)
+
+        for col, col_zones in self.zones_by_col.items():
+            col_zones.sort(key=lambda z: z["row_index"])
+            xs = [float(z["desk_center"][0]) for z in col_zones]
+            self.col_center_x[col] = float(np.mean(xs))
+
+            line_item = next(
+                (item for item in self.column_lines if int(item["column_index"]) == col),
+                None,
+            )
+            if line_item is not None:
+                self.col_distance_limit[col] = max(
+                    180.0,
+                    float(line_item.get("avg_step", 0.0)) * 0.9,
+                    float(line_item.get("avg_box_width", 0.0)) * 2.0,
+                )
+            else:
+                self.col_distance_limit[col] = 260.0
+
+    def _pick_column(self, anchor_xy):
+        if self.column_lines:
+            best_item = min(
+                self.column_lines,
+                key=lambda item: point_line_distance_kb(anchor_xy, item["line_kb"]),
+            )
+            return int(best_item["column_index"])
+        return min(
+            self.zones_by_col.keys(),
+            key=lambda col: abs(float(anchor_xy[0]) - self.col_center_x[col]),
+        )
+
+    def assign_point(self, anchor_xy, occupied_seat_nos: set[int]):
+        if not self.zones_by_col:
+            return None
+
+        col = self._pick_column(anchor_xy)
+        candidates = [
+            zone for zone in self.zones_by_col.get(col, [])
+            if int(zone["desk_no"]) not in occupied_seat_nos
+        ]
+        if not candidates:
+            return None
+
+        best_zone = min(candidates, key=lambda z: l2(anchor_xy, z["desk_center"]))
+        distance = l2(anchor_xy, best_zone["desk_center"])
+        if distance > self.col_distance_limit.get(col, 260.0):
+            return None
+
+        return {
+            "desk_id": best_zone["desk_id"],
+            "desk_no": best_zone["desk_no"],
+            "col_idx": best_zone["column_index"],
+            "row_idx": best_zone["row_index"],
+            "cost": round(distance, 4),
+            "in_zone": False,
+            "column_fallback": True,
+            "anchor_x": round(float(anchor_xy[0]), 2),
+            "anchor_y": round(float(anchor_xy[1]), 2),
+            "zone_cx": round(best_zone["zone_center"][0], 2),
+            "zone_cy": round(best_zone["zone_center"][1], 2),
+        }
+
+
+class MovementTeacherDetector:
+    """
+    在视频后半段, 用移动轨迹识别布局内老师。
+
+    规则:
+    1. 只在视频后半段启用
+    2. 布局内 track 在观察窗口内移动距离明显较大, 则锁定为 teacher
+    3. 一旦锁定为 teacher, 后续不再参与座位绑定
+    """
+
+    def __init__(self, fps: float,
+                 phase_start_frame: int,
+                 observe_seconds: float = 1.5,
+                 move_window_seconds: float = 2.5,
+                 move_distance_thresh: float = 260.0,
+                 net_displacement_thresh: float = 120.0):
+        self.fps = max(1.0, fps)
+        self.phase_start_frame = max(0, int(phase_start_frame))
+        self.observe_frames = max(1, int(round(observe_seconds * self.fps)))
+        self.move_window_frames = max(2, int(round(move_window_seconds * self.fps)))
+        self.move_distance_thresh = float(move_distance_thresh)
+        self.net_displacement_thresh = float(net_displacement_thresh)
+        self.states: dict[int, dict] = {}
+
+    def _get_state(self, track_id: int):
+        if track_id not in self.states:
+            self.states[track_id] = {
+                "anchors": deque(maxlen=self.move_window_frames),
+                "inside_frames": 0,
+                "teacher_locked": False,
+                "last_seen_frame": -1,
+                "away_from_bound_frames": 0,
+            }
+        return self.states[track_id]
+
+    def update(self, track_id: int, frame_idx: int, anchor,
+               inside_classroom: bool, bound_seat_overlap: bool):
+        st = self._get_state(track_id)
+        st["last_seen_frame"] = frame_idx
+        if inside_classroom:
+            st["inside_frames"] += 1
+            st["anchors"].append(np.asarray(anchor, dtype=np.float32))
+            if bound_seat_overlap:
+                st["away_from_bound_frames"] = 0
+            else:
+                st["away_from_bound_frames"] += 1
+        else:
+            st["anchors"].clear()
+            st["inside_frames"] = 0
+            st["away_from_bound_frames"] = 0
+
+    def _path_length(self, track_id: int) -> float:
+        st = self.states.get(track_id)
+        if st is None:
+            return 0.0
+        pts = list(st["anchors"])
+        if len(pts) < 2:
+            return 0.0
+        return float(sum(l2(a, b) for a, b in zip(pts[:-1], pts[1:])))
+
+    def _net_displacement(self, track_id: int) -> float:
+        st = self.states.get(track_id)
+        if st is None:
+            return 0.0
+        pts = list(st["anchors"])
+        if len(pts) < 2:
+            return 0.0
+        return l2(pts[0], pts[-1])
+
+    def is_teacher_locked(self, track_id: int) -> bool:
+        st = self.states.get(track_id)
+        if st is None:
+            return False
+        return bool(st.get("teacher_locked", False))
+
+    def should_delay_new_binding(self, track_id: int, frame_idx: int,
+                                 inside_classroom: bool, has_binding: bool) -> bool:
+        if frame_idx < self.phase_start_frame or has_binding or not inside_classroom:
+            return False
+        st = self.states.get(track_id)
+        if st is None:
+            return True
+        if st.get("teacher_locked", False):
+            return False
+        return st["inside_frames"] < self.observe_frames
+
+    def is_teacher_like(self, track_id: int, frame_idx: int,
+                        inside_classroom: bool,
+                        has_binding: bool) -> bool:
+        st = self._get_state(track_id)
+        if st.get("teacher_locked", False):
+            return True
+        if frame_idx < self.phase_start_frame or not inside_classroom:
+            return False
+        if has_binding and st["away_from_bound_frames"] < self.observe_frames:
+            return False
+        if st["inside_frames"] < self.observe_frames:
+            return False
+
+        move_distance = self._path_length(track_id)
+        net_displacement = self._net_displacement(track_id)
+        if (move_distance >= self.move_distance_thresh
+                and net_displacement >= self.net_displacement_thresh):
+            st["teacher_locked"] = True
+            return True
+        return False
 
 
 class GridIntervalAssigner:
@@ -1013,6 +1239,9 @@ class PersonDeskBindingPipelineV3:
         simple_vis: bool,
         max_students: int = 30,
         max_teachers: int = 2,
+        layout_callback=None,
+        frame_callback=None,
+        finish_callback=None,
     ):
         if not os.path.isfile(source):
             raise FileNotFoundError(f"视频不存在: {source}")
@@ -1047,6 +1276,9 @@ class PersonDeskBindingPipelineV3:
         self.simple_vis = simple_vis
         self.max_students = max_students
         self.max_teachers = max_teachers
+        self.layout_callback = layout_callback
+        self.frame_callback = frame_callback
+        self.finish_callback = finish_callback
 
         self.person_model = YOLO(person_weights)
         self.person_names = getattr(self.person_model, "names", None)
@@ -1061,6 +1293,18 @@ class PersonDeskBindingPipelineV3:
             num_cols=desk_num_cols,
             required_per_col=desk_required_per_col,
         )
+
+    def _emit_layout(self, payload: dict):
+        if callable(self.layout_callback):
+            self.layout_callback(payload)
+
+    def _emit_frame(self, payload: dict):
+        if callable(self.frame_callback):
+            self.frame_callback(payload)
+
+    def _emit_finish(self, payload: dict):
+        if callable(self.finish_callback):
+            self.finish_callback(payload)
 
     # ── 参考帧桌子检测 ───────────────────────────────────────
 
@@ -1276,11 +1520,40 @@ class PersonDeskBindingPipelineV3:
             cv2.imwrite(output_zone_map_path, zone_frame)
             print(f"  区间可视化: {output_zone_map_path}")
 
+        self._emit_layout({
+            "source": self.source,
+            "reference_frame_idx": reference["frame_idx"],
+            "frame_width": int(reference["frame"].shape[1]),
+            "frame_height": int(reference["frame"].shape[0]),
+            "desk_count": len(desks),
+            "zone_count": len(zones),
+            "chosen_mode": layout.get("chosen_mode", "unknown"),
+            "desks": desks,
+            "zones": [
+                {
+                    "desk_id": z["desk_id"],
+                    "desk_no": int(z["desk_no"]),
+                    "column_index": int(z["column_index"]),
+                    "row_index": int(z["row_index"]),
+                    "desk_xyxy": [float(v) for v in z["desk_xyxy"]],
+                    "polygon": z["polygon"].tolist(),
+                    "zone_center": [float(v) for v in z["zone_center"]],
+                }
+                for z in zones
+            ],
+            "column_lines": column_lines,
+            "classroom_polygon": (
+                classroom_polygon.tolist() if classroom_polygon is not None else None
+            ),
+        })
+
         # ── Step 3: 构建区间绑定器 ───────────────────────────
         print("=" * 60)
         print("Step 3: 构建梯形重叠绑定器...")
         binder = ZoneBinder(zones=zones)
+        column_fallback = ColumnFallbackAssigner(zones=zones, column_lines=column_lines)
         seat_no_to_desk = {int(z["desk_no"]): z["desk_id"] for z in zones}
+        seat_no_to_zone = {int(z["desk_no"]): z for z in zones}
         print("  规则1: 只对教室包围区内的人做座位绑定")
         print("  规则2: 人框与梯形座位区的 IoU 越大, 优先级越高")
         print("  规则3: 按 IoU 做一对一贪心匹配")
@@ -1303,13 +1576,33 @@ class PersonDeskBindingPipelineV3:
         print("Step 4: 逐帧处理 (梯形 IoU 绑定)...")
         stable_manager = StableSeatManager(
             fps=fps,
-            switch_seconds=1.0,
-            miss_hold_seconds=2.0,
+            switch_seconds=4.5,
+            miss_hold_seconds=8.0,
+            initial_bind_seconds=2.0,
         )
+        teacher_phase_start_frame = (
+            total_frames // 2 if total_frames and total_frames > 0 else 0
+        )
+        teacher_detector = MovementTeacherDetector(
+            fps=fps,
+            phase_start_frame=teacher_phase_start_frame,
+            observe_seconds=1.5,
+            move_window_seconds=2.5,
+            move_distance_thresh=260.0,
+            net_displacement_thresh=120.0,
+        )
+        print(f"  初次入座确认: {stable_manager.initial_confirm_frames} 帧 "
+              f"({stable_manager.initial_confirm_frames / fps:.2f}s)")
         print(f"  换座确认: {stable_manager.switch_confirm_frames} 帧 "
               f"({stable_manager.switch_confirm_frames / fps:.2f}s)")
         print(f"  丢检保持: {stable_manager.miss_hold_frames} 帧 "
               f"({stable_manager.miss_hold_frames / fps:.2f}s)")
+        print(f"  老师判定起点: 帧 {teacher_phase_start_frame} "
+              f"({teacher_phase_start_frame / fps:.2f}s)")
+        print(f"  老师观察窗口: {teacher_detector.observe_frames} 帧 / "
+              f"{teacher_detector.move_window_frames} 帧")
+        print(f"  老师移动阈值: 路径 {teacher_detector.move_distance_thresh:.0f}px, "
+              f"位移 {teacher_detector.net_displacement_thresh:.0f}px")
         print(f"  视频: {width}x{height} @ {fps:.1f}fps, "
               f"总帧: {total_frames}")
 
@@ -1383,17 +1676,73 @@ class PersonDeskBindingPipelineV3:
                     p["track_id"]: foot_point(p["xyxy"])
                     for p in people
                 }
+                teacher_like_tracks = set()
+                delayed_tracks = set()
+                for person in people:
+                    tid = person["track_id"]
+                    anchor = anchor_pts[tid]
+                    inside_classroom = point_in_polygon(anchor, classroom_polygon)
+                    has_binding = stable_manager.has_active_binding(tid, frame_idx)
+                    bound_seat_no = stable_manager.get_bound_seat(tid, frame_idx)
+                    bound_seat_overlap = False
+                    if bound_seat_no is not None:
+                        bound_zone = seat_no_to_zone.get(int(bound_seat_no))
+                        if bound_zone is not None:
+                            _, keep_area = convex_polygon_iou(
+                                box_polygon(person["xyxy"]),
+                                bound_zone["polygon"],
+                            )
+                            bound_seat_overlap = (
+                                point_in_polygon(anchor, bound_zone["polygon"])
+                                or keep_area > 1.0
+                            )
+                    teacher_detector.update(
+                        tid, frame_idx, anchor, inside_classroom, bound_seat_overlap
+                    )
+                    if teacher_detector.is_teacher_like(
+                        tid, frame_idx, inside_classroom, has_binding
+                    ):
+                        if has_binding:
+                            stable_manager.force_release(tid)
+                        teacher_like_tracks.add(tid)
+                    elif teacher_detector.should_delay_new_binding(
+                        tid, frame_idx, inside_classroom, has_binding
+                    ):
+                        delayed_tracks.add(tid)
 
                 student_people = [
                     p for p in people
-                    if point_in_polygon(anchor_pts[p["track_id"]], classroom_polygon)
+                    if (point_in_polygon(anchor_pts[p["track_id"]], classroom_polygon)
+                        and p["track_id"] not in teacher_like_tracks
+                        and p["track_id"] not in delayed_tracks)
                 ]
                 assignments, student_anchor_pts = binder.assign_batch(student_people)
                 anchor_pts.update(student_anchor_pts)
+                occupied_seat_nos = (
+                    stable_manager.active_seat_numbers(frame_idx)
+                    | {int(a["desk_no"]) for a in assignments.values()}
+                )
+                for person in student_people:
+                    tid = person["track_id"]
+                    if tid in assignments:
+                        continue
+                    if stable_manager.has_active_binding(tid, frame_idx):
+                        continue
+                    fb = column_fallback.assign_point(anchor_pts[tid], occupied_seat_nos)
+                    if fb is None:
+                        continue
+                    assignments[tid] = fb
+                    occupied_seat_nos.add(int(fb["desk_no"]))
+
+                frame_rows = []
 
                 # 绘制
                 annotated = None
-                if video_writer is not None or self.display:
+                if (
+                    video_writer is not None
+                    or self.display
+                    or callable(self.frame_callback)
+                ):
                     annotated = self._draw_zones(frame, zones, classroom_polygon)
                     if column_lines and not self.simple_vis:
                         annotated = draw_column_lines(
@@ -1409,16 +1758,35 @@ class PersonDeskBindingPipelineV3:
                         tid, foot_point(person["xyxy"]))
                     assignment = assignments.get(tid)
                     inside_classroom = point_in_polygon(anchor, classroom_polygon)
+                    is_teacher_like = tid in teacher_like_tracks
 
                     current_seat_no = int(assignment["desk_no"]) if assignment else None
                     current_desk_id = assignment["desk_id"] if assignment else None
+                    bound_seat_no = stable_manager.get_display_seat(tid, frame_idx)
+                    proposed_seat_no = current_seat_no
 
-                    should_update_binding = inside_classroom or stable_manager.has_active_binding(
+                    # 已绑定学生只要当前人框仍与原座位区有重叠, 就继续保持原座位,
+                    # 避免在座位附近小范围移动时误切到邻座。
+                    if bound_seat_no is not None:
+                        bound_zone = seat_no_to_zone.get(bound_seat_no)
+                        if bound_zone is not None:
+                            keep_iou, keep_area = convex_polygon_iou(
+                                box_polygon(person["xyxy"]),
+                                bound_zone["polygon"],
+                            )
+                            anchor_inside_bound = point_in_polygon(
+                                anchor, bound_zone["polygon"]
+                            )
+                            if anchor_inside_bound or keep_area > 1.0:
+                                proposed_seat_no = bound_seat_no
+
+                    should_update_binding = ((inside_classroom and not is_teacher_like)
+                                             or stable_manager.has_active_binding(
                         tid, frame_idx
-                    )
+                    ))
                     if should_update_binding:
                         display_seat_id = stable_manager.update(
-                            tid, frame_idx, current_seat_no
+                            tid, frame_idx, proposed_seat_no
                         )
                     else:
                         display_seat_id = None
@@ -1434,7 +1802,14 @@ class PersonDeskBindingPipelineV3:
                         seat_track_votes.setdefault(display_seat_id, Counter())[tid] += 1
 
                     is_bound = display_seat_id is not None
-                    r = "student" if is_bound or inside_classroom else "teacher"
+                    if is_bound:
+                        r = "student"
+                    elif is_teacher_like:
+                        r = "teacher"
+                    elif inside_classroom:
+                        r = "unknown"
+                    else:
+                        r = "teacher"
                     track_region_role[tid] = r
 
                     if r == "student" and is_bound:
@@ -1452,50 +1827,59 @@ class PersonDeskBindingPipelineV3:
                             is_bound, assignment, zone_lookup,
                         )
 
+                    if r == "student":
+                        public_track_id = display_seat_id
+                        aligned_student_id = display_seat_id
+                    else:
+                        public_track_id = f"T{tid}"
+                        aligned_student_id = None
+
+                    frame_row = {
+                        "frame_idx": frame_idx,
+                        "track_id": public_track_id,
+                        "track_id_raw": tid,
+                        "role": r,
+                        "is_bound": is_bound,
+                        "is_confirmed": is_bound,
+                        "person_conf": round(person["conf"], 4),
+                        "seat_no_current": current_seat_no,
+                        "seat_no_display": display_seat_id,
+                        "desk_id_current": current_desk_id,
+                        "desk_id_confirmed": display_physical_desk,
+                        "desk_id_display": display_desk,
+                        "bind_track_id": tid,
+                        "physical_desk_id_current": current_desk_id,
+                        "physical_desk_id_display": display_physical_desk,
+                        "student_id_aligned": aligned_student_id,
+                        "seat_id_same_as_track": display_seat_id,
+                        "inside_classroom": inside_classroom,
+                        "in_zone": assignment is not None,
+                        "overlap_iou": (
+                            assignment.get("overlap_iou") if assignment else None
+                        ),
+                        "overlap_area": (
+                            assignment.get("overlap_area") if assignment else None
+                        ),
+                        "fallback_grid": bool(
+                            assignment
+                            and (
+                                assignment.get("fallback_grid")
+                                or assignment.get("column_fallback")
+                            )
+                        ),
+                        "anchor_x": round(float(anchor[0]), 2),
+                        "anchor_y": round(float(anchor[1]), 2),
+                        "zone_cx": assignment["zone_cx"] if assignment else None,
+                        "zone_cy": assignment["zone_cy"] if assignment else None,
+                        "x1": round(person["xyxy"][0], 2),
+                        "y1": round(person["xyxy"][1], 2),
+                        "x2": round(person["xyxy"][2], 2),
+                        "y2": round(person["xyxy"][3], 2),
+                        "total_move": 0.0,
+                    }
+                    frame_rows.append(frame_row)
                     if csv_writer is not None:
-                        if r == "student":
-                            public_track_id = display_seat_id
-                            aligned_student_id = display_seat_id
-                        else:
-                            public_track_id = f"T{tid}"
-                            aligned_student_id = None
-                        csv_writer.writerow({
-                            "frame_idx": frame_idx,
-                            "track_id": public_track_id,
-                            "track_id_raw": tid,
-                            "role": r,
-                            "is_bound": is_bound,
-                            "is_confirmed": is_bound,
-                            "person_conf": round(person["conf"], 4),
-                            "seat_no_current": current_seat_no,
-                            "seat_no_display": display_seat_id,
-                            "desk_id_current": current_desk_id,
-                            "desk_id_confirmed": display_physical_desk,
-                            "desk_id_display": display_desk,
-                            "bind_track_id": tid,
-                            "physical_desk_id_current": current_desk_id,
-                            "physical_desk_id_display": display_physical_desk,
-                            "student_id_aligned": aligned_student_id,
-                            "seat_id_same_as_track": display_seat_id,
-                            "inside_classroom": inside_classroom,
-                            "in_zone": assignment is not None,
-                            "overlap_iou": (
-                                assignment.get("overlap_iou") if assignment else None
-                            ),
-                            "overlap_area": (
-                                assignment.get("overlap_area") if assignment else None
-                            ),
-                            "fallback_grid": False,
-                            "anchor_x": round(float(anchor[0]), 2),
-                            "anchor_y": round(float(anchor[1]), 2),
-                            "zone_cx": assignment["zone_cx"] if assignment else None,
-                            "zone_cy": assignment["zone_cy"] if assignment else None,
-                            "x1": round(person["xyxy"][0], 2),
-                            "y1": round(person["xyxy"][1], 2),
-                            "x2": round(person["xyxy"][2], 2),
-                            "y2": round(person["xyxy"][3], 2),
-                            "total_move": 0.0,
-                        })
+                        csv_writer.writerow(frame_row)
 
                 info = (
                     f"Frame {frame_idx}/{total_frames or '?'} | "
@@ -1507,6 +1891,28 @@ class PersonDeskBindingPipelineV3:
                     if video_writer is not None:
                         video_writer.write(annotated)
 
+                callback_frame = None
+                if callable(self.frame_callback):
+                    callback_frame = (
+                        annotated.copy() if annotated is not None else frame.copy()
+                    )
+                    self._emit_frame({
+                        "source": self.source,
+                        "frame_idx": frame_idx,
+                        "total_frames": total_frames,
+                        "fps": fps,
+                        "frame_width": width,
+                        "frame_height": height,
+                        "student_count": student_count,
+                        "teacher_count": teacher_count,
+                        "unknown_count": unknown_count,
+                        "active_bindings": sorted(
+                            int(seat_no) for seat_no in stable_manager.active_seat_numbers(frame_idx)
+                        ),
+                        "rows": frame_rows,
+                        "frame_bgr": callback_frame,
+                    })
+
                 if self.display and annotated is not None:
                     cv2.imshow("V3 Zone Binding", annotated)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -1517,7 +1923,7 @@ class PersonDeskBindingPipelineV3:
                     pct = 100.0 * frame_idx / total_frames
                     total_assigned = len(assignments)
                     print(f"  {frame_idx}/{total_frames} ({pct:.1f}%) "
-                          f"S={student_count} T={teacher_count} | "
+                          f"S={student_count} T={teacher_count} ?={unknown_count} | "
                           f"当前重叠绑定={total_assigned}/30")
 
                 frame_idx += 1
@@ -1591,12 +1997,26 @@ class PersonDeskBindingPipelineV3:
                 "teacher_rule": "outside_classroom_polygon",
                 "student_rule": "inside_classroom_polygon",
                 "matching_rule": "bbox_zone_iou_greedy",
+                "initial_bind_seconds": round(
+                    stable_manager.initial_confirm_frames / fps, 3
+                ),
                 "switch_confirm_seconds": round(
                     stable_manager.switch_confirm_frames / fps, 3
                 ),
                 "miss_hold_seconds": round(
                     stable_manager.miss_hold_frames / fps, 3
                 ),
+                "teacher_phase_start_seconds": round(
+                    teacher_phase_start_frame / fps, 3
+                ),
+                "teacher_detect_observe_seconds": round(
+                    teacher_detector.observe_frames / fps, 3
+                ),
+                "teacher_move_window_seconds": round(
+                    teacher_detector.move_window_frames / fps, 3
+                ),
+                "teacher_move_distance_thresh": teacher_detector.move_distance_thresh,
+                "teacher_net_displacement_thresh": teacher_detector.net_displacement_thresh,
                 "first_extend_ratio": self.first_extend_ratio,
                 "last_extend_ratio": self.last_extend_ratio,
                 "simple_vis": self.simple_vis,
@@ -1664,6 +2084,8 @@ class PersonDeskBindingPipelineV3:
         print("=" * 60)
         print(f"完成! {frame_idx} 帧, "
               f"已绑定座位 {len(occupied_bind_ids)}/{len(zones)} 个")
+        self._emit_finish(summary)
+        return summary
 
 
 # ─── CLI ─────────────────────────────────────────────────────
