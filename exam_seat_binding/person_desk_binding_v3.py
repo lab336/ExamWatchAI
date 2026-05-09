@@ -570,15 +570,28 @@ class StableSeatManager:
 
 class ColumnFallbackAssigner:
     """
-    同列空位兜底分配器。
+    同列顺序兜底分配器。
+
+    逻辑:
+    1. 先按列线将未绑定的人分到对应列
+    2. 在列方向上计算每个人脚点的深度投影
+    3. 按深度从近到远排序后，与同列剩余空座位做保序匹配
+    4. 若人与可分配座位的深度差过大，则跳过，不强行绑定
     """
 
     def __init__(self, zones: list, column_lines: list | None):
         self.zones = zones
         self.column_lines = column_lines or []
+        self.column_line_by_col: dict[int, dict] = {
+            int(item["column_index"]): item for item in self.column_lines
+        }
         self.zones_by_col: dict[int, list] = {}
         self.col_center_x: dict[int, float] = {}
         self.col_distance_limit: dict[int, float] = {}
+        self.col_depth_limit: dict[int, float] = {}
+        self.col_origin: dict[int, np.ndarray] = {}
+        self.col_axis_unit: dict[int, np.ndarray] = {}
+        self.col_zone_depths: dict[int, dict[int, float]] = {}
 
         for zone in zones:
             col = int(zone["column_index"])
@@ -589,10 +602,7 @@ class ColumnFallbackAssigner:
             xs = [float(z["desk_center"][0]) for z in col_zones]
             self.col_center_x[col] = float(np.mean(xs))
 
-            line_item = next(
-                (item for item in self.column_lines if int(item["column_index"]) == col),
-                None,
-            )
+            line_item = self.column_line_by_col.get(col)
             if line_item is not None:
                 self.col_distance_limit[col] = max(
                     180.0,
@@ -602,48 +612,199 @@ class ColumnFallbackAssigner:
             else:
                 self.col_distance_limit[col] = 260.0
 
+            if line_item is not None:
+                origin = np.asarray(
+                    line_item.get("segment_start", col_zones[0]["zone_center"]),
+                    dtype=np.float32,
+                )
+                far_point = np.asarray(
+                    line_item.get("segment_end", col_zones[-1]["zone_center"]),
+                    dtype=np.float32,
+                )
+            else:
+                origin = np.asarray(col_zones[0]["zone_center"], dtype=np.float32)
+                far_point = np.asarray(col_zones[-1]["zone_center"], dtype=np.float32)
+
+            axis = far_point - origin
+            axis_norm = float(np.linalg.norm(axis))
+            if axis_norm <= 1e-6:
+                axis = np.asarray([0.0, -1.0], dtype=np.float32)
+                axis_norm = 1.0
+            axis_unit = axis / axis_norm
+
+            self.col_origin[col] = origin
+            self.col_axis_unit[col] = axis_unit
+
+            zone_depths: dict[int, float] = {}
+            for zone in col_zones:
+                seat_no = int(zone["desk_no"])
+                zone_depths[seat_no] = self._project_depth(
+                    np.asarray(zone["zone_center"], dtype=np.float32), col,
+                )
+            self.col_zone_depths[col] = zone_depths
+
+            ordered_depths = [zone_depths[int(zone["desk_no"])] for zone in col_zones]
+            if len(ordered_depths) >= 2:
+                depth_steps = [
+                    abs(depth_b - depth_a)
+                    for depth_a, depth_b in zip(ordered_depths[:-1], ordered_depths[1:])
+                ]
+                typical_step = float(np.median(depth_steps))
+            else:
+                typical_step = float(
+                    line_item.get("avg_step", 0.0)
+                    if line_item is not None else 0.0
+                )
+            avg_box_height = float(line_item.get("avg_box_height", 0.0)) if line_item else 0.0
+            self.col_depth_limit[col] = max(
+                110.0,
+                typical_step * 1.15,
+                avg_box_height * 1.1,
+            )
+
     def _pick_column(self, anchor_xy):
+        if not self.zones_by_col:
+            return None, float("inf")
         if self.column_lines:
             best_item = min(
                 self.column_lines,
                 key=lambda item: point_line_distance_kb(anchor_xy, item["line_kb"]),
             )
-            return int(best_item["column_index"])
-        return min(
+            col = int(best_item["column_index"])
+            return col, point_line_distance_kb(anchor_xy, best_item["line_kb"])
+        col = min(
             self.zones_by_col.keys(),
             key=lambda col: abs(float(anchor_xy[0]) - self.col_center_x[col]),
         )
+        return col, abs(float(anchor_xy[0]) - self.col_center_x[col])
 
-    def assign_point(self, anchor_xy, occupied_seat_nos: set[int]):
-        if not self.zones_by_col:
-            return None
+    def _project_depth(self, point_xy, col: int) -> float:
+        point = np.asarray(point_xy, dtype=np.float32)
+        origin = self.col_origin[col]
+        axis_unit = self.col_axis_unit[col]
+        return float(np.dot(point - origin, axis_unit))
 
-        col = self._pick_column(anchor_xy)
-        candidates = [
-            zone for zone in self.zones_by_col.get(col, [])
-            if int(zone["desk_no"]) not in occupied_seat_nos
-        ]
-        if not candidates:
-            return None
+    def _preferred_row(self, col: int, depth_value: float):
+        col_zones = self.zones_by_col.get(col, [])
+        if not col_zones:
+            return None, float("inf")
 
-        best_zone = min(candidates, key=lambda z: l2(anchor_xy, z["desk_center"]))
-        distance = l2(anchor_xy, best_zone["desk_center"])
-        if distance > self.col_distance_limit.get(col, 260.0):
-            return None
+        best_zone = min(
+            col_zones,
+            key=lambda zone: abs(
+                self.col_zone_depths[col][int(zone["desk_no"])] - depth_value
+            ),
+        )
+        best_depth = self.col_zone_depths[col][int(best_zone["desk_no"])]
+        return int(best_zone["row_index"]), abs(best_depth - depth_value)
 
-        return {
-            "desk_id": best_zone["desk_id"],
-            "desk_no": best_zone["desk_no"],
-            "col_idx": best_zone["column_index"],
-            "row_idx": best_zone["row_index"],
-            "cost": round(distance, 4),
-            "in_zone": False,
-            "column_fallback": True,
-            "anchor_x": round(float(anchor_xy[0]), 2),
-            "anchor_y": round(float(anchor_xy[1]), 2),
-            "zone_cx": round(best_zone["zone_center"][0], 2),
-            "zone_cy": round(best_zone["zone_center"][1], 2),
-        }
+    def assign_batch(
+        self,
+        people: list,
+        anchor_pts: dict[int, np.ndarray],
+        occupied_seat_nos: set[int],
+        blocked_track_ids: set[int] | None = None,
+    ):
+        if not self.zones_by_col or not people:
+            return {}
+
+        blocked = blocked_track_ids or set()
+        grouped_people: dict[int, list[dict]] = {}
+        assignments = {}
+
+        for person in people:
+            tid = int(person["track_id"])
+            if tid in blocked:
+                continue
+            anchor = anchor_pts.get(tid)
+            if anchor is None:
+                continue
+
+            col, line_distance = self._pick_column(anchor)
+            if col is None:
+                continue
+            if line_distance > self.col_distance_limit.get(col, 260.0):
+                continue
+
+            depth_value = self._project_depth(anchor, col)
+            preferred_row, _ = self._preferred_row(col, depth_value)
+            if preferred_row is None:
+                continue
+
+            grouped_people.setdefault(col, []).append(
+                {
+                    "track_id": tid,
+                    "anchor": anchor,
+                    "depth_value": depth_value,
+                    "line_distance": float(line_distance),
+                    "preferred_row": int(preferred_row),
+                }
+            )
+
+        for col, col_people in grouped_people.items():
+            available_zones = [
+                zone for zone in self.zones_by_col.get(col, [])
+                if int(zone["desk_no"]) not in occupied_seat_nos
+            ]
+            if not available_zones:
+                continue
+
+            available_zones.sort(key=lambda zone: int(zone["row_index"]))
+            col_people.sort(
+                key=lambda item: (
+                    item["depth_value"],
+                    float(item["anchor"][0]),
+                    int(item["track_id"]),
+                )
+            )
+
+            last_row = -1
+            for info in col_people:
+                candidates = [
+                    zone for zone in available_zones
+                    if int(zone["row_index"]) > last_row
+                ]
+                if not candidates:
+                    break
+
+                best_zone = min(
+                    candidates,
+                    key=lambda zone: (
+                        abs(int(zone["row_index"]) - info["preferred_row"]),
+                        abs(
+                            self.col_zone_depths[col][int(zone["desk_no"])]
+                            - info["depth_value"]
+                        ),
+                        l2(info["anchor"], zone["zone_center"]),
+                    ),
+                )
+                depth_gap = abs(
+                    self.col_zone_depths[col][int(best_zone["desk_no"])]
+                    - info["depth_value"]
+                )
+                if depth_gap > self.col_depth_limit.get(col, 140.0):
+                    continue
+
+                seat_no = int(best_zone["desk_no"])
+                assignments[info["track_id"]] = {
+                    "desk_id": best_zone["desk_id"],
+                    "desk_no": seat_no,
+                    "col_idx": best_zone["column_index"],
+                    "row_idx": best_zone["row_index"],
+                    "cost": round(depth_gap + info["line_distance"], 4),
+                    "in_zone": False,
+                    "column_fallback": True,
+                    "ordered_column_fallback": True,
+                    "anchor_x": round(float(info["anchor"][0]), 2),
+                    "anchor_y": round(float(info["anchor"][1]), 2),
+                    "zone_cx": round(best_zone["zone_center"][0], 2),
+                    "zone_cy": round(best_zone["zone_center"][1], 2),
+                }
+                occupied_seat_nos.add(seat_no)
+                available_zones.remove(best_zone)
+                last_row = int(best_zone["row_index"])
+
+        return assignments
 
 
 class MovementTeacherDetector:
@@ -720,6 +881,25 @@ class MovementTeacherDetector:
         if st is None:
             return False
         return bool(st.get("teacher_locked", False))
+
+    def is_high_motion(self, track_id: int,
+                       inside_classroom: bool,
+                       min_ratio: float = 0.6) -> bool:
+        if not inside_classroom:
+            return False
+        st = self.states.get(track_id)
+        if st is None:
+            return False
+        min_frames = max(4, self.observe_frames // 2)
+        if min(st["inside_frames"], len(st["anchors"])) < min_frames:
+            return False
+
+        move_distance = self._path_length(track_id)
+        net_displacement = self._net_displacement(track_id)
+        return (
+            move_distance >= self.move_distance_thresh * min_ratio
+            and net_displacement >= self.net_displacement_thresh * min_ratio
+        )
 
     def should_delay_new_binding(self, track_id: int, frame_idx: int,
                                  inside_classroom: bool, has_binding: bool) -> bool:
@@ -1579,6 +1759,8 @@ class PersonDeskBindingPipelineV3:
         print("  规则1: 只对教室包围区内的人做座位绑定")
         print("  规则2: 人框与梯形座位区的 IoU 越大, 优先级越高")
         print("  规则3: 按 IoU 做一对一贪心匹配")
+        print("  规则4: IoU 失败后, 同列按前后顺序做兜底匹配")
+        print("  规则5: 移动量明显过大的未绑定目标, 暂不入座")
         print("  输出ID: 学生对外统一使用座位号 1..30")
 
         # ── 打开视频 ─────────────────────────────────────────
@@ -1700,6 +1882,7 @@ class PersonDeskBindingPipelineV3:
                 }
                 teacher_like_tracks = set()
                 delayed_tracks = set()
+                high_motion_tracks = set()
                 for person in people:
                     tid = person["track_id"]
                     anchor = anchor_pts[tid]
@@ -1727,6 +1910,10 @@ class PersonDeskBindingPipelineV3:
                         if has_binding:
                             stable_manager.force_release(tid)
                         teacher_like_tracks.add(tid)
+                    elif (not has_binding and teacher_detector.is_high_motion(
+                        tid, inside_classroom
+                    )):
+                        high_motion_tracks.add(tid)
                     elif teacher_detector.should_delay_new_binding(
                         tid, frame_idx, inside_classroom, has_binding
                     ):
@@ -1736,7 +1923,8 @@ class PersonDeskBindingPipelineV3:
                     p for p in people
                     if (point_in_polygon(anchor_pts[p["track_id"]], classroom_polygon)
                         and p["track_id"] not in teacher_like_tracks
-                        and p["track_id"] not in delayed_tracks)
+                        and p["track_id"] not in delayed_tracks
+                        and p["track_id"] not in high_motion_tracks)
                 ]
                 assignments, student_anchor_pts = binder.assign_batch(student_people)
                 anchor_pts.update(student_anchor_pts)
@@ -1744,17 +1932,20 @@ class PersonDeskBindingPipelineV3:
                     stable_manager.active_seat_numbers(frame_idx)
                     | {int(a["desk_no"]) for a in assignments.values()}
                 )
-                for person in student_people:
-                    tid = person["track_id"]
-                    if tid in assignments:
-                        continue
-                    if stable_manager.has_active_binding(tid, frame_idx):
-                        continue
-                    fb = column_fallback.assign_point(anchor_pts[tid], occupied_seat_nos)
-                    if fb is None:
-                        continue
-                    assignments[tid] = fb
-                    occupied_seat_nos.add(int(fb["desk_no"]))
+                fallback_people = [
+                    person for person in student_people
+                    if (person["track_id"] not in assignments
+                        and not stable_manager.has_active_binding(
+                            person["track_id"], frame_idx
+                        ))
+                ]
+                fallback_assignments = column_fallback.assign_batch(
+                    people=fallback_people,
+                    anchor_pts=anchor_pts,
+                    occupied_seat_nos=occupied_seat_nos,
+                    blocked_track_ids=high_motion_tracks,
+                )
+                assignments.update(fallback_assignments)
 
                 frame_rows = []
                 should_emit_frame = (
