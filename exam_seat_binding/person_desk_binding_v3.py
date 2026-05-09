@@ -1239,6 +1239,8 @@ class PersonDeskBindingPipelineV3:
         simple_vis: bool,
         max_students: int = 30,
         max_teachers: int = 2,
+        frame_callback_stride: int = 3,
+        frame_callback_max_width: int | None = 1280,
         layout_callback=None,
         frame_callback=None,
         finish_callback=None,
@@ -1276,6 +1278,12 @@ class PersonDeskBindingPipelineV3:
         self.simple_vis = simple_vis
         self.max_students = max_students
         self.max_teachers = max_teachers
+        self.frame_callback_stride = max(1, int(frame_callback_stride))
+        self.frame_callback_max_width = (
+            int(frame_callback_max_width)
+            if frame_callback_max_width is not None and int(frame_callback_max_width) > 0
+            else None
+        )
         self.layout_callback = layout_callback
         self.frame_callback = frame_callback
         self.finish_callback = finish_callback
@@ -1305,6 +1313,20 @@ class PersonDeskBindingPipelineV3:
     def _emit_finish(self, payload: dict):
         if callable(self.finish_callback):
             self.finish_callback(payload)
+
+    def _prepare_callback_frame(self, frame):
+        callback_frame = frame.copy()
+        max_width = self.frame_callback_max_width
+        if max_width is not None:
+            height, width = callback_frame.shape[:2]
+            if width > max_width:
+                scale = max_width / float(width)
+                callback_frame = cv2.resize(
+                    callback_frame,
+                    (max_width, max(1, int(round(height * scale)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+        return callback_frame
 
     # ── 参考帧桌子检测 ───────────────────────────────────────
 
@@ -1735,13 +1757,21 @@ class PersonDeskBindingPipelineV3:
                     occupied_seat_nos.add(int(fb["desk_no"]))
 
                 frame_rows = []
+                should_emit_frame = (
+                    callable(self.frame_callback)
+                    and (
+                        frame_idx == 0
+                        or frame_idx % self.frame_callback_stride == 0
+                        or (total_frames > 0 and frame_idx >= total_frames - 1)
+                    )
+                )
 
                 # 绘制
                 annotated = None
                 if (
                     video_writer is not None
                     or self.display
-                    or callable(self.frame_callback)
+                    or should_emit_frame
                 ):
                     annotated = self._draw_zones(frame, zones, classroom_polygon)
                     if column_lines and not self.simple_vis:
@@ -1892,10 +1922,10 @@ class PersonDeskBindingPipelineV3:
                         video_writer.write(annotated)
 
                 callback_frame = None
-                if callable(self.frame_callback):
-                    callback_frame = (
-                        annotated.copy() if annotated is not None else frame.copy()
-                    )
+                if should_emit_frame:
+                    callback_source = annotated if annotated is not None else frame
+                    callback_frame = self._prepare_callback_frame(callback_source)
+                    callback_frame_raw = self._prepare_callback_frame(frame)
                     self._emit_frame({
                         "source": self.source,
                         "frame_idx": frame_idx,
@@ -1911,6 +1941,7 @@ class PersonDeskBindingPipelineV3:
                         ),
                         "rows": frame_rows,
                         "frame_bgr": callback_frame,
+                        "frame_bgr_raw": callback_frame_raw,
                     })
 
                 if self.display and annotated is not None:
