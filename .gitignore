@@ -5,6 +5,7 @@ data/
 *.mov
 exam_seat_binding/weight
 output
+output2
 # Model files
 model/
 *.pt

@@ -4,7 +4,7 @@
 
 使用示例：
 # 合并两个视频
-python scrpts/video_tool/video_merge.py --input data/ideotest/clipped_testdata2.mp4 data/ideotest/clipped_testdata.mp4 --output data/ideotest/merged_output.mp4
+python scrpts/video_tool/video_merge.py --input data/1.10/clipleft/clipped_testdata1.mp4 data/1.10/clipleft/clipped_testdata2.mp4 --output data/1.10/clipleft/merged_output.mp4
 
 # 从文本文件读取视频列表
 python scrpts/video_tool/video_merge.py --list videos.txt --output merged.mp4

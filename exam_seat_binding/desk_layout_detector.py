@@ -8,13 +8,13 @@
 
 示例：
 1. 普通检测:
-   python exam_seat_binding/desk_layout_detector.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode normal
+   python exam_seat_binding/desk_layout_detector.py --source data/1.10/clip/clip_desk.mp4 --weights exam_seat_binding/weight/yolo11desk.pt --mode normal
 2. 分列方案1:
-   python exam_seat_binding/desk_layout_detector.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode scheme1
+   python exam_seat_binding/desk_layout_detector.py --source data/1.10/clipleft/clipped_testdata1.mp4 --weights exam_seat_binding/weight/yolo11desk.pt --mode scheme1   --output output/video
 3. 分列方案2:
-   python exam_seat_binding/desk_layout_detector.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode scheme2
+   python exam_seat_binding/desk_layout_detector.py --source data/1.10/clip/clip_desk.mp4 --weights exam_seat_binding/weight/yolo11desk.pt --mode scheme2
 4. 自动选择方案:
-   python exam_seat_binding/desk_layout_detector.py --source data/my_screenshots --weights exam_seat_binding/weight/yolo11desk.pt --mode auto
+   python exam_seat_binding/desk_layout_detector.py --source data/1.10/clip/clip_desk.mp4 --weights exam_seat_binding/weight/yolo11desk.pt --mode auto
 """
 
 import argparse
@@ -198,6 +198,10 @@ def fitted_columns_straightness_score(
         per_col_scores.append(float(np.mean(dists)))
 
     return float(np.mean(per_col_scores)), fitted_lines
+
+
+def _scheme_name(scheme: int) -> str:
+    return "scheme1" if int(scheme) == 1 else "scheme2"
 
 
 def draw_normal(img, boxes, model_names):
@@ -384,17 +388,104 @@ class DeskLayoutDetector:
             centers.append(list(box_center(box)))
         return np.array(centers, dtype=np.float32)
 
+    def _split_columns_for_scheme(self, centers_np: np.ndarray, scheme: int):
+        if int(scheme) == 1:
+            return vd1.split_into_columns_by_origin_walk(
+                centers_np,
+                num_cols=self.num_cols,
+                expected_per_col=self.required_per_col,
+            )
+        return vd2.split_into_columns_by_origin_walk(
+            centers_np,
+            num_cols=self.num_cols,
+            expected_per_col=self.required_per_col,
+        )
+
+    def _build_layout_for_scheme(self, boxes, scheme: int):
+        centers_np = self._extract_centers(boxes)
+        columns, lines, _ = self._split_columns_for_scheme(centers_np, scheme)
+        style = 1 if int(scheme) == 1 else 2
+        ordered_columns, desks = build_layout_entries(
+            boxes,
+            columns,
+            style=style,
+            num_per_col=self.required_per_col,
+        )
+        column_lines = build_column_line_entries(boxes, ordered_columns, desks)
+        return {
+            "chosen_scheme": int(scheme),
+            "chosen_mode": _scheme_name(scheme),
+            "style": style,
+            "columns": columns,
+            "ordered_columns": ordered_columns,
+            "column_lines": column_lines,
+            "desks": desks,
+            "_raw_lines": lines,
+        }
+
+    def _score_layout_for_scheme(self, boxes, scheme: int):
+        """给单帧的某个分列方案打分，分数越高越适合作为固定座位模型。"""
+        if len(boxes) == 0:
+            return None
+
+        layout = self._build_layout_for_scheme(boxes, scheme)
+        centers_np = self._extract_centers(boxes)
+        columns = layout["columns"]
+        raw_lines = layout.pop("_raw_lines", [])
+
+        expected_total = self.num_cols * self.required_per_col
+        desk_count = len(layout["desks"])
+        col_counts = [len(col) for col in columns]
+        complete_cols = sum(1 for count in col_counts if count >= self.required_per_col)
+        count_penalty = abs(desk_count - expected_total)
+        col_balance_penalty = sum(abs(count - self.required_per_col) for count in col_counts)
+
+        straight_score, _ = fitted_columns_straightness_score(
+            centers_np,
+            columns,
+            required_per_col=self.required_per_col,
+        )
+        if not np.isfinite(straight_score):
+            straight_score = avg_point_line_distance(centers_np, columns, raw_lines)
+        straight_penalty = straight_score if np.isfinite(straight_score) else 10000.0
+
+        conf_sum = sum(float(d["conf"]) for d in layout["desks"])
+        mean_conf = conf_sum / max(1, desk_count)
+
+        score = (
+            desk_count * 1000.0
+            + complete_cols * 250.0
+            + mean_conf * 100.0
+            - count_penalty * 300.0
+            - col_balance_penalty * 80.0
+            - straight_penalty * 5.0
+        )
+        layout["layout_score"] = float(score)
+        layout["layout_metrics"] = {
+            "desk_count": int(desk_count),
+            "expected_total": int(expected_total),
+            "column_counts": [int(v) for v in col_counts],
+            "complete_columns": int(complete_cols),
+            "count_penalty": int(count_penalty),
+            "column_balance_penalty": int(col_balance_penalty),
+            "straightness": float(straight_score) if np.isfinite(straight_score) else None,
+            "confidence_sum": float(conf_sum),
+            "mean_confidence": float(mean_conf),
+            "score": float(score),
+        }
+        return layout
+
     def _select_layout(self, centers_np: np.ndarray, tag="", log=True):
         if self.mode == "scheme1":
-            cols, _, _ = vd1.split_into_columns_by_origin_walk(centers_np, num_cols=self.num_cols)
+            cols, _, _ = self._split_columns_for_scheme(centers_np, 1)
             return 1, cols
 
         if self.mode == "scheme2":
-            cols, _, _ = vd2.split_into_columns_by_origin_walk(centers_np, num_cols=self.num_cols)
+            cols, _, _ = self._split_columns_for_scheme(centers_np, 2)
             return 2, cols
 
-        cols1, lines1, _ = vd1.split_into_columns_by_origin_walk(centers_np, num_cols=self.num_cols)
-        cols2, lines2, _ = vd2.split_into_columns_by_origin_walk(centers_np, num_cols=self.num_cols)
+        cols1, lines1, _ = self._split_columns_for_scheme(centers_np, 1)
+        cols2, lines2, _ = self._split_columns_for_scheme(centers_np, 2)
         straight1, fitted1 = fitted_columns_straightness_score(
             centers_np, cols1, required_per_col=self.required_per_col
         )
@@ -423,6 +514,187 @@ class DeskLayoutDetector:
         if log:
             print(f"[AUTO] 五列拟合不足，回退整体误差比较: s1={score1:.4f}, s2={score2:.4f}, 选择方案{chosen}: {tag}")
         return chosen, (cols1 if chosen == 1 else cols2)
+
+    def _candidate_schemes(self):
+        if self.mode == "scheme1":
+            return [1]
+        if self.mode == "scheme2":
+            return [2]
+        if self.mode == "auto":
+            return [1, 2]
+        return []
+
+    def select_best_layout_from_video(
+        self,
+        video_path: str,
+        max_frames: int = 120,
+        sample_step: int = 5,
+        log: bool = True,
+    ):
+        """在视频前若干帧中采样检测，选择最稳定、最完整的座位布局模型。
+
+        返回结构与旧版参考帧选择兼容:
+        {
+            frame_idx, frame, layout, desk_count, score
+        }
+        """
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"无法打开视频: {video_path}")
+
+        sample_step = max(1, int(sample_step))
+        max_frames = max(1, int(max_frames))
+
+        if self.mode == "normal":
+            best = None
+            frame_idx = 0
+            try:
+                while True:
+                    ret, frame = cap.read()
+                    if not ret or frame_idx >= max_frames:
+                        break
+                    if frame_idx % sample_step == 0:
+                        result = self.detect_desks(
+                            frame,
+                            tag=f"seq:{frame_idx}",
+                            annotate=False,
+                            log=False,
+                        )
+                        desks = result["layout"]["desks"]
+                        score = sum(d["conf"] for d in desks)
+                        if desks and (
+                            best is None
+                            or len(desks) > best["desk_count"]
+                            or (len(desks) == best["desk_count"] and score > best["score"])
+                        ):
+                            best = {
+                                "frame_idx": frame_idx,
+                                "frame": frame.copy(),
+                                "layout": result["layout"],
+                                "desk_count": len(desks),
+                                "score": float(score),
+                            }
+                    frame_idx += 1
+            finally:
+                cap.release()
+
+            if best is None:
+                raise RuntimeError("桌子检测失败，未找到可用桌子布局。")
+            return best
+
+        schemes = self._candidate_schemes()
+        if not schemes:
+            raise RuntimeError(f"不支持的桌子布局模式: {self.mode}")
+
+        stats = {
+            scheme: {
+                "sampled_frames": 0,
+                "usable_frames": 0,
+                "full_layout_frames": 0,
+                "score_sum": 0.0,
+                "best": None,
+            }
+            for scheme in schemes
+        }
+
+        frame_idx = 0
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret or frame_idx >= max_frames:
+                    break
+                if frame_idx % sample_step != 0:
+                    frame_idx += 1
+                    continue
+
+                results = self._predict(frame)
+                boxes = results[0].boxes
+                for scheme in schemes:
+                    stats[scheme]["sampled_frames"] += 1
+                    layout = self._score_layout_for_scheme(boxes, scheme)
+                    if layout is None:
+                        continue
+                    metrics = layout["layout_metrics"]
+                    stats[scheme]["usable_frames"] += 1
+                    stats[scheme]["score_sum"] += layout["layout_score"]
+                    if metrics["desk_count"] >= metrics["expected_total"]:
+                        stats[scheme]["full_layout_frames"] += 1
+
+                    best = stats[scheme]["best"]
+                    if best is None or layout["layout_score"] > best["score"]:
+                        stats[scheme]["best"] = {
+                            "frame_idx": frame_idx,
+                            "frame": frame.copy(),
+                            "layout": layout,
+                            "desk_count": len(layout["desks"]),
+                            "score": float(layout["layout_score"]),
+                        }
+
+                frame_idx += 1
+        finally:
+            cap.release()
+
+        candidates = []
+        for scheme, item in stats.items():
+            if item["best"] is None or item["usable_frames"] == 0:
+                continue
+            avg_score = item["score_sum"] / max(1, item["usable_frames"])
+            aggregate_score = (
+                avg_score
+                + item["full_layout_frames"] * 500.0
+                + item["usable_frames"] * 25.0
+            )
+            candidates.append((aggregate_score, item["best"]["score"], scheme))
+
+        if not candidates:
+            raise RuntimeError("桌子检测失败，未找到可用桌子布局。")
+
+        candidates.sort(reverse=True)
+        _, _, chosen_scheme = candidates[0]
+        chosen = stats[chosen_scheme]["best"]
+
+        sequence_summary = {}
+        for scheme, item in stats.items():
+            avg_score = (
+                item["score_sum"] / max(1, item["usable_frames"])
+                if item["usable_frames"] > 0 else None
+            )
+            sequence_summary[_scheme_name(scheme)] = {
+                "sampled_frames": int(item["sampled_frames"]),
+                "usable_frames": int(item["usable_frames"]),
+                "full_layout_frames": int(item["full_layout_frames"]),
+                "average_score": float(avg_score) if avg_score is not None else None,
+                "best_score": (
+                    float(item["best"]["score"]) if item["best"] is not None else None
+                ),
+                "best_frame_idx": (
+                    int(item["best"]["frame_idx"]) if item["best"] is not None else None
+                ),
+            }
+
+        chosen["layout"]["sequence_selection"] = {
+            "method": "sampled_video_layout_score",
+            "mode": self.mode,
+            "chosen_scheme": int(chosen_scheme),
+            "chosen_mode": _scheme_name(chosen_scheme),
+            "max_frames": int(max_frames),
+            "sample_step": int(sample_step),
+            "stats": sequence_summary,
+        }
+        if log:
+            print("[SEQUENCE_LAYOUT] 视频序列布局评估:")
+            for name, info in sequence_summary.items():
+                print(
+                    f"  {name}: usable={info['usable_frames']}/"
+                    f"{info['sampled_frames']}, full={info['full_layout_frames']}, "
+                    f"avg={info['average_score']}, best={info['best_score']} "
+                    f"@frame={info['best_frame_idx']}"
+                )
+            print(
+                f"  选择: {_scheme_name(chosen_scheme)} "
+                f"@ frame {chosen['frame_idx']} score={chosen['score']:.2f}"
+            )
+        return chosen
 
     def get_layout_info(self, boxes, tag="", log=True):
         if len(boxes) == 0:
@@ -650,8 +922,8 @@ def main():
     parser = argparse.ArgumentParser(description="桌子布局检测脚本")
     parser.add_argument("--source", type=str, required=True, help="检测源: 图片/视频/文件夹/摄像头ID(0)")
     parser.add_argument("--weights", type=str, default="exam_seat_binding/weight/yolo11desk.pt", help="模型权重文件路径")
-    parser.add_argument("--conf", type=float, default=0.7, help="置信度阈值")
-    parser.add_argument("--iou", type=float, default=0.45, help="NMS IOU阈值")
+    parser.add_argument("--conf", type=float, default=0.8, help="置信度阈值")
+    parser.add_argument("--iou", type=float, default=0.5, help="NMS IOU阈值")
     parser.add_argument("--output", type=str, default="output", help="结果保存目录")
     parser.add_argument("--display", action="store_true", help="实时显示检测结果(仅视频)")
     parser.add_argument("--device", type=str, default="", help="运行设备: cpu/cuda/0/1 等")

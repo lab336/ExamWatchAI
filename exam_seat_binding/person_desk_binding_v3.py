@@ -16,7 +16,7 @@
   → 人框与梯形区算 IoU → 贪心一对一分配 → 输出座位号
 
 用法:
-python exam_seat_binding/person_desk_binding_v3.py --source data/ideotest/merged_output.mp4
+python exam_seat_binding/person_desk_binding_v3.py --source data/1.10/clip/merged_output.mp4
 python exam_seat_binding/person_desk_binding_v3.py --source data/ideotest/merged_output.mp4 --display
 """
 
@@ -1511,44 +1511,12 @@ class PersonDeskBindingPipelineV3:
     # ── 参考帧桌子检测 ───────────────────────────────────────
 
     def _select_reference_desks(self):
-        cap = cv2.VideoCapture(self.source)
-        if not cap.isOpened():
-            raise RuntimeError(f"无法打开视频: {self.source}")
-        best = None
-        frame_idx = 0
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if frame_idx >= self.reference_max_frames:
-                    break
-                if frame_idx % self.reference_sample_step == 0:
-                    result = self.desk_detector.detect_desks(
-                        frame, tag=f"ref:{frame_idx}", annotate=False, log=False,
-                    )
-                    desks = result["layout"]["desks"]
-                    score = sum(d["conf"] for d in desks)
-                    if desks and (
-                        best is None
-                        or len(desks) > best["desk_count"]
-                        or (len(desks) == best["desk_count"]
-                            and score > best["score"])
-                    ):
-                        best = {
-                            "frame_idx": frame_idx,
-                            "frame": frame.copy(),
-                            "layout": result["layout"],
-                            "desk_count": len(desks),
-                            "score": score,
-                        }
-                frame_idx += 1
-        finally:
-            cap.release()
-
-        if best is None:
-            raise RuntimeError("桌子检测失败，未找到可用桌子布局。")
-        return best
+        return self.desk_detector.select_best_layout_from_video(
+            self.source,
+            max_frames=self.reference_max_frames,
+            sample_step=self.reference_sample_step,
+            log=True,
+        )
 
     # ── 人物提取 ─────────────────────────────────────────────
 
@@ -1688,11 +1656,16 @@ class PersonDeskBindingPipelineV3:
         layout = reference["layout"]
         desks = layout["desks"]
         column_lines = layout.get("column_lines", [])
+        sequence_selection = layout.get("sequence_selection", {})
 
         print(f"  桌子参考帧: {reference['frame_idx']}")
         print(f"  检测到桌子: {len(desks)} 个")
         print(f"  列直线: {len(column_lines)} 条")
         print(f"  布局方案: {layout.get('chosen_mode', 'unknown')}")
+        if sequence_selection:
+            print(f"  序列选择: {sequence_selection.get('method')} "
+                  f"sample_step={sequence_selection.get('sample_step')}, "
+                  f"max_frames={sequence_selection.get('max_frames')}")
 
         # ── Step 2: 构建相邻桌子区间 ─────────────────────────
         print("=" * 60)
@@ -1730,6 +1703,7 @@ class PersonDeskBindingPipelineV3:
             "desk_count": len(desks),
             "zone_count": len(zones),
             "chosen_mode": layout.get("chosen_mode", "unknown"),
+            "sequence_selection": sequence_selection,
             "desks": desks,
             "zones": [
                 {
@@ -2213,6 +2187,7 @@ class PersonDeskBindingPipelineV3:
             "desk_count": len(desks),
             "zone_count": len(zones),
             "occupied_seats": len(occupied_bind_ids),
+            "layout_selection": sequence_selection,
             "config": {
                 "binding_method": "inter_desk_zone_iou",
                 "anchor_point": "bbox_polygon",
