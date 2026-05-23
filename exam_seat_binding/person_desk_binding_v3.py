@@ -1424,6 +1424,7 @@ class PersonDeskBindingPipelineV3:
         layout_callback=None,
         frame_callback=None,
         finish_callback=None,
+        desk_repair_conf: float | None = None,
     ):
         if not os.path.isfile(source):
             raise FileNotFoundError(f"视频不存在: {source}")
@@ -1480,6 +1481,7 @@ class PersonDeskBindingPipelineV3:
             mode=desk_mode,
             num_cols=desk_num_cols,
             required_per_col=desk_required_per_col,
+            repair_conf_threshold=desk_repair_conf,
         )
 
     def _emit_layout(self, payload: dict):
@@ -1515,6 +1517,7 @@ class PersonDeskBindingPipelineV3:
             self.source,
             max_frames=self.reference_max_frames,
             sample_step=self.reference_sample_step,
+            save_dir=self.output_dir,
             log=True,
         )
 
@@ -1666,6 +1669,10 @@ class PersonDeskBindingPipelineV3:
             print(f"  序列选择: {sequence_selection.get('method')} "
                   f"sample_step={sequence_selection.get('sample_step')}, "
                   f"max_frames={sequence_selection.get('max_frames')}")
+        if layout.get("best_sampled_frame_image"):
+            print(f"  最佳具体帧图: {layout.get('best_sampled_frame_image')}")
+        if layout.get("best_sampled_frame_repaired_image"):
+            print(f"  角度优化对照图: {layout.get('best_sampled_frame_repaired_image')}")
 
         # ── Step 2: 构建相邻桌子区间 ─────────────────────────
         print("=" * 60)
@@ -1704,6 +1711,8 @@ class PersonDeskBindingPipelineV3:
             "zone_count": len(zones),
             "chosen_mode": layout.get("chosen_mode", "unknown"),
             "sequence_selection": sequence_selection,
+            "best_sampled_frame_image": layout.get("best_sampled_frame_image"),
+            "best_sampled_frame_repaired_image": layout.get("best_sampled_frame_repaired_image"),
             "desks": desks,
             "zones": [
                 {
@@ -2342,6 +2351,8 @@ def main():
                    choices=["normal", "scheme1", "scheme2", "auto"])
     p.add_argument("--desk-num-cols", type=int, default=5)
     p.add_argument("--desk-required-per-col", type=int, default=6)
+    p.add_argument("--desk-repair-conf", type=float, default=None,
+                   help="缺失桌位按列补检的低置信度阈值，默认比 --desk-conf 低 0.30，最低 0.15")
     p.add_argument("--reference-max-frames", type=int, default=120)
     p.add_argument("--reference-sample-step", type=int, default=5)
 
@@ -2397,6 +2408,7 @@ def main():
         desk_mode=args.desk_mode,
         desk_num_cols=args.desk_num_cols,
         desk_required_per_col=args.desk_required_per_col,
+        desk_repair_conf=args.desk_repair_conf,
         reference_max_frames=args.reference_max_frames,
         reference_sample_step=args.reference_sample_step,
         confirm_seconds=args.confirm_seconds,
