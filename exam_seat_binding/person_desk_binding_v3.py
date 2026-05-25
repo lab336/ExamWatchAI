@@ -1402,6 +1402,8 @@ class PersonDeskBindingPipelineV3:
         desk_mode: str,
         desk_num_cols: int,
         desk_required_per_col: int,
+        desk_init_sample_count: int,
+        desk_pending_confirm_hits: int,
         reference_max_frames: int,
         reference_sample_step: int,
         confirm_seconds: float,
@@ -1424,7 +1426,6 @@ class PersonDeskBindingPipelineV3:
         layout_callback=None,
         frame_callback=None,
         finish_callback=None,
-        desk_repair_conf: float | None = None,
     ):
         if not os.path.isfile(source):
             raise FileNotFoundError(f"视频不存在: {source}")
@@ -1481,7 +1482,8 @@ class PersonDeskBindingPipelineV3:
             mode=desk_mode,
             num_cols=desk_num_cols,
             required_per_col=desk_required_per_col,
-            repair_conf_threshold=desk_repair_conf,
+            init_sample_count=desk_init_sample_count,
+            pending_confirm_hits=desk_pending_confirm_hits,
         )
 
     def _emit_layout(self, payload: dict):
@@ -2351,9 +2353,12 @@ def main():
                    choices=["normal", "scheme1", "scheme2", "auto"])
     p.add_argument("--desk-num-cols", type=int, default=5)
     p.add_argument("--desk-required-per-col", type=int, default=6)
-    p.add_argument("--desk-repair-conf", type=float, default=None,
-                   help="缺失桌位按列补检的低置信度阈值，默认比 --desk-conf 低 0.30，最低 0.15")
-    p.add_argument("--reference-max-frames", type=int, default=120)
+    p.add_argument("--desk-init-sample-count", type=int, default=5,
+                   help="桌子累计模型初始化使用的前K个采样帧")
+    p.add_argument("--desk-pending-confirm-hits", type=int, default=1,
+                   help="候选桌位进入确认模型前需要命中的采样帧次数")
+    p.add_argument("--reference-max-frames", type=int, default=0,
+                   help="参考桌子布局最多扫描帧数；<=0 表示扫描完整视频")
     p.add_argument("--reference-sample-step", type=int, default=5)
 
     # V3 核心: 区间构建参数
@@ -2408,7 +2413,8 @@ def main():
         desk_mode=args.desk_mode,
         desk_num_cols=args.desk_num_cols,
         desk_required_per_col=args.desk_required_per_col,
-        desk_repair_conf=args.desk_repair_conf,
+        desk_init_sample_count=args.desk_init_sample_count,
+        desk_pending_confirm_hits=args.desk_pending_confirm_hits,
         reference_max_frames=args.reference_max_frames,
         reference_sample_step=args.reference_sample_step,
         confirm_seconds=args.confirm_seconds,

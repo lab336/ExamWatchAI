@@ -18,10 +18,12 @@
 """
 
 import argparse
+import copy
 import itertools
 import importlib.util
 import os
 import sys
+import traceback
 from pathlib import Path
 
 import cv2
@@ -39,8 +41,8 @@ def box_center(box):
 
 
 def box_iou_xyxy(a, b):
-    ax1, ay1, ax2, ay2 = [float(v) for v in a]
-    bx1, by1, bx2, by2 = [float(v) for v in b]
+    ax1, ay1, ax2, ay2 = normalize_xyxy(a)
+    bx1, by1, bx2, by2 = normalize_xyxy(b)
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)
     ix2, iy2 = min(ax2, bx2), min(ay2, by2)
     iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
@@ -48,6 +50,47 @@ def box_iou_xyxy(a, b):
     area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
     area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
     return inter / (area_a + area_b - inter + 1e-8)
+
+
+def box_overlap_metrics(a, b):
+    ax1, ay1, ax2, ay2 = normalize_xyxy(a)
+    bx1, by1, bx2, by2 = normalize_xyxy(b)
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return {
+        "iou": inter / (union + 1e-8),
+        "ios": inter / (min(area_a, area_b) + 1e-8),
+        "ioa": inter / (area_a + 1e-8),
+        "iob": inter / (area_b + 1e-8),
+    }
+
+
+def normalize_xyxy(xyxy):
+    if isinstance(xyxy, dict):
+        if all(k in xyxy for k in ("x1", "y1", "x2", "y2")):
+            return [float(xyxy[k]) for k in ("x1", "y1", "x2", "y2")]
+        if all(k in xyxy for k in (0, 1, 2, 3)):
+            return [float(xyxy[k]) for k in (0, 1, 2, 3)]
+        if all(k in xyxy for k in ("0", "1", "2", "3")):
+            return [float(xyxy[k]) for k in ("0", "1", "2", "3")]
+    arr = np.asarray(xyxy, dtype=np.float32).reshape(-1)
+    if arr.size < 4:
+        raise ValueError(f"Invalid xyxy box: {xyxy}")
+    return [float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])]
+
+
+def desk_xyxy(desk):
+    return normalize_xyxy(desk["xyxy"])
+
+
+def xyxy_size(xyxy):
+    x1, y1, x2, y2 = normalize_xyxy(xyxy)
+    return float(x2 - x1), float(y2 - y1)
 
 
 def order_column_indices(boxes, columns, style=1):
@@ -167,7 +210,7 @@ def _x_on_line_at_y(line_kb, y, fallback_x):
 
 def _line_crosses_box(line_kb, xyxy, margin=0.0):
     k, b = line_kb
-    x1, y1, x2, y2 = [float(v) for v in xyxy]
+    x1, y1, x2, y2 = normalize_xyxy(xyxy)
     x1 -= margin
     y1 -= margin
     x2 += margin
@@ -219,8 +262,9 @@ def build_column_line_entries_from_desks(desks, num_cols):
             continue
 
         centers = [item["center"] for item in column_desks]
-        widths = [item["xyxy"][2] - item["xyxy"][0] for item in column_desks]
-        heights = [item["xyxy"][3] - item["xyxy"][1] for item in column_desks]
+        sizes = [xyxy_size(item["xyxy"]) for item in column_desks]
+        widths = [size[0] for size in sizes]
+        heights = [size[1] for size in sizes]
         points_np = np.asarray(centers, dtype=np.float32)
         line_kb = _fit_line_from_centers(points_np)
         step_lengths = [
@@ -411,7 +455,7 @@ def draw_layout_entries(img, desks, num_cols=5, required_per_col=6, title="Relia
     ]
 
     for desk in sorted(desks, key=lambda d: d["desk_no"]):
-        x1, y1, x2, y2 = [int(round(v)) for v in desk["xyxy"]]
+        x1, y1, x2, y2 = [int(round(v)) for v in desk_xyxy(desk)]
         col_id = int(desk["column_index"])
         color = col_colors[col_id % len(col_colors)]
         is_virtual = bool(desk.get("is_virtual", False))
@@ -428,8 +472,8 @@ def draw_layout_entries(img, desks, num_cols=5, required_per_col=6, title="Relia
         label = f"{desk['desk_id']} {float(desk.get('conf', 0.0)):.2f}"
         if is_virtual:
             label += " inferred"
-        elif desk.get("is_low_conf_recovered", False):
-            label += " recovered"
+        elif desk.get("is_sequence_fused", False):
+            label += " fused"
         (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
         label_y = max(label_h + baseline + 4, y1)
         cv2.rectangle(annotated, (x1, label_y - label_h - baseline - 4), (x1 + label_w + 4, label_y), color, -1)
@@ -493,13 +537,48 @@ def draw_sequence_best_frame(img, layout, title="Best sampled frame layout"):
         lines.append(f"score={float(metrics.get('score', 0.0)):.1f}")
         lines.append(f"cols={metrics.get('column_counts')}")
     if repair:
-        lines.append(f"low_conf={repair.get('sequence_low_conf_recovered_desks', repair.get('low_conf_recovered_desks', 0))}")
+        lines.append(f"fused={repair.get('sequence_fused_desks', 0)}")
         lines.append(f"virtual={repair.get('virtual_desks', 0)}")
 
     y = 62
     for text in lines:
         cv2.putText(annotated, text, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
         y += 24
+    return annotated
+
+
+def draw_sequence_candidates(img, candidates, title="All sampled high-conf candidates"):
+    annotated = img.copy()
+    color = (0, 220, 255)
+    for idx, cand in enumerate(candidates, 1):
+        x1, y1, x2, y2 = [int(round(v)) for v in normalize_xyxy(cand["xyxy"])]
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+        label = f"C{idx:03d} {float(cand.get('conf', 0.0)):.2f}"
+        source_frame = cand.get("source_frame_idx")
+        if source_frame is not None:
+            label += f" f{int(source_frame)}"
+        (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        label_y = max(label_h + baseline + 3, y1)
+        cv2.rectangle(
+            annotated,
+            (x1, label_y - label_h - baseline - 4),
+            (x1 + label_w + 4, label_y),
+            color,
+            -1,
+        )
+        cv2.putText(
+            annotated,
+            label,
+            (x1 + 2, label_y - baseline - 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.rectangle(annotated, (8, 8), (760, 42), (0, 0, 0), -1)
+    cv2.putText(annotated, title, (16, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
     return annotated
 
 
@@ -515,7 +594,8 @@ class DeskLayoutDetector:
         mode="auto",
         num_cols=5,
         required_per_col=6,
-        repair_conf_threshold=None,
+        init_sample_count=5,
+        pending_confirm_hits=1,
     ):
         if not os.path.exists(weights_path):
             raise FileNotFoundError(f"权重文件不存在: {weights_path}")
@@ -533,7 +613,8 @@ class DeskLayoutDetector:
         self.mode = mode
         self.num_cols = num_cols
         self.required_per_col = required_per_col
-        self.repair_conf_threshold = repair_conf_threshold
+        self.init_sample_count = max(1, int(init_sample_count))
+        self.pending_confirm_hits = max(1, int(pending_confirm_hits))
 
         if "cuda" in str(self.device):
             self._clear_cuda_cache()
@@ -586,12 +667,9 @@ class DeskLayoutDetector:
             pass
 
     def _predict(self, source):
-        return self._predict_with_conf(source, self.conf_threshold)
-
-    def _predict_with_conf(self, source, conf_threshold):
         return self.model.predict(
             source=source,
-            conf=conf_threshold,
+            conf=self.conf_threshold,
             iou=self.iou_threshold,
             save=False,
             verbose=False,
@@ -599,11 +677,6 @@ class DeskLayoutDetector:
             imgsz=self.img_size or 640,
             half=self.half,
         )
-
-    def _effective_repair_conf_threshold(self):
-        if self.repair_conf_threshold is not None:
-            return float(self.repair_conf_threshold)
-        return max(0.15, min(0.45, float(self.conf_threshold) - 0.30))
 
     def _extract_centers(self, boxes):
         centers = []
@@ -672,7 +745,7 @@ class DeskLayoutDetector:
         selected = best[1] if best else ordered[: self.required_per_col]
         return self._prune_sharp_turns_in_column(sorted(selected, key=lambda item: item["row_index"]))
 
-    def _prune_sharp_turns_in_column(self, desks, min_keep=2, angle_threshold=160.0):
+    def _prune_sharp_turns_in_column(self, desks, min_keep=2, angle_threshold=170.0):
         selected = sorted(desks, key=lambda item: item["row_index"])
         removed = []
         while len(selected) > min_keep:
@@ -715,20 +788,21 @@ class DeskLayoutDetector:
             item.pop("removed_reason", None)
         return selected
 
-    def _make_low_conf_candidates(self, boxes, existing_desks, frame_idx=None):
+    def _make_detection_candidates(self, boxes, existing_desks=None, frame_idx=None, allow_overlaps=False):
         candidates = []
-        existing_xyxy = [desk["xyxy"] for desk in existing_desks]
+        existing_desks = existing_desks or []
+        existing_xyxy = [desk_xyxy(desk) for desk in existing_desks]
         boxes_list = list(boxes) if boxes is not None else []
         for idx, box in enumerate(boxes_list):
             if isinstance(box, dict):
-                xyxy = [float(v) for v in box["xyxy"]]
-                if any(box_iou_xyxy(xyxy, prev) > 0.45 for prev in existing_xyxy):
+                xyxy = normalize_xyxy(box["xyxy"])
+                if not allow_overlaps and any(box_iou_xyxy(xyxy, prev) > 0.45 for prev in existing_xyxy):
                     continue
                 cand = dict(box)
+                cand["xyxy"] = xyxy
                 cand.setdefault("low_index", idx)
                 cand.setdefault("index", -1)
-                cand.setdefault("is_low_conf_recovered", True)
-                cand.setdefault("source", "low_conf_column_recovery")
+                cand.setdefault("source", "sequence_detection")
                 if frame_idx is not None:
                     cand["source_frame_idx"] = int(frame_idx)
                 candidates.append(cand)
@@ -736,7 +810,7 @@ class DeskLayoutDetector:
 
             x1, y1, x2, y2 = box_xyxy(box)
             xyxy = [x1, y1, x2, y2]
-            if any(box_iou_xyxy(xyxy, prev) > 0.45 for prev in existing_xyxy):
+            if not allow_overlaps and any(box_iou_xyxy(xyxy, prev) > 0.45 for prev in existing_xyxy):
                 continue
             cx, cy = box_center(box)
             candidates.append(
@@ -747,28 +821,182 @@ class DeskLayoutDetector:
                     "center": [cx, cy],
                     "conf": float(box.conf[0]),
                     "cls": int(box.cls[0]),
-                    "is_low_conf_recovered": True,
-                    "source": "low_conf_column_recovery",
+                    "source": "sequence_detection",
                     "source_frame_idx": int(frame_idx) if frame_idx is not None else None,
                 }
             )
         return candidates
 
-    def _recover_low_conf_desks_for_columns(
+    def _boxes_as_sequence_candidates(self, boxes, frame_idx=None, source="raw_high_conf_detection"):
+        candidates = self._make_detection_candidates(
+            boxes,
+            existing_desks=[],
+            frame_idx=frame_idx,
+            allow_overlaps=True,
+        )
+        for cand in candidates:
+            cand["source"] = source
+        return candidates
+
+    def _layout_desks_as_sequence_candidates(self, layout, frame_idx=None):
+        candidates = []
+        for idx, desk in enumerate(layout.get("desks", [])):
+            cand = dict(desk)
+            cand["low_index"] = int(desk.get("index", idx))
+            cand["index"] = -1
+            cand["source"] = "sequence_high_conf_layout"
+            cand["source_frame_idx"] = int(frame_idx) if frame_idx is not None else None
+            candidates.append(cand)
+        return candidates
+
+    def _dedupe_sequence_candidates(self, candidates, iou_threshold=0.45):
+        """Merge repeated detections of the same physical desk, keeping the highest confidence box."""
+        ordered = sorted(
+            [dict(cand) for cand in candidates],
+            key=lambda item: float(item.get("conf", 0.0)),
+            reverse=True,
+        )
+        kept = []
+        for cand in ordered:
+            cand["xyxy"] = normalize_xyxy(cand["xyxy"])
+            if any(self._is_same_physical_desk_candidate(cand, kept_item, iou_threshold) for kept_item in kept):
+                continue
+            kept.append(cand)
+        return kept
+
+    def _is_same_physical_desk_candidate(self, cand, kept_item, iou_threshold):
+        cand_xyxy = normalize_xyxy(cand["xyxy"])
+        kept_xyxy = normalize_xyxy(kept_item["xyxy"])
+        overlap = box_overlap_metrics(cand_xyxy, kept_xyxy)
+        if overlap["iou"] >= max(0.22, iou_threshold * 0.62):
+            return True
+
+        cx, cy = [float(v) for v in cand["center"]]
+        kx, ky = [float(v) for v in kept_item["center"]]
+        cw, ch = xyxy_size(cand_xyxy)
+        kw, kh = xyxy_size(kept_xyxy)
+        center_dist = float(np.linalg.norm(np.asarray([cx, cy]) - np.asarray([kx, ky])))
+        avg_w = max(1.0, (cw + kw) * 0.5)
+        avg_h = max(1.0, (ch + kh) * 0.5)
+        size_ratio = max(cw / max(kw, 1.0), kw / max(cw, 1.0)) + max(ch / max(kh, 1.0), kh / max(ch, 1.0))
+
+        if overlap["ios"] >= 0.58 and center_dist <= max(avg_w * 0.82, avg_h * 0.82, 56.0):
+            return True
+        if center_dist <= max(avg_w * 0.34, avg_h * 0.42, 34.0) and size_ratio <= 3.45:
+            return True
+        return False
+
+    def _is_duplicate_of_existing_column_desk(self, cand, existing_desks, row_step):
+        cx, cy = [float(v) for v in cand["center"]]
+        cand_xyxy = normalize_xyxy(cand["xyxy"])
+        for desk in existing_desks:
+            ex1, ey1, ex2, ey2 = desk_xyxy(desk)
+            ew = max(1.0, ex2 - ex1)
+            eh = max(1.0, ey2 - ey1)
+            ecx, ecy = [float(v) for v in desk["center"]]
+            iou = box_iou_xyxy(cand_xyxy, desk_xyxy(desk))
+            x_close = abs(cx - ecx) <= max(ew * 0.75, 42.0)
+            y_close = abs(cy - ecy) <= max(eh * 0.85, row_step * 0.32, 38.0)
+            center_close = np.linalg.norm(np.asarray([cx, cy]) - np.asarray([ecx, ecy])) <= max(ew * 0.95, eh * 1.15, 55.0)
+            if iou >= 0.12 or (x_close and y_close) or center_close:
+                return True
+        return False
+
+    def _assign_desks_to_nearest_global_rows(self, desks, row_y):
+        assigned = []
+        available_rows = set(range(self.required_per_col))
+        for desk in sorted(desks, key=lambda item: float(item.get("conf", 0.0)), reverse=True):
+            if not available_rows:
+                break
+            cy = float(desk["center"][1])
+            row_id = min(available_rows, key=lambda r: abs(cy - float(row_y[r])))
+            available_rows.remove(row_id)
+            item = dict(desk)
+            item["row_index"] = int(row_id)
+            assigned.append(item)
+        return sorted(assigned, key=lambda item: item["row_index"])
+
+    def _is_stable_complete_column(self, desks):
+        selected = sorted(desks, key=lambda item: item["row_index"])[: self.required_per_col]
+        if len(selected) < self.required_per_col:
+            return False
+        angle_stats = column_angle_stats_from_desks(selected)
+        angle_ok = angle_stats["min_angle"] is None or angle_stats["min_angle"] >= 170.0
+        mean_conf = float(np.mean([float(d.get("conf", 0.0)) for d in selected]))
+        return angle_ok and mean_conf >= max(0.5, float(self.conf_threshold) - 0.15)
+
+    def _merge_protected_columns_from_layout(self, base_layout, protected_layout):
+        """Keep complete, straight columns from the best sampled frame as fixed base columns."""
+        if not protected_layout:
+            return base_layout
+
+        protected_columns = {}
+        for col_id in range(self.num_cols):
+            col_desks = sorted(
+                [
+                    dict(desk)
+                    for desk in protected_layout.get("desks", [])
+                    if int(desk.get("column_index", -1)) == col_id
+                ],
+                key=lambda item: int(item.get("row_index", 0)),
+            )
+            if not self._is_stable_complete_column(col_desks):
+                continue
+
+            protected_columns[col_id] = []
+            for row_id, desk in enumerate(col_desks[: self.required_per_col]):
+                item = dict(desk)
+                item["column_index"] = int(col_id)
+                item["row_index"] = int(row_id)
+                item["desk_no"] = col_id * self.required_per_col + row_id + 1
+                item["desk_id"] = f"D{item['desk_no']:02d}"
+                item["xyxy"] = desk_xyxy(item)
+                item["locked_base"] = True
+                item["protected_base"] = True
+                item["source"] = "best_frame_protected_complete_column"
+                protected_columns[col_id].append(item)
+
+        if not protected_columns:
+            return base_layout
+
+        merged = copy.deepcopy(base_layout)
+        merged_desks = [
+            dict(desk)
+            for desk in merged.get("desks", [])
+            if int(desk.get("column_index", -1)) not in protected_columns
+        ]
+        for col_desks in protected_columns.values():
+            merged_desks.extend(col_desks)
+
+        merged["desks"] = sorted(merged_desks, key=lambda item: item["desk_no"])
+        merged["ordered_columns"] = [
+            [desk.get("index", -1) for desk in merged["desks"] if desk["column_index"] == col_id]
+            for col_id in range(self.num_cols)
+        ]
+        merged["columns"] = merged["ordered_columns"]
+        merged["column_lines"] = build_column_line_entries_from_desks(merged["desks"], self.num_cols)
+        merged.setdefault("sequence_model", {})
+        merged["sequence_model"]["protected_complete_columns"] = [int(c) for c in sorted(protected_columns)]
+        return merged
+
+    def _fuse_sequence_candidates_by_column_line(
         self,
         pruned_columns,
-        low_conf_candidates,
+        sequence_candidates,
         row_y,
         row_w,
         row_h,
         fallback_w,
         fallback_h,
+        preserve_existing=True,
+        pending_pool=None,
+        pending_confirm_hits=1,
     ):
-        if not low_conf_candidates:
+        if not sequence_candidates:
             return 0
 
+        fused_count = 0
         used_candidate_ids = set()
-        recovered_count = 0
         row_step_values = [
             abs(float(row_y[r]) - float(row_y[r + 1]))
             for r in range(self.required_per_col - 1)
@@ -776,85 +1004,755 @@ class DeskLayoutDetector:
         ]
         row_step = float(np.median(row_step_values)) if row_step_values else fallback_h * 1.8
 
-        for col_id in range(self.num_cols):
+        def slot_score(item, line, selected, row_id):
+            center = np.asarray(item["center"], dtype=np.float32)
+            item_w, item_h = xyxy_size(item["xyxy"])
+            expected_y = float(row_y[row_id])
+            fallback_x = float(np.median([desk["center"][0] for desk in selected]))
+            expected_x = _x_on_line_at_y(line, expected_y, fallback_x)
+            expected = np.asarray([expected_x, expected_y], dtype=np.float32)
+            line_dist = vd1.point_line_distance_kb(center, line)
+            center_dist = float(np.linalg.norm(center - expected))
+            y_dist = abs(float(center[1]) - expected_y)
+            target_w = float(row_w.get(row_id) or fallback_w)
+            target_h = float(row_h.get(row_id) or fallback_h)
+            size_ratio = max(item_w / (target_w + 1e-8), target_w / (item_w + 1e-8))
+            size_ratio += max(item_h / (target_h + 1e-8), target_h / (item_h + 1e-8))
+            return line_dist * 1.8 + center_dist + y_dist * 0.6 + size_ratio * 6.0
+
+        for col_id in sorted(pruned_columns.keys()):
             selected = pruned_columns[col_id]
-            if len(selected) >= self.required_per_col:
-                continue
             if len(selected) < 2:
                 continue
 
             line = _fit_line_from_centers([item["center"] for item in selected])
-            present_rows = {int(item["row_index"]) for item in selected}
-            missing_rows = [r for r in range(self.required_per_col) if r not in present_rows]
+            row_slots = {}
+            for desk in selected:
+                row_id = int(desk["row_index"])
+                if 0 <= row_id < self.required_per_col:
+                    row_slots[row_id] = desk
 
-            for row_id in missing_rows:
-                expected_y = float(row_y[row_id])
-                fallback_x = float(np.median([item["center"][0] for item in selected]))
-                expected_x = _x_on_line_at_y(line, expected_y, fallback_x)
-                expected = np.asarray([expected_x, expected_y], dtype=np.float32)
+            for cand_id, cand in enumerate(sequence_candidates):
+                if cand_id in used_candidate_ids:
+                    continue
 
-                best = None
-                for cand_id, cand in enumerate(low_conf_candidates):
-                    if cand_id in used_candidate_ids:
-                        continue
-                    center = np.asarray(cand["center"], dtype=np.float32)
-                    line_dist = vd1.point_line_distance_kb(center, line)
+                center = np.asarray(cand["center"], dtype=np.float32)
+                cand_w, cand_h = xyxy_size(cand["xyxy"])
+                line_dist = vd1.point_line_distance_kb(center, line)
+
+                best_row = None
+                best_row_score = None
+                for row_id in range(self.required_per_col):
+                    expected_y = float(row_y[row_id])
+                    fallback_x = float(np.median([item["center"][0] for item in selected]))
+                    expected_x = _x_on_line_at_y(line, expected_y, fallback_x)
+                    expected = np.asarray([expected_x, expected_y], dtype=np.float32)
                     center_dist = float(np.linalg.norm(center - expected))
                     y_dist = abs(float(center[1]) - expected_y)
-                    cand_w = float(cand["xyxy"][2] - cand["xyxy"][0])
-                    cand_h = float(cand["xyxy"][3] - cand["xyxy"][1])
                     target_w = float(row_w.get(row_id) or fallback_w)
                     target_h = float(row_h.get(row_id) or fallback_h)
+                    line_crosses_box = _line_crosses_box(line, cand["xyxy"], margin=max(5.0, target_w * 0.12))
+                    max_line_dist = max(target_w * 0.52, 34.0)
+                    max_center_dist = max(row_step * 0.82, target_w * 1.25, 72.0)
+                    max_y_dist = max(row_step * 0.66, target_h * 1.55, 58.0)
+
+                    if line_dist > max_line_dist and not line_crosses_box:
+                        continue
+                    if center_dist > max_center_dist or y_dist > max_y_dist:
+                        continue
+
                     size_ratio = max(cand_w / (target_w + 1e-8), target_w / (cand_w + 1e-8))
                     size_ratio += max(cand_h / (target_h + 1e-8), target_h / (cand_h + 1e-8))
-                    line_crosses_box = _line_crosses_box(line, cand["xyxy"], margin=max(4.0, target_w * 0.08))
-
-                    max_line_dist = max(target_w * 0.42, 28.0)
-                    max_center_dist = max(row_step * 0.72, target_w * 1.05, 58.0)
-                    max_y_dist = max(row_step * 0.58, target_h * 1.35, 45.0)
-                    if line_dist > max_line_dist or center_dist > max_center_dist or y_dist > max_y_dist:
-                        if not (line_crosses_box and center_dist <= max_center_dist * 1.15 and y_dist <= max_y_dist * 1.15):
-                            continue
-                    if size_ratio > 5.2:
+                    if size_ratio > 5.4:
                         continue
 
                     score = (
-                        line_dist * 1.5
+                        line_dist * 1.8
                         + center_dist
-                        + y_dist * 0.7
-                        + size_ratio * 8.0
-                        - (35.0 if line_crosses_box else 0.0)
-                        - float(cand.get("conf", 0.0)) * 80.0
+                        + y_dist * 0.6
+                        + size_ratio * 6.0
+                        - (45.0 if line_crosses_box else 0.0)
+                        - float(cand.get("conf", 0.0)) * 90.0
                     )
-                    if best is None or score < best[0]:
-                        best = (score, cand_id, cand)
+                    if best_row_score is None or score < best_row_score:
+                        best_row_score = score
+                        best_row = row_id
 
-                if best is None:
+                if best_row is None:
                     continue
 
-                _, cand_id, cand = best
-                used_candidate_ids.add(cand_id)
-                desk_no = col_id * self.required_per_col + row_id + 1
+                existing = row_slots.get(best_row)
+                other_existing = [
+                    desk for row_id, desk in row_slots.items()
+                    if int(row_id) != int(best_row)
+                ]
+                if self._is_duplicate_of_existing_column_desk(cand, other_existing, row_step):
+                    continue
+                if existing is not None and self._is_duplicate_of_existing_column_desk(cand, [existing], row_step):
+                    continue
+
                 recovered = dict(cand)
                 recovered.update(
                     {
-                        "desk_no": desk_no,
-                        "desk_id": f"D{desk_no:02d}",
                         "column_index": col_id,
-                        "row_index": row_id,
+                        "row_index": int(best_row),
+                        "is_virtual": False,
+                        "is_sequence_fused": True,
+                        "source": "sequence_line_fusion",
+                    }
+                )
+
+                if pending_pool is not None:
+                    key = (int(col_id), int(best_row))
+                    entry = pending_pool.setdefault(key, {"hits": 0, "frames": set(), "best": None})
+                    source_frame = cand.get("source_frame_idx")
+                    frame_key = int(source_frame) if source_frame is not None else -1
+                    if frame_key not in entry["frames"]:
+                        entry["frames"].add(frame_key)
+                        entry["hits"] += 1
+                    if entry["best"] is None or float(recovered.get("conf", 0.0)) > float(entry["best"].get("conf", 0.0)):
+                        entry["best"] = recovered
+                    if entry["hits"] < pending_confirm_hits:
+                        continue
+                    recovered = dict(entry["best"])
+
+                trial = [item for item in row_slots.values() if int(item["row_index"]) != best_row]
+                trial.append(recovered)
+                stats = column_angle_stats_from_desks(trial)
+                if stats["min_angle"] is not None and stats["min_angle"] < 170.0:
+                    continue
+
+                if existing is not None:
+                    if existing.get("protected_base", False):
+                        continue
+                    same_desk_iou = box_iou_xyxy(desk_xyxy(existing), recovered["xyxy"])
+                    existing_conf = float(existing.get("conf", 0.0))
+                    cand_conf = float(recovered.get("conf", 0.0))
+                    existing_score = slot_score(existing, line, selected, best_row)
+                    recovered_score = slot_score(recovered, line, selected, best_row)
+                    replace = recovered_score + 22.0 < existing_score or cand_conf > existing_conf + 0.10
+                    if same_desk_iou > 0.45:
+                        replace = False
+                    if not replace:
+                        continue
+
+                row_slots[best_row] = recovered
+                if pending_pool is not None:
+                    pending_pool.pop((int(col_id), int(best_row)), None)
+                used_candidate_ids.add(cand_id)
+                fused_count += 1
+                selected[:] = sorted(row_slots.values(), key=lambda item: item["row_index"])
+                line = _fit_line_from_centers([item["center"] for item in selected])
+
+        return fused_count
+
+    def _fuse_global_sequence_candidates_by_slots(
+        self,
+        pruned_columns,
+        sequence_candidates,
+        row_y,
+        row_w,
+        row_h,
+        fallback_w,
+        fallback_h,
+    ):
+        if not sequence_candidates:
+            return 0
+
+        row_step_values = [
+            abs(float(row_y[r]) - float(row_y[r + 1]))
+            for r in range(self.required_per_col - 1)
+            if row_y.get(r) is not None and row_y.get(r + 1) is not None
+        ]
+        row_step = float(np.median(row_step_values)) if row_step_values else fallback_h * 1.8
+        fused_count = 0
+        used_candidate_ids = set()
+
+        for col_id in sorted(pruned_columns.keys()):
+            selected = pruned_columns[col_id]
+            if len(selected) < 2:
+                continue
+
+            changed = True
+            while changed and len(selected) < self.required_per_col:
+                changed = False
+                selected.sort(key=lambda item: int(item["row_index"]))
+                line = _fit_line_from_centers([item["center"] for item in selected])
+                row_slots = {
+                    int(desk["row_index"]): desk
+                    for desk in selected
+                    if 0 <= int(desk["row_index"]) < self.required_per_col
+                }
+                missing_rows = [
+                    row_id
+                    for row_id in range(self.required_per_col)
+                    if row_id not in row_slots
+                ]
+                if not missing_rows:
+                    break
+
+                best = None
+                fallback_x = float(np.median([item["center"][0] for item in selected]))
+                for row_id in missing_rows:
+                    expected_y = float(row_y[row_id])
+                    expected_x = _x_on_line_at_y(line, expected_y, fallback_x)
+                    expected = np.asarray([expected_x, expected_y], dtype=np.float32)
+                    target_w = float(row_w.get(row_id) or fallback_w)
+                    target_h = float(row_h.get(row_id) or fallback_h)
+                    max_line_dist = max(target_w * 0.72, 48.0)
+                    max_center_dist = max(row_step * 1.05, target_w * 1.55, 92.0)
+                    max_y_dist = max(row_step * 0.88, target_h * 1.85, 72.0)
+
+                    for cand_id, cand in enumerate(sequence_candidates):
+                        if cand_id in used_candidate_ids:
+                            continue
+                        if self._is_duplicate_of_existing_column_desk(cand, selected, row_step):
+                            continue
+
+                        center = np.asarray(cand["center"], dtype=np.float32)
+                        cand_w, cand_h = xyxy_size(cand["xyxy"])
+                        line_dist = vd1.point_line_distance_kb(center, line)
+                        center_dist = float(np.linalg.norm(center - expected))
+                        y_dist = abs(float(center[1]) - expected_y)
+                        line_crosses_box = _line_crosses_box(line, cand["xyxy"], margin=max(6.0, target_w * 0.16))
+
+                        if line_dist > max_line_dist and not line_crosses_box:
+                            continue
+                        if center_dist > max_center_dist or y_dist > max_y_dist:
+                            continue
+
+                        size_ratio = max(cand_w / (target_w + 1e-8), target_w / (cand_w + 1e-8))
+                        size_ratio += max(cand_h / (target_h + 1e-8), target_h / (cand_h + 1e-8))
+                        if size_ratio > 5.8:
+                            continue
+
+                        recovered = dict(cand)
+                        recovered.update(
+                            {
+                                "column_index": int(col_id),
+                                "row_index": int(row_id),
+                                "is_virtual": False,
+                                "is_sequence_fused": True,
+                                "source": "global_sequence_slot_fusion",
+                            }
+                        )
+                        trial = [item for item in selected if int(item["row_index"]) != row_id]
+                        trial.append(recovered)
+                        stats = column_angle_stats_from_desks(trial)
+                        if stats["min_angle"] is not None and stats["min_angle"] < 170.0:
+                            continue
+
+                        score = (
+                            line_dist * 2.0
+                            + center_dist
+                            + y_dist * 0.8
+                            + size_ratio * 8.0
+                            - (55.0 if line_crosses_box else 0.0)
+                            - float(cand.get("conf", 0.0)) * 95.0
+                        )
+                        if best is None or score < best[0]:
+                            best = (score, cand_id, recovered)
+
+                if best is None:
+                    break
+
+                _, cand_id, recovered = best
+                used_candidate_ids.add(cand_id)
+                selected.append(recovered)
+                selected.sort(key=lambda item: int(item["row_index"]))
+                fused_count += 1
+                changed = True
+
+        return fused_count
+
+    def _rebuild_unlocked_columns_from_global_candidates(
+        self,
+        pruned_columns,
+        sequence_candidates,
+        row_y,
+        row_w,
+        row_h,
+        fallback_w,
+        fallback_h,
+    ):
+        if not sequence_candidates:
+            return 0
+
+        row_step_values = [
+            abs(float(row_y[r]) - float(row_y[r + 1]))
+            for r in range(self.required_per_col - 1)
+            if row_y.get(r) is not None and row_y.get(r + 1) is not None
+        ]
+        row_step = float(np.median(row_step_values)) if row_step_values else fallback_h * 1.8
+        changed_count = 0
+
+        for col_id in sorted(pruned_columns.keys()):
+            base_selected = self._prune_sharp_turns_in_column(pruned_columns[col_id])
+            if len(base_selected) >= self.required_per_col:
+                continue
+            if len(base_selected) < 2:
+                continue
+
+            line = _fit_line_from_centers([item["center"] for item in base_selected])
+            fallback_x = float(np.median([item["center"][0] for item in base_selected]))
+            existing_by_row = {
+                int(item["row_index"]): dict(item, source=item.get("source", "current_layout"))
+                for item in base_selected
+                if 0 <= int(item["row_index"]) < self.required_per_col
+            }
+
+            row_choices = {row_id: [] for row_id in range(self.required_per_col)}
+            candidate_pool = list(sequence_candidates)
+            for item in existing_by_row.values():
+                existing = dict(item)
+                existing["source"] = existing.get("source", "current_layout")
+                candidate_pool.append(existing)
+
+            for cand_id, cand in enumerate(candidate_pool):
+                center = np.asarray(cand["center"], dtype=np.float32)
+                cand_w, cand_h = xyxy_size(cand["xyxy"])
+                line_dist = vd1.point_line_distance_kb(center, line)
+                is_existing = cand.get("source") == "current_layout" or cand.get("protected_base", False)
+
+                for row_id in range(self.required_per_col):
+                    expected_y = float(row_y[row_id])
+                    expected_x = _x_on_line_at_y(line, expected_y, fallback_x)
+                    expected = np.asarray([expected_x, expected_y], dtype=np.float32)
+                    center_dist = float(np.linalg.norm(center - expected))
+                    y_dist = abs(float(center[1]) - expected_y)
+                    target_w = float(row_w.get(row_id) or fallback_w)
+                    target_h = float(row_h.get(row_id) or fallback_h)
+                    line_crosses_box = _line_crosses_box(line, cand["xyxy"], margin=max(6.0, target_w * 0.18))
+
+                    max_line_dist = max(target_w * 0.80, 56.0)
+                    max_center_dist = max(row_step * 1.18, target_w * 1.75, 108.0)
+                    max_y_dist = max(row_step * 0.95, target_h * 2.0, 82.0)
+                    if line_dist > max_line_dist and not line_crosses_box and not is_existing:
+                        continue
+                    if center_dist > max_center_dist or y_dist > max_y_dist:
+                        continue
+
+                    size_ratio = max(cand_w / (target_w + 1e-8), target_w / (cand_w + 1e-8))
+                    size_ratio += max(cand_h / (target_h + 1e-8), target_h / (cand_h + 1e-8))
+                    if size_ratio > 6.2:
+                        continue
+
+                    score = (
+                        line_dist * 2.0
+                        + center_dist
+                        + y_dist * 0.8
+                        + size_ratio * 8.0
+                        - (60.0 if line_crosses_box else 0.0)
+                        - float(cand.get("conf", 0.0)) * 95.0
+                        - (18.0 if is_existing and int(cand.get("row_index", -1)) == row_id else 0.0)
+                    )
+                    row_choices[row_id].append((score, cand_id, cand))
+
+            rebuilt = []
+            used_ids = set()
+            for row_id in range(self.required_per_col):
+                best_item = None
+                for _, cand_id, cand in sorted(row_choices[row_id], key=lambda item: item[0]):
+                    if cand_id in used_ids:
+                        continue
+                    if self._is_duplicate_of_existing_column_desk(cand, rebuilt, row_step):
+                        continue
+
+                    item = dict(cand)
+                    item.update(
+                        {
+                            "column_index": int(col_id),
+                            "row_index": int(row_id),
+                            "desk_no": int(col_id) * self.required_per_col + row_id + 1,
+                            "desk_id": f"D{int(col_id) * self.required_per_col + row_id + 1:02d}",
+                            "is_virtual": False,
+                        }
+                    )
+                    if cand.get("source") != "current_layout":
+                        item["is_sequence_fused"] = True
+                        item["source"] = "global_sequence_column_rebuild"
+                    best_item = (cand_id, item)
+                    break
+
+                if best_item is not None:
+                    cand_id, item = best_item
+                    used_ids.add(cand_id)
+                    rebuilt.append(item)
+
+            if len(rebuilt) < len(base_selected):
+                continue
+            stats = column_angle_stats_from_desks(rebuilt)
+            if stats["min_angle"] is not None and stats["min_angle"] < 170.0:
+                rebuilt = self._prune_sharp_turns_in_column(rebuilt)
+                stats = column_angle_stats_from_desks(rebuilt)
+                if stats["min_angle"] is not None and stats["min_angle"] < 170.0:
+                    continue
+
+            old_keys = {
+                (int(item.get("row_index", -1)), tuple(round(v, 1) for v in desk_xyxy(item)))
+                for item in pruned_columns[col_id]
+            }
+            new_keys = {
+                (int(item.get("row_index", -1)), tuple(round(v, 1) for v in desk_xyxy(item)))
+                for item in rebuilt
+            }
+            if new_keys != old_keys:
+                changed_count += max(0, len(rebuilt) - len(pruned_columns[col_id])) + int(len(rebuilt) == len(pruned_columns[col_id]))
+            pruned_columns[col_id] = sorted(rebuilt, key=lambda item: int(item["row_index"]))
+
+        return changed_count
+
+    def _complete_columns_by_line_candidate_pool(
+        self,
+        pruned_columns,
+        sequence_candidates,
+        fallback_w,
+        fallback_h,
+    ):
+        if not sequence_candidates:
+            return 0
+
+        changed_count = 0
+        for col_id in sorted(pruned_columns.keys()):
+            base_selected = self._prune_sharp_turns_in_column(pruned_columns[col_id])
+            if len(base_selected) >= self.required_per_col:
+                continue
+            if len(base_selected) < 2:
+                continue
+
+            line = _fit_line_from_centers([item["center"] for item in base_selected])
+            base_sizes = [xyxy_size(item["xyxy"]) for item in base_selected]
+            target_w = float(np.median([size[0] for size in base_sizes])) if base_sizes else fallback_w
+            target_h = float(np.median([size[1] for size in base_sizes])) if base_sizes else fallback_h
+            max_line_dist = max(target_w * 0.95, 86.0)
+
+            pool = []
+            for item in base_selected:
+                existing = dict(item)
+                existing["source"] = existing.get("source", "current_layout")
+                pool.append(existing)
+
+            for cand in sequence_candidates:
+                center = np.asarray(cand["center"], dtype=np.float32)
+                line_dist = vd1.point_line_distance_kb(center, line)
+                line_crosses_box = _line_crosses_box(line, cand["xyxy"], margin=max(8.0, target_w * 0.20))
+                if line_dist > max_line_dist and not line_crosses_box:
+                    continue
+                cand_w, cand_h = xyxy_size(cand["xyxy"])
+                size_ratio = max(cand_w / (target_w + 1e-8), target_w / (cand_w + 1e-8))
+                size_ratio += max(cand_h / (target_h + 1e-8), target_h / (cand_h + 1e-8))
+                if size_ratio > 6.8:
+                    continue
+                item = dict(cand)
+                item["_line_dist"] = float(line_dist)
+                item["_line_crosses_box"] = bool(line_crosses_box)
+                pool.append(item)
+
+            pool = self._dedupe_sequence_candidates(pool, iou_threshold=max(0.18, self.iou_threshold * 0.55))
+            if len(pool) < len(base_selected):
+                continue
+
+            pool.sort(
+                key=lambda item: (
+                    float(item.get("_line_dist", vd1.point_line_distance_kb(np.asarray(item["center"], dtype=np.float32), line))),
+                    -float(item.get("conf", 0.0)),
+                )
+            )
+            limited_pool = pool[: min(len(pool), 18)]
+            target_count = min(self.required_per_col, len(limited_pool))
+            if target_count < len(base_selected):
+                continue
+
+            best = None
+            if target_count == self.required_per_col and len(limited_pool) >= self.required_per_col:
+                groups = itertools.combinations(limited_pool, self.required_per_col)
+            else:
+                groups = [limited_pool]
+
+            for group in groups:
+                ordered = sorted(group, key=lambda item: float(item["center"][1]), reverse=True)
+                stats = column_angle_stats_from_desks(
+                    [dict(item, row_index=idx) for idx, item in enumerate(ordered)]
+                )
+                min_angle = stats["min_angle"] if stats["min_angle"] is not None else 180.0
+                if min_angle < 170.0:
+                    continue
+
+                centers = np.asarray([item["center"] for item in ordered], dtype=np.float32)
+                group_line = _fit_line_from_centers(centers)
+                straight = float(np.mean([vd1.point_line_distance_kb(pt, group_line) for pt in centers]))
+                y_steps = [
+                    abs(float(a["center"][1]) - float(b["center"][1]))
+                    for a, b in zip(ordered[:-1], ordered[1:])
+                ]
+                spacing_penalty = float(np.std(y_steps)) if len(y_steps) >= 2 else 0.0
+                mean_conf = float(np.mean([float(item.get("conf", 0.0)) for item in ordered]))
+                mean_line_dist = float(
+                    np.mean([
+                        vd1.point_line_distance_kb(np.asarray(item["center"], dtype=np.float32), line)
+                        for item in ordered
+                    ])
+                )
+                existing_hits = sum(1 for item in ordered if item.get("source") == "current_layout")
+                score = (
+                    straight * 2.0
+                    + mean_line_dist * 1.2
+                    + spacing_penalty * 0.18
+                    - mean_conf * 90.0
+                    - existing_hits * 4.0
+                    - len(ordered) * 120.0
+                )
+                if best is None or score < best[0]:
+                    best = (score, ordered)
+
+            if best is None:
+                continue
+
+            rebuilt = []
+            for row_id, item in enumerate(best[1][: self.required_per_col]):
+                desk = dict(item)
+                desk.pop("_line_dist", None)
+                desk.pop("_line_crosses_box", None)
+                desk.update(
+                    {
+                        "column_index": int(col_id),
+                        "row_index": int(row_id),
+                        "desk_no": int(col_id) * self.required_per_col + row_id + 1,
+                        "desk_id": f"D{int(col_id) * self.required_per_col + row_id + 1:02d}",
                         "is_virtual": False,
                     }
                 )
-                selected.append(recovered)
-                selected.sort(key=lambda item: item["row_index"])
-                recovered_count += 1
+                if desk.get("source") != "current_layout":
+                    desk["source"] = "global_sequence_line_pool_complete"
+                    desk["is_sequence_fused"] = True
+                rebuilt.append(desk)
 
-        return recovered_count
+            if len(rebuilt) > len(pruned_columns[col_id]):
+                changed_count += len(rebuilt) - len(pruned_columns[col_id])
+            elif len(rebuilt) == len(pruned_columns[col_id]):
+                old_boxes = {tuple(round(v, 1) for v in desk_xyxy(item)) for item in pruned_columns[col_id]}
+                new_boxes = {tuple(round(v, 1) for v in desk_xyxy(item)) for item in rebuilt}
+                if old_boxes != new_boxes:
+                    changed_count += 1
+            pruned_columns[col_id] = rebuilt
 
-    def _repair_layout_to_grid(self, layout, image_shape=None, low_conf_boxes=None):
+        return changed_count
+
+    def _correct_near_camera_end_from_candidates(
+        self,
+        pruned_columns,
+        sequence_candidates,
+        fallback_w,
+        fallback_h,
+    ):
+        if not sequence_candidates:
+            return 0
+
+        changed_count = 0
+        for col_id in sorted(pruned_columns.keys()):
+            selected = sorted(pruned_columns[col_id], key=lambda item: int(item["row_index"]))
+            if len(selected) < 3:
+                continue
+
+            line = _fit_line_from_centers([item["center"] for item in selected])
+            bottom = max(selected, key=lambda item: float(item["center"][1]))
+            other_rows = [item for item in selected if item is not bottom]
+            bottom_w, bottom_h = xyxy_size(bottom["xyxy"])
+            target_w = bottom_w if bottom_w > 1 else fallback_w
+            target_h = bottom_h if bottom_h > 1 else fallback_h
+            max_line_dist = max(target_w * 0.90, 82.0)
+            min_y_gain = max(target_h * 0.32, 24.0)
+
+            best = None
+            for cand in sequence_candidates:
+                cy = float(cand["center"][1])
+                if cy <= float(bottom["center"][1]) + min_y_gain:
+                    continue
+                if self._is_duplicate_of_existing_column_desk(cand, other_rows, max(target_h * 1.6, 45.0)):
+                    continue
+
+                center = np.asarray(cand["center"], dtype=np.float32)
+                line_dist = vd1.point_line_distance_kb(center, line)
+                line_crosses_box = _line_crosses_box(line, cand["xyxy"], margin=max(8.0, target_w * 0.22))
+                if line_dist > max_line_dist and not line_crosses_box:
+                    continue
+
+                cand_w, cand_h = xyxy_size(cand["xyxy"])
+                size_ratio = max(cand_w / (target_w + 1e-8), target_w / (cand_w + 1e-8))
+                size_ratio += max(cand_h / (target_h + 1e-8), target_h / (cand_h + 1e-8))
+                if size_ratio > 7.0:
+                    continue
+
+                trial = other_rows + [dict(cand)]
+                ordered = sorted(trial, key=lambda item: float(item["center"][1]), reverse=True)
+                trial_with_rows = [dict(item, row_index=idx) for idx, item in enumerate(ordered[: self.required_per_col])]
+                stats = column_angle_stats_from_desks(trial_with_rows)
+                if stats["min_angle"] is not None and stats["min_angle"] < 170.0:
+                    continue
+
+                y_gain = cy - float(bottom["center"][1])
+                score = (
+                    line_dist * 1.8
+                    + size_ratio * 8.0
+                    - y_gain * 0.65
+                    - float(cand.get("conf", 0.0)) * 95.0
+                    - (45.0 if line_crosses_box else 0.0)
+                )
+                if best is None or score < best[0]:
+                    best = (score, cand)
+
+            if best is None:
+                continue
+
+            replacement = dict(best[1])
+            replacement["source"] = "global_sequence_near_camera_end_correction"
+            replacement["is_sequence_fused"] = True
+            rebuilt = other_rows + [replacement]
+            rebuilt = sorted(rebuilt, key=lambda item: float(item["center"][1]), reverse=True)
+            final = []
+            for row_id, item in enumerate(rebuilt[: self.required_per_col]):
+                desk = dict(item)
+                desk.update(
+                    {
+                        "column_index": int(col_id),
+                        "row_index": int(row_id),
+                        "desk_no": int(col_id) * self.required_per_col + row_id + 1,
+                        "desk_id": f"D{int(col_id) * self.required_per_col + row_id + 1:02d}",
+                        "is_virtual": False,
+                    }
+                )
+                final.append(desk)
+
+            pruned_columns[col_id] = final
+            changed_count += 1
+
+        return changed_count
+
+    def _insert_candidates_into_large_column_gaps(
+        self,
+        pruned_columns,
+        sequence_candidates,
+        fallback_w,
+        fallback_h,
+    ):
+        if not sequence_candidates:
+            return 0
+
+        inserted_count = 0
+        for col_id in sorted(pruned_columns.keys()):
+            selected = sorted(pruned_columns[col_id], key=lambda item: float(item["center"][1]), reverse=True)
+            if len(selected) < 3 or len(selected) >= self.required_per_col:
+                continue
+
+            line = _fit_line_from_centers([item["center"] for item in selected])
+            sizes = [xyxy_size(item["xyxy"]) for item in selected]
+            target_w = float(np.median([size[0] for size in sizes])) if sizes else fallback_w
+            target_h = float(np.median([size[1] for size in sizes])) if sizes else fallback_h
+            gaps = [
+                abs(float(a["center"][1]) - float(b["center"][1]))
+                for a, b in zip(selected[:-1], selected[1:])
+            ]
+            if not gaps:
+                continue
+            sorted_gaps = sorted(gaps)
+            normal_gap_source = sorted_gaps[:-1] if len(sorted_gaps) >= 3 else sorted_gaps
+            normal_gap = float(np.median(normal_gap_source))
+            if normal_gap <= 1:
+                normal_gap = target_h * 1.8
+
+            changed = True
+            while changed and len(selected) < self.required_per_col:
+                changed = False
+                selected = sorted(selected, key=lambda item: float(item["center"][1]), reverse=True)
+                best = None
+
+                for gap_idx, (upper, lower) in enumerate(zip(selected[:-1], selected[1:])):
+                    upper_y = float(upper["center"][1])
+                    lower_y = float(lower["center"][1])
+                    gap = upper_y - lower_y
+                    if gap < normal_gap * 1.42 and gap < target_h * 2.35:
+                        continue
+
+                    expected_y = (upper_y + lower_y) * 0.5
+                    min_y = lower_y + normal_gap * 0.25
+                    max_y = upper_y - normal_gap * 0.25
+                    for cand in sequence_candidates:
+                        cy = float(cand["center"][1])
+                        if not (min_y <= cy <= max_y):
+                            continue
+                        cand_xyxy = normalize_xyxy(cand["xyxy"])
+                        if any(box_iou_xyxy(cand_xyxy, desk_xyxy(item)) >= 0.30 for item in selected):
+                            continue
+
+                        center = np.asarray(cand["center"], dtype=np.float32)
+                        line_dist = vd1.point_line_distance_kb(center, line)
+                        line_crosses_box = _line_crosses_box(line, cand["xyxy"], margin=max(8.0, target_w * 0.22))
+                        if line_dist > max(target_w * 1.20, 130.0) and not line_crosses_box:
+                            continue
+
+                        cand_w, cand_h = xyxy_size(cand["xyxy"])
+                        size_ratio = max(cand_w / (target_w + 1e-8), target_w / (cand_w + 1e-8))
+                        size_ratio += max(cand_h / (target_h + 1e-8), target_h / (cand_h + 1e-8))
+                        if size_ratio > 8.0:
+                            continue
+
+                        trial = selected + [dict(cand)]
+                        trial_ordered = sorted(trial, key=lambda item: float(item["center"][1]), reverse=True)
+                        stats = column_angle_stats_from_desks(
+                            [dict(item, row_index=idx) for idx, item in enumerate(trial_ordered)]
+                        )
+                        if stats["min_angle"] is not None and stats["min_angle"] < 160.0:
+                            continue
+
+                        score = (
+                            abs(cy - expected_y)
+                            + line_dist * 1.8
+                            + size_ratio * 8.0
+                            - float(cand.get("conf", 0.0)) * 95.0
+                            - (45.0 if line_crosses_box else 0.0)
+                        )
+                        if best is None or score < best[0]:
+                            best = (score, cand)
+
+                if best is None:
+                    break
+
+                item = dict(best[1])
+                item["source"] = "global_sequence_gap_insert"
+                item["is_sequence_fused"] = True
+                selected.append(item)
+                inserted_count += 1
+                changed = True
+
+            rebuilt = []
+            for row_id, item in enumerate(sorted(selected, key=lambda item: float(item["center"][1]), reverse=True)[: self.required_per_col]):
+                desk = dict(item)
+                desk.update(
+                    {
+                        "column_index": int(col_id),
+                        "row_index": int(row_id),
+                        "desk_no": int(col_id) * self.required_per_col + row_id + 1,
+                        "desk_id": f"D{int(col_id) * self.required_per_col + row_id + 1:02d}",
+                        "is_virtual": False,
+                    }
+                )
+                rebuilt.append(desk)
+            pruned_columns[col_id] = rebuilt
+
+        return inserted_count
+
+    def _repair_layout_to_grid(
+        self,
+        layout,
+        image_shape=None,
+        sequence_candidates=None,
+        preserve_existing=False,
+        pending_pool=None,
+        pending_confirm_hits=1,
+    ):
         """优化序列选出的布局，但不凭空生成桌位。
 
-        完整列被视为稳定列，不再被其他列的点改写；缺失位置只允许按列线恢复低置信检测框。
+        完整列被视为稳定列，不再被其他列的点改写；缺失位置只允许使用视频序列中的高置信检测框补入。
         若没有真实检测框，就保持缺失，不再创建 inferred/virtual 桌子。
         """
         if self.mode == "normal":
@@ -877,17 +1775,24 @@ class DeskLayoutDetector:
         all_widths = []
         all_heights = []
         for col_id in range(self.num_cols):
-            selected = self._pick_best_column_six(columns[col_id])
+            selected = (
+                sorted(columns[col_id], key=lambda item: item["row_index"])
+                if preserve_existing
+                else self._pick_best_column_six(columns[col_id])
+            )
             for row_id, desk in enumerate(selected):
                 desk["column_index"] = col_id
-                desk["row_index"] = row_id
-                desk["desk_no"] = col_id * self.required_per_col + row_id + 1
+                if not preserve_existing:
+                    desk["row_index"] = row_id
+                desk["desk_no"] = col_id * self.required_per_col + int(desk["row_index"]) + 1
                 desk["desk_id"] = f"D{desk['desk_no']:02d}"
                 desk["is_virtual"] = bool(desk.get("is_virtual", False))
-                all_widths.append(float(desk["xyxy"][2] - desk["xyxy"][0]))
-                all_heights.append(float(desk["xyxy"][3] - desk["xyxy"][1]))
+                desk["xyxy"] = desk_xyxy(desk)
+                desk_w, desk_h = xyxy_size(desk["xyxy"])
+                all_widths.append(desk_w)
+                all_heights.append(desk_h)
             pruned_columns[col_id] = selected
-            if len(selected) >= self.required_per_col and np.mean([d.get("conf", 0.0) for d in selected]) >= max(0.5, self.conf_threshold - 0.15):
+            if self._is_stable_complete_column(selected):
                 locked_columns.append(col_id)
 
         fallback_w = float(np.median(all_widths)) if all_widths else 60.0
@@ -897,11 +1802,12 @@ class DeskLayoutDetector:
         row_w_samples = {r: [] for r in range(self.required_per_col)}
         row_h_samples = {r: [] for r in range(self.required_per_col)}
         for selected in pruned_columns.values():
-            if len(selected) >= self.required_per_col:
+            if self._is_stable_complete_column(selected):
                 for row_id, desk in enumerate(selected[: self.required_per_col]):
                     row_y_samples[row_id].append(float(desk["center"][1]))
-                    row_w_samples[row_id].append(float(desk["xyxy"][2] - desk["xyxy"][0]))
-                    row_h_samples[row_id].append(float(desk["xyxy"][3] - desk["xyxy"][1]))
+                    desk_w, desk_h = xyxy_size(desk["xyxy"])
+                    row_w_samples[row_id].append(desk_w)
+                    row_h_samples[row_id].append(desk_h)
 
         if not any(row_y_samples.values()):
             sorted_all = sorted(desks, key=lambda item: item["center"][1], reverse=True)
@@ -931,37 +1837,98 @@ class DeskLayoutDetector:
             row_y = {row_id: fallback_h * (self.required_per_col - row_id) for row_id in range(self.required_per_col)}
 
         for col_id, selected in pruned_columns.items():
-            if len(selected) >= self.required_per_col:
+            if col_id in locked_columns:
+                pruned_columns[col_id] = sorted(selected[: self.required_per_col], key=lambda item: item["row_index"])
                 continue
-            available_rows = set(range(self.required_per_col))
-            reassigned = []
-            for desk in sorted(selected, key=lambda item: float(item.get("conf", 0.0)), reverse=True):
-                row_id = min(available_rows, key=lambda r: abs(float(desk["center"][1]) - float(row_y[r])))
-                available_rows.remove(row_id)
-                desk["row_index"] = int(row_id)
-                desk["desk_no"] = col_id * self.required_per_col + row_id + 1
-                desk["desk_id"] = f"D{desk['desk_no']:02d}"
-                reassigned.append(desk)
-            pruned_columns[col_id] = sorted(reassigned, key=lambda item: item["row_index"])
+            if len(selected) >= self.required_per_col:
+                angle_stats = column_angle_stats_from_desks(selected[: self.required_per_col])
+                if angle_stats["min_angle"] is None or angle_stats["min_angle"] >= 170.0:
+                    continue
+                selected = self._prune_sharp_turns_in_column(selected)
+                pruned_columns[col_id] = selected
+            if preserve_existing:
+                pruned_columns[col_id] = self._assign_desks_to_nearest_global_rows(selected, row_y)
+            else:
+                available_rows = set(range(self.required_per_col))
+                reassigned = []
+                for desk in sorted(selected, key=lambda item: float(item.get("conf", 0.0)), reverse=True):
+                    row_id = min(available_rows, key=lambda r: abs(float(desk["center"][1]) - float(row_y[r])))
+                    available_rows.remove(row_id)
+                    desk["row_index"] = int(row_id)
+                    desk["desk_no"] = col_id * self.required_per_col + row_id + 1
+                    desk["desk_id"] = f"D{desk['desk_no']:02d}"
+                    reassigned.append(desk)
+                pruned_columns[col_id] = sorted(reassigned, key=lambda item: item["row_index"])
 
-        low_conf_candidates = self._make_low_conf_candidates(low_conf_boxes, desks)
-        low_conf_recovered = self._recover_low_conf_desks_for_columns(
-            pruned_columns,
-            low_conf_candidates,
+        unlocked_columns = {
+            col_id: selected
+            for col_id, selected in pruned_columns.items()
+            if col_id not in locked_columns
+        }
+        sequence_fused = self._fuse_sequence_candidates_by_column_line(
+            unlocked_columns,
+            sequence_candidates or [],
+            row_y,
+            row_w,
+            row_h,
+            fallback_w,
+            fallback_h,
+            preserve_existing=preserve_existing,
+            pending_pool=pending_pool,
+            pending_confirm_hits=pending_confirm_hits,
+        )
+        sequence_fused += self._fuse_global_sequence_candidates_by_slots(
+            unlocked_columns,
+            sequence_candidates or [],
             row_y,
             row_w,
             row_h,
             fallback_w,
             fallback_h,
         )
+        sequence_fused += self._rebuild_unlocked_columns_from_global_candidates(
+            unlocked_columns,
+            sequence_candidates or [],
+            row_y,
+            row_w,
+            row_h,
+            fallback_w,
+            fallback_h,
+        )
+        sequence_fused += self._complete_columns_by_line_candidate_pool(
+            unlocked_columns,
+            sequence_candidates or [],
+            fallback_w,
+            fallback_h,
+        )
+        sequence_fused += self._correct_near_camera_end_from_candidates(
+            unlocked_columns,
+            sequence_candidates or [],
+            fallback_w,
+            fallback_h,
+        )
+        sequence_fused += self._insert_candidates_into_large_column_gaps(
+            unlocked_columns,
+            sequence_candidates or [],
+            fallback_w,
+            fallback_h,
+        )
+        for col_id, selected in unlocked_columns.items():
+            pruned_columns[col_id] = selected
 
         repaired = []
         for col_id in range(self.num_cols):
             selected = pruned_columns[col_id]
-            selected = self._prune_sharp_turns_in_column(selected)
+            if col_id in locked_columns:
+                selected = sorted(selected[: self.required_per_col], key=lambda item: item["row_index"])
+            elif not preserve_existing:
+                selected = self._prune_sharp_turns_in_column(selected)
             for row_id, desk in enumerate(sorted(selected, key=lambda item: item["row_index"])):
-                desk["row_index"] = row_id
-                desk_no = col_id * self.required_per_col + row_id + 1
+                if preserve_existing:
+                    row_id = int(desk["row_index"])
+                else:
+                    desk["row_index"] = row_id
+                desk_no = col_id * self.required_per_col + int(desk["row_index"]) + 1
                 desk["desk_no"] = desk_no
                 desk["desk_id"] = f"D{desk_no:02d}"
                 desk["is_virtual"] = False
@@ -978,12 +1945,12 @@ class DeskLayoutDetector:
         layout["columns"] = ordered_columns
         layout["column_lines"] = build_column_line_entries_from_desks(repaired, self.num_cols)
         layout["layout_repair"] = {
-            "method": "angle_pruned_low_conf_recovery_no_virtual",
+            "method": "angle_pruned_high_conf_sequence_fusion_no_virtual",
+            "preserve_existing": bool(preserve_existing),
             "expected_total": int(expected_total),
             "final_total": int(len(repaired)),
             "virtual_desks": 0,
-            "low_conf_recovered_desks": int(low_conf_recovered),
-            "repair_conf_threshold": float(self._effective_repair_conf_threshold()),
+            "sequence_fused_desks": int(sequence_fused),
             "locked_columns": [int(c) for c in locked_columns],
             "column_counts_before": [int(len(columns[c])) for c in range(self.num_cols)],
             "column_counts_after": [
@@ -999,47 +1966,157 @@ class DeskLayoutDetector:
         }
         return layout
 
-    def _optimize_layout_across_sampled_frames(self, layout, sampled_frames):
-        """用多帧低置信检测沿当前列线持续优化布局。"""
-        current_layout = layout
-        repair_conf = self._effective_repair_conf_threshold()
+    def _build_initial_layout_from_early_frames(self, sampled_frames, chosen_scheme, fallback_layout):
+        early_frames = sampled_frames[: self.init_sample_count]
+        slot_observations = {}
+        for item in early_frames:
+            layout = item.get("layouts", {}).get(chosen_scheme)
+            if layout is None:
+                continue
+            for desk in layout.get("desks", []):
+                col = int(desk.get("column_index", -1))
+                row = int(desk.get("row_index", -1))
+                if not (0 <= col < self.num_cols and 0 <= row < self.required_per_col):
+                    continue
+                key = (col, row)
+                obs = dict(desk)
+                obs["source_frame_idx"] = int(item["frame_idx"])
+                slot_observations.setdefault(key, []).append(obs)
+
+        initial_desks = []
+        for (col, row), observations in sorted(slot_observations.items()):
+            best = max(observations, key=lambda d: float(d.get("conf", 0.0)))
+            item = dict(best)
+            item["column_index"] = int(col)
+            item["row_index"] = int(row)
+            item["desk_no"] = col * self.required_per_col + row + 1
+            item["desk_id"] = f"D{item['desk_no']:02d}"
+            item["evidence_count"] = int(len({d.get("source_frame_idx") for d in observations}))
+            item["locked_base"] = item["evidence_count"] >= self.pending_confirm_hits
+            item["source"] = "early_sequence_initial_model"
+            initial_desks.append(item)
+
+        if not initial_desks:
+            layout = copy.deepcopy(fallback_layout)
+            layout["desks"] = [dict(d, locked_base=True, evidence_count=1) for d in layout.get("desks", [])]
+            layout["sequence_model"] = {
+                "method": "fallback_best_frame_seed",
+                "init_sample_count": int(self.init_sample_count),
+                "pending_confirm_hits": int(self.pending_confirm_hits),
+            }
+            return layout
+
+        layout = copy.deepcopy(fallback_layout)
+        layout["desks"] = sorted(initial_desks, key=lambda d: d["desk_no"])
+        layout["ordered_columns"] = [
+            [desk.get("index", -1) for desk in layout["desks"] if desk["column_index"] == col_id]
+            for col_id in range(self.num_cols)
+        ]
+        layout["columns"] = layout["ordered_columns"]
+        layout["column_lines"] = build_column_line_entries_from_desks(layout["desks"], self.num_cols)
+        layout["sequence_model"] = {
+            "method": "early_frame_cumulative_seed",
+            "init_sample_count": int(self.init_sample_count),
+            "pending_confirm_hits": int(self.pending_confirm_hits),
+            "early_sampled_frames": [int(item["frame_idx"]) for item in early_frames],
+            "slot_count": int(len(initial_desks)),
+            "locked_base_count": int(sum(1 for desk in initial_desks if desk.get("locked_base"))),
+        }
+        return layout
+
+    def _optimize_layout_across_sampled_frames(self, layout, sampled_frames, chosen_scheme=None):
+        """用全视频采样帧的高置信检测沿当前列线持续优化布局。"""
+        current_layout = dict(layout)
+        current_layout["desks"] = [dict(d, locked_base=True) for d in layout.get("desks", [])]
         iterations = []
-        total_recovered = 0
+        total_fused = 0
 
-        if repair_conf >= self.conf_threshold:
-            current_layout = self._repair_layout_to_grid(current_layout)
-            current_layout.setdefault("layout_repair", {})["sequence_iterations"] = iterations
-            current_layout["layout_repair"]["sequence_low_conf_recovered_desks"] = 0
-            return current_layout
-
+        pending_pool = {}
+        sequence_candidate_count = 0
+        global_raw_candidates = []
         for item in sampled_frames:
             frame_idx = int(item["frame_idx"])
-            frame = item["frame"]
-            low_conf_results = self._predict_with_conf(frame, repair_conf)
-            low_conf_boxes = low_conf_results[0].boxes
+            raw_high_conf_candidates = [
+                dict(cand)
+                for cand in item.get("raw_high_conf_candidates", [])
+            ]
+            global_raw_candidates.extend(raw_high_conf_candidates)
+            high_conf_candidates = list(raw_high_conf_candidates)
+            high_conf_layout = item.get("layouts", {}).get(chosen_scheme)
+            if high_conf_layout is not None:
+                high_conf_candidates.extend(
+                    self._layout_desks_as_sequence_candidates(
+                        high_conf_layout,
+                        frame_idx=frame_idx,
+                    )
+                )
+            sequence_candidate_count += len(high_conf_candidates)
+
             before_count = len(current_layout.get("desks", []))
             current_layout = self._repair_layout_to_grid(
                 current_layout,
-                frame.shape,
-                low_conf_boxes=low_conf_boxes,
+                item["frame"].shape,
+                sequence_candidates=high_conf_candidates,
+                preserve_existing=True,
+                pending_pool=pending_pool,
+                pending_confirm_hits=self.pending_confirm_hits,
             )
             repair_info = current_layout.get("layout_repair", {})
-            recovered = int(repair_info.get("low_conf_recovered_desks", 0))
-            total_recovered += recovered
+            fused = int(repair_info.get("sequence_fused_desks", 0))
+            total_fused += fused
             iterations.append(
                 {
                     "frame_idx": frame_idx,
                     "before_count": int(before_count),
                     "after_count": int(len(current_layout.get("desks", []))),
-                    "low_conf_recovered_desks": recovered,
+                    "raw_high_conf_candidate_count": int(len(raw_high_conf_candidates)),
+                    "high_conf_candidate_count": int(len(high_conf_candidates)),
+                    "sequence_candidate_count": int(sequence_candidate_count),
+                    "pending_pool_size": int(len(pending_pool)),
+                    "sequence_fused_desks": fused,
                     "column_counts_after": repair_info.get("column_counts_after", []),
                     "column_angle_stats": repair_info.get("column_angle_stats", []),
                 }
             )
 
+        before_global_count = len(current_layout.get("desks", []))
+        global_raw_candidates = self._dedupe_sequence_candidates(
+            global_raw_candidates,
+            iou_threshold=self.iou_threshold,
+        )
+        current_layout = self._repair_layout_to_grid(
+            current_layout,
+            sequence_candidates=global_raw_candidates,
+            preserve_existing=True,
+            pending_pool=None,
+            pending_confirm_hits=1,
+        )
+        repair_info = current_layout.get("layout_repair", {})
+        global_fused = int(repair_info.get("sequence_fused_desks", 0))
+        total_fused += global_fused
+        iterations.append(
+            {
+                "frame_idx": -1,
+                "stage": "global_all_sampled_frames",
+                "before_count": int(before_global_count),
+                "after_count": int(len(current_layout.get("desks", []))),
+                "raw_high_conf_candidate_count": int(len(global_raw_candidates)),
+                "high_conf_candidate_count": int(len(global_raw_candidates)),
+                "sequence_candidate_count": int(sequence_candidate_count),
+                "pending_pool_size": int(len(pending_pool)),
+                "sequence_fused_desks": global_fused,
+                "column_counts_after": repair_info.get("column_counts_after", []),
+                "column_angle_stats": repair_info.get("column_angle_stats", []),
+            }
+        )
+
         current_layout.setdefault("layout_repair", {})["sequence_iterations"] = iterations
-        current_layout["layout_repair"]["sequence_low_conf_recovered_desks"] = int(total_recovered)
-        current_layout["layout_repair"]["repair_conf_threshold"] = float(repair_conf)
+        current_layout["layout_repair"]["sequence_fused_desks"] = int(total_fused)
+        current_layout["layout_repair"]["sequence_candidate_count"] = int(sequence_candidate_count)
+        current_layout["layout_repair"]["pending_pool_size"] = int(len(pending_pool))
+        current_layout["layout_repair"]["pending_confirm_hits"] = int(self.pending_confirm_hits)
+        current_layout["layout_repair"]["init_sample_count"] = int(self.init_sample_count)
+        current_layout["layout_repair"]["sequence_conf_threshold"] = float(self.conf_threshold)
         return current_layout
 
     def _score_layout_for_scheme(self, boxes, scheme: int):
@@ -1048,9 +2125,10 @@ class DeskLayoutDetector:
             return None
 
         layout = self._build_layout_for_scheme(boxes, scheme)
+        layout = self._repair_layout_to_grid(layout, preserve_existing=False)
         centers_np = self._extract_centers(boxes)
         columns = layout["columns"]
-        raw_lines = layout.pop("_raw_lines", [])
+        raw_lines = layout.pop("_raw_lines", layout.get("column_lines", []))
 
         expected_total = self.num_cols * self.required_per_col
         desk_count = len(layout["desks"])
@@ -1165,12 +2243,12 @@ class DeskLayoutDetector:
     def select_best_layout_from_video(
         self,
         video_path: str,
-        max_frames: int = 120,
+        max_frames: int = 0,
         sample_step: int = 5,
         save_dir: str | None = None,
         log: bool = True,
     ):
-        """在视频前若干帧中采样检测，选择最稳定、最完整的座位布局模型。
+        """在视频序列中按步长采样检测，选择并持续优化最稳定的座位布局模型。
 
         返回结构与旧版参考帧选择兼容:
         {
@@ -1182,7 +2260,8 @@ class DeskLayoutDetector:
             raise RuntimeError(f"无法打开视频: {video_path}")
 
         sample_step = max(1, int(sample_step))
-        max_frames = max(1, int(max_frames))
+        max_frames = int(max_frames) if max_frames is not None else 0
+        scan_all_frames = max_frames <= 0
 
         if self.mode == "normal":
             best = None
@@ -1190,7 +2269,7 @@ class DeskLayoutDetector:
             try:
                 while True:
                     ret, frame = cap.read()
-                    if not ret or frame_idx >= max_frames:
+                    if not ret or (not scan_all_frames and frame_idx >= max_frames):
                         break
                     if frame_idx % sample_step == 0:
                         result = self.detect_desks(
@@ -1241,20 +2320,30 @@ class DeskLayoutDetector:
         try:
             while True:
                 ret, frame = cap.read()
-                if not ret or frame_idx >= max_frames:
+                if not ret or (not scan_all_frames and frame_idx >= max_frames):
                     break
                 if frame_idx % sample_step != 0:
                     frame_idx += 1
                     continue
 
-                sampled_frames.append({"frame_idx": frame_idx, "frame": frame.copy()})
+                sampled_record = {"frame_idx": frame_idx, "frame": frame.copy(), "layouts": {}}
+                sampled_frames.append(sampled_record)
                 results = self._predict(frame)
                 boxes = results[0].boxes
+                sampled_record["raw_high_conf_candidates"] = self._boxes_as_sequence_candidates(
+                    boxes,
+                    frame_idx=frame_idx,
+                )
                 for scheme in schemes:
                     stats[scheme]["sampled_frames"] += 1
                     layout = self._score_layout_for_scheme(boxes, scheme)
                     if layout is None:
                         continue
+                    sampled_record["layouts"][scheme] = {
+                        key: value
+                        for key, value in layout.items()
+                        if key not in {"_raw_lines"}
+                    }
                     metrics = layout["layout_metrics"]
                     stats[scheme]["usable_frames"] += 1
                     stats[scheme]["score_sum"] += layout["layout_score"]
@@ -1298,9 +2387,20 @@ class DeskLayoutDetector:
             for key, value in chosen["layout"].items()
             if key not in {"_raw_lines"}
         }
+        initial_layout = copy.deepcopy(chosen_raw_layout)
+        initial_layout["sequence_model"] = {
+            "method": "best_sampled_frame_seed",
+            "best_frame_idx": int(chosen["frame_idx"]),
+            "pending_confirm_hits": int(self.pending_confirm_hits),
+        }
+        initial_layout = self._merge_protected_columns_from_layout(
+            initial_layout,
+            chosen_raw_layout,
+        )
         chosen["layout"] = self._optimize_layout_across_sampled_frames(
-            chosen["layout"],
+            initial_layout,
             sampled_frames,
+            chosen_scheme=chosen_scheme,
         )
         chosen["desk_count"] = len(chosen["layout"].get("desks", []))
 
@@ -1329,12 +2429,19 @@ class DeskLayoutDetector:
             "chosen_scheme": int(chosen_scheme),
             "chosen_mode": _scheme_name(chosen_scheme),
             "max_frames": int(max_frames),
+            "scan_all_frames": bool(scan_all_frames),
             "sample_step": int(sample_step),
+            "optimization_sampled_frames": int(len(sampled_frames)),
             "stats": sequence_summary,
         }
         repair_info = chosen["layout"].get("layout_repair", {})
         if log:
             print("[SEQUENCE_LAYOUT] 视频序列布局评估:")
+            print(
+                f"  采样范围: {'完整视频' if scan_all_frames else f'前{max_frames}帧'}, "
+                f"sample_step={sample_step}, "
+                f"用于后续优化采样帧={len(sampled_frames)}"
+            )
             for name, info in sequence_summary.items():
                 print(
                     f"  {name}: usable={info['usable_frames']}/"
@@ -1351,7 +2458,8 @@ class DeskLayoutDetector:
                     "  布局优化: "
                     f"final={repair_info.get('final_total')}/"
                     f"{repair_info.get('expected_total')}, "
-                    f"low_conf={repair_info.get('sequence_low_conf_recovered_desks', repair_info.get('low_conf_recovered_desks'))}, "
+                    f"fused={repair_info.get('sequence_fused_desks', 0)}, "
+                    f"candidates={repair_info.get('sequence_candidate_count', 0)}, "
                     f"virtual=0, "
                     f"locked_cols={repair_info.get('locked_columns')}"
                 )
@@ -1359,6 +2467,15 @@ class DeskLayoutDetector:
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
             video_name = Path(str(video_path)).stem if not str(video_path).isdigit() else f"camera_{video_path}"
+            all_raw_candidates = [
+                dict(cand)
+                for item in sampled_frames
+                for cand in item.get("raw_high_conf_candidates", [])
+            ]
+            dedup_candidates = self._dedupe_sequence_candidates(
+                all_raw_candidates,
+                iou_threshold=self.iou_threshold,
+            )
             raw_layout_img = draw_sequence_best_frame(
                 chosen["frame"],
                 chosen_raw_layout,
@@ -1366,6 +2483,17 @@ class DeskLayoutDetector:
             )
             raw_output_path = os.path.join(save_dir, f"best_sampled_frame_{video_name}.jpg")
             cv2.imwrite(raw_output_path, raw_layout_img)
+
+            candidates_img = draw_sequence_candidates(
+                chosen["frame"],
+                dedup_candidates,
+                title=(
+                    f"All sampled candidates after IoU dedupe | "
+                    f"raw {len(all_raw_candidates)} -> kept {len(dedup_candidates)}"
+                ),
+            )
+            candidates_output_path = os.path.join(save_dir, f"all_sequence_candidates_{video_name}.jpg")
+            cv2.imwrite(candidates_output_path, candidates_img)
 
             layout_img = draw_layout_entries(
                 chosen["frame"],
@@ -1378,9 +2506,11 @@ class DeskLayoutDetector:
             cv2.imwrite(output_path, layout_img)
             chosen["layout"]["best_sampled_frame_image"] = raw_output_path
             chosen["layout"]["best_sampled_frame_repaired_image"] = output_path
+            chosen["layout"]["all_sequence_candidates_image"] = candidates_output_path
             chosen["layout"]["reliable_layout_image"] = raw_output_path
             if log:
                 print(f"  最佳具体帧图(未补齐): {raw_output_path}")
+                print(f"  全视频候选框图: {candidates_output_path}")
                 print(f"  最佳具体帧图(补齐后): {output_path}")
         return chosen
 
@@ -1529,7 +2659,7 @@ class DeskLayoutDetector:
             self.detect_image(str(image_file), save_dir)
         print(f"\n所有图片检测完成! 结果保存至: {save_dir}")
 
-    def detect_video(self, video_path, save_dir="output", display=False):
+    def detect_video(self, video_path, save_dir="output", display=False, reference_max_frames=0, reference_sample_step=5):
         if isinstance(video_path, int) or str(video_path).isdigit():
             cap = cv2.VideoCapture(int(video_path))
             video_name = f"camera_{video_path}"
@@ -1564,8 +2694,8 @@ class DeskLayoutDetector:
             try:
                 fixed_reference = self.select_best_layout_from_video(
                     video_path,
-                    max_frames=min(180, total_frames) if total_frames > 0 else 180,
-                    sample_step=5,
+                    max_frames=reference_max_frames,
+                    sample_step=reference_sample_step,
                     save_dir=save_dir,
                     log=True,
                 )
@@ -1577,7 +2707,8 @@ class DeskLayoutDetector:
                     f"image={fixed_layout.get('reliable_layout_image')}"
                 )
             except Exception as e:
-                print(f"警告: 固定可靠布局建立失败，将回退逐帧布局: {e}")
+                print(f"警告: 固定可靠布局建立失败，将回退逐帧布局: {repr(e)}")
+                traceback.print_exc()
 
         frame_count = 0
         try:
@@ -1642,7 +2773,7 @@ def main():
     parser.add_argument("--source", type=str, required=True, help="检测源: 图片/视频/文件夹/摄像头ID(0)")
     parser.add_argument("--weights", type=str, default="exam_seat_binding/weight/yolo11desk.pt", help="模型权重文件路径")
     parser.add_argument("--conf", type=float, default=0.7, help="置信度阈值")
-    parser.add_argument("--iou", type=float, default=0.5, help="NMS IOU阈值")
+    parser.add_argument("--iou", type=float, default=0.7, help="NMS IOU阈值")
     parser.add_argument("--output", type=str, default="output", help="结果保存目录")
     parser.add_argument("--display", action="store_true", help="实时显示检测结果(仅视频)")
     parser.add_argument("--device", type=str, default="", help="运行设备: cpu/cuda/0/1 等")
@@ -1658,12 +2789,10 @@ def main():
     )
     parser.add_argument("--num-cols", type=int, default=5, help="列数")
     parser.add_argument("--required-per-col", type=int, default=6, help="AUTO模式每列拟合所需点数")
-    parser.add_argument(
-        "--repair-conf",
-        type=float,
-        default=None,
-        help="缺失桌位按列补检的低置信度阈值，默认比 --conf 低 0.30，最低 0.15",
-    )
+    parser.add_argument("--reference-max-frames", type=int, default=0, help="参考桌子布局最多扫描帧数；<=0 表示扫描完整视频")
+    parser.add_argument("--reference-sample-step", type=int, default=5, help="参考桌子布局采样步长，默认每5帧检测一次")
+    parser.add_argument("--init-sample-count", type=int, default=5, help="桌子累计模型初始化使用的前K个采样帧")
+    parser.add_argument("--pending-confirm-hits", type=int, default=1, help="候选桌位进入确认模型前需要命中的采样帧次数")
 
     # 兼容旧参数风格
     parser.add_argument("--enable-desk-layout", action="store_true", help="兼容参数：启用分列布局")
@@ -1694,7 +2823,8 @@ def main():
             mode=run_mode,
             num_cols=args.num_cols,
             required_per_col=args.required_per_col,
-            repair_conf_threshold=args.repair_conf,
+            init_sample_count=args.init_sample_count,
+            pending_confirm_hits=args.pending_confirm_hits,
         )
     except Exception as e:
         print(f"\n初始化检测器失败: {e}")
@@ -1703,13 +2833,13 @@ def main():
     source = args.source
     if source.isdigit():
         print(f"\n开始检测摄像头: {source}")
-        detector.detect_video(source, args.output, args.display)
+        detector.detect_video(source, args.output, args.display, args.reference_max_frames, args.reference_sample_step)
     elif os.path.isdir(source):
         print(f"\n开始检测文件夹: {source}")
         detector.detect_folder(source, args.output)
     elif source.lower().endswith((".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv")):
         print(f"\n开始检测视频: {source}")
-        detector.detect_video(source, args.output, args.display)
+        detector.detect_video(source, args.output, args.display, args.reference_max_frames, args.reference_sample_step)
     elif os.path.isfile(source):
         print(f"\n开始检测图片: {source}")
         detector.detect_image(source, args.output)
