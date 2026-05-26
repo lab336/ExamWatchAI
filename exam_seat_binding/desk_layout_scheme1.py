@@ -41,39 +41,6 @@ def point_line_distance_kb(point: np.ndarray, line_kb: Tuple[float, float]) -> f
     return abs(k * x - y_up + b) / (np.sqrt(k * k + 1.0) + 1e-8)
 
 
-def clip_line_kb_to_image(line_kb: Tuple[float, float], w: int, h: int):
-    """将 y_up = kx + b 转成图像坐标并裁剪到图像边界。"""
-    k, b = line_kb
-    pts = []
-
-    y0 = -k * 0.0 - b
-    yw = -k * (w - 1) - b
-    if 0 <= y0 <= h - 1:
-        pts.append((0, int(round(y0))))
-    if 0 <= yw <= h - 1:
-        pts.append((w - 1, int(round(yw))))
-
-    if abs(k) > 1e-8:
-        x_top = (-0.0 - b) / k
-        x_bottom = (-(h - 1) - b) / k
-        if 0 <= x_top <= w - 1:
-            pts.append((int(round(x_top)), 0))
-        if 0 <= x_bottom <= w - 1:
-            pts.append((int(round(x_bottom)), h - 1))
-
-    uniq = []
-    for point in pts:
-        if point not in uniq:
-            uniq.append(point)
-    if len(uniq) >= 2:
-        return uniq[0], uniq[1]
-
-    x1, x2 = 0, w - 1
-    y1 = int(round(-k * x1 - b))
-    y2 = int(round(-k * x2 - b))
-    return (x1, y1), (x2, y2)
-
-
 def _dist_to_origin(pt: np.ndarray) -> float:
     return float(np.sqrt(float(pt[0]) * float(pt[0]) + float(pt[1]) * float(pt[1])))
 
@@ -221,7 +188,6 @@ def split_into_columns_by_origin_walk(
 
 
 __all__ = [
-    "clip_line_kb_to_image",
     "fit_line_kb_positive",
     "point_line_distance_kb",
     "split_into_columns_by_origin_walk",

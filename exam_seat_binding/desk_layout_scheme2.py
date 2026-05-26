@@ -11,67 +11,10 @@ from typing import List, Tuple
 
 import numpy as np
 
-
-def fit_line_kb_positive(points: np.ndarray, min_k: float = 0.02) -> Tuple[float, float]:
-    """拟合 y_up = kx + b（数学坐标，y_up = -y_img），并强制 k > 0。"""
-    pts = np.asarray(points, dtype=np.float32)
-    if len(pts) == 0:
-        return 0.2, 0.0
-
-    x = pts[:, 0]
-    y_up = -pts[:, 1]
-
-    if len(pts) == 1:
-        k = max(min_k, 0.2)
-        b = float(y_up[0] - k * x[0])
-        return float(k), float(b)
-
-    A = np.vstack([x, np.ones_like(x)]).T
-    k, b = np.linalg.lstsq(A, y_up, rcond=None)[0]
-    k = float(max(float(k), min_k))
-    b = float(np.mean(y_up - k * x))
-    return k, b
-
-
-def point_line_distance_kb(point: np.ndarray, line_kb: Tuple[float, float]) -> float:
-    """点到 y_up = kx + b 直线的距离。"""
-    x = float(point[0])
-    y_up = float(-point[1])
-    k, b = line_kb
-    return abs(k * x - y_up + b) / (np.sqrt(k * k + 1.0) + 1e-8)
-
-
-def clip_line_kb_to_image(line_kb: Tuple[float, float], w: int, h: int):
-    """将 y_up = kx + b 转成图像坐标并裁剪到图像边界。"""
-    k, b = line_kb
-    pts = []
-
-    y0 = -k * 0.0 - b
-    yw = -k * (w - 1) - b
-    if 0 <= y0 <= h - 1:
-        pts.append((0, int(round(y0))))
-    if 0 <= yw <= h - 1:
-        pts.append((w - 1, int(round(yw))))
-
-    if abs(k) > 1e-8:
-        x_top = (-0.0 - b) / k
-        x_bottom = (-(h - 1) - b) / k
-        if 0 <= x_top <= w - 1:
-            pts.append((int(round(x_top)), 0))
-        if 0 <= x_bottom <= w - 1:
-            pts.append((int(round(x_bottom)), h - 1))
-
-    uniq = []
-    for point in pts:
-        if point not in uniq:
-            uniq.append(point)
-    if len(uniq) >= 2:
-        return uniq[0], uniq[1]
-
-    x1, x2 = 0, w - 1
-    y1 = int(round(-k * x1 - b))
-    y2 = int(round(-k * x2 - b))
-    return (x1, y1), (x2, y2)
+try:
+    from exam_seat_binding.desk_layout_scheme1 import fit_line_kb_positive, point_line_distance_kb
+except Exception:
+    from desk_layout_scheme1 import fit_line_kb_positive, point_line_distance_kb
 
 
 def _pick_max_y_head(centers: np.ndarray, remaining: set) -> int:
@@ -174,7 +117,6 @@ def split_into_columns_by_origin_walk(
 
 
 __all__ = [
-    "clip_line_kb_to_image",
     "fit_line_kb_positive",
     "point_line_distance_kb",
     "split_into_columns_by_origin_walk",

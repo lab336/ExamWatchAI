@@ -380,70 +380,6 @@ def draw_normal(img, boxes, model_names):
     return annotated
 
 
-def draw_layout(img, boxes, columns, style=1, num_per_col=6):
-    annotated = img.copy()
-    col_colors = [
-        (255, 80, 80),
-        (80, 255, 80),
-        (80, 80, 255),
-        (255, 200, 80),
-        (220, 80, 255),
-    ]
-    boxes_list = list(boxes)
-    ordered_columns, layout_entries = build_layout_entries(
-        boxes_list,
-        columns,
-        style=style,
-        num_per_col=num_per_col,
-    )
-
-    for box in boxes_list:
-        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), (120, 120, 120), 1)
-
-    for col_id, sorted_idxs in enumerate(ordered_columns):
-        if len(sorted_idxs) == 0:
-            continue
-        color = col_colors[col_id % len(col_colors)]
-
-        col_entries = [item for item in layout_entries if item["column_index"] == col_id]
-        for item in col_entries:
-            box = boxes_list[item["index"]]
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            conf = item["conf"]
-
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            label = f"{item['desk_no']}: {conf:.2f}"
-            (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(annotated, (x1, y1 - label_h - baseline - 5), (x1 + label_w, y1), color, -1)
-            cv2.putText(annotated, label, (x1, y1 - baseline - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-
-        for j in range(len(sorted_idxs) - 1):
-            idx_a = sorted_idxs[j]
-            idx_b = sorted_idxs[j + 1]
-            box_a = boxes_list[idx_a]
-            box_b = boxes_list[idx_b]
-            ax1, ay1, ax2, ay2 = map(int, box_a.xyxy[0].tolist())
-            bx1, by1, bx2, by2 = map(int, box_b.xyxy[0].tolist())
-
-            if style == 1:
-                cv2.line(annotated, (ax1, ay1), (bx1, by1), color, 2)
-                cv2.line(annotated, (ax2, ay2), (bx2, by2), color, 2)
-            else:
-                cv2.line(annotated, (ax1, ay2), (bx1, by2), color, 2)
-                cv2.line(annotated, (ax2, ay1), (bx2, by1), color, 2)
-
-        top_idx = sorted_idxs[-1]
-        box_top = boxes_list[top_idx]
-        x1, y1, x2, y2 = map(int, box_top.xyxy[0].tolist())
-        tx = (x1 + x2) // 2
-        ty = y1
-        label = f"C{col_id + 1}({len(sorted_idxs)})"
-        cv2.putText(annotated, label, (tx + 8, max(20, ty - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-
-    return annotated
-
-
 def draw_layout_entries(img, desks, num_cols=5, required_per_col=6, title="Reliable seat layout"):
     annotated = img.copy()
     col_colors = [
@@ -1966,64 +1902,6 @@ class DeskLayoutDetector:
         }
         return layout
 
-    def _build_initial_layout_from_early_frames(self, sampled_frames, chosen_scheme, fallback_layout):
-        early_frames = sampled_frames[: self.init_sample_count]
-        slot_observations = {}
-        for item in early_frames:
-            layout = item.get("layouts", {}).get(chosen_scheme)
-            if layout is None:
-                continue
-            for desk in layout.get("desks", []):
-                col = int(desk.get("column_index", -1))
-                row = int(desk.get("row_index", -1))
-                if not (0 <= col < self.num_cols and 0 <= row < self.required_per_col):
-                    continue
-                key = (col, row)
-                obs = dict(desk)
-                obs["source_frame_idx"] = int(item["frame_idx"])
-                slot_observations.setdefault(key, []).append(obs)
-
-        initial_desks = []
-        for (col, row), observations in sorted(slot_observations.items()):
-            best = max(observations, key=lambda d: float(d.get("conf", 0.0)))
-            item = dict(best)
-            item["column_index"] = int(col)
-            item["row_index"] = int(row)
-            item["desk_no"] = col * self.required_per_col + row + 1
-            item["desk_id"] = f"D{item['desk_no']:02d}"
-            item["evidence_count"] = int(len({d.get("source_frame_idx") for d in observations}))
-            item["locked_base"] = item["evidence_count"] >= self.pending_confirm_hits
-            item["source"] = "early_sequence_initial_model"
-            initial_desks.append(item)
-
-        if not initial_desks:
-            layout = copy.deepcopy(fallback_layout)
-            layout["desks"] = [dict(d, locked_base=True, evidence_count=1) for d in layout.get("desks", [])]
-            layout["sequence_model"] = {
-                "method": "fallback_best_frame_seed",
-                "init_sample_count": int(self.init_sample_count),
-                "pending_confirm_hits": int(self.pending_confirm_hits),
-            }
-            return layout
-
-        layout = copy.deepcopy(fallback_layout)
-        layout["desks"] = sorted(initial_desks, key=lambda d: d["desk_no"])
-        layout["ordered_columns"] = [
-            [desk.get("index", -1) for desk in layout["desks"] if desk["column_index"] == col_id]
-            for col_id in range(self.num_cols)
-        ]
-        layout["columns"] = layout["ordered_columns"]
-        layout["column_lines"] = build_column_line_entries_from_desks(layout["desks"], self.num_cols)
-        layout["sequence_model"] = {
-            "method": "early_frame_cumulative_seed",
-            "init_sample_count": int(self.init_sample_count),
-            "pending_confirm_hits": int(self.pending_confirm_hits),
-            "early_sampled_frames": [int(item["frame_idx"]) for item in early_frames],
-            "slot_count": int(len(initial_desks)),
-            "locked_base_count": int(sum(1 for desk in initial_desks if desk.get("locked_base"))),
-        }
-        return layout
-
     def _optimize_layout_across_sampled_frames(self, layout, sampled_frames, chosen_scheme=None):
         """用全视频采样帧的高置信检测沿当前列线持续优化布局。"""
         current_layout = dict(layout)
@@ -2202,10 +2080,10 @@ class DeskLayoutDetector:
 
         cols1, lines1, _ = self._split_columns_for_scheme(centers_np, 1)
         cols2, lines2, _ = self._split_columns_for_scheme(centers_np, 2)
-        straight1, fitted1 = fitted_columns_straightness_score(
+        straight1, _ = fitted_columns_straightness_score(
             centers_np, cols1, required_per_col=self.required_per_col
         )
-        straight2, fitted2 = fitted_columns_straightness_score(
+        straight2, _ = fitted_columns_straightness_score(
             centers_np, cols2, required_per_col=self.required_per_col
         )
 
