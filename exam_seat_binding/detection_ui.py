@@ -199,6 +199,7 @@ class LiveBindingConfig:
     desk_required_per_col: int = 6
     reference_max_frames: int = 120
     reference_sample_step: int = 5
+    desk_reference_seconds: float = 0.0
     confirm_seconds: float = 3.0
     confirm_ratio: float = 0.50
     hold_seconds: float = 5.0
@@ -209,6 +210,7 @@ class LiveBindingConfig:
     pending_hold_seconds: float = 2.0
     first_extend_ratio: float = 0.6
     last_extend_ratio: float = 1.2
+    classroom_padding: float = 0.0
     outputs: set[str] = field(default_factory=set)
     simple_vis: bool = True
     max_students: int = 30
@@ -639,6 +641,7 @@ class RealBindingSession:
                 desk_required_per_col=self.config.desk_required_per_col,
                 reference_max_frames=self.config.reference_max_frames,
                 reference_sample_step=self.config.reference_sample_step,
+                desk_reference_seconds=self.config.desk_reference_seconds,
                 confirm_seconds=self.config.confirm_seconds,
                 confirm_ratio=self.config.confirm_ratio,
                 hold_seconds=self.config.hold_seconds,
@@ -649,6 +652,7 @@ class RealBindingSession:
                 pending_hold_seconds=self.config.pending_hold_seconds,
                 first_extend_ratio=self.config.first_extend_ratio,
                 last_extend_ratio=self.config.last_extend_ratio,
+                classroom_padding=self.config.classroom_padding,
                 outputs=self.config.outputs,
                 display=False,
                 simple_vis=self.config.simple_vis,
@@ -2668,8 +2672,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--desk-required-per-col", type=int, default=6)
     parser.add_argument("--reference-max-frames", type=int, default=120)
     parser.add_argument("--reference-sample-step", type=int, default=5)
+    parser.add_argument("--desk-reference-seconds", type=float, default=0.0,
+                        help="只用视频开头 N 秒建立固定桌子模型；>0 时人绑定从 N 秒之后开始")
     parser.add_argument("--first-extend", type=float, default=0.6)
     parser.add_argument("--last-extend", type=float, default=1.2)
+    parser.add_argument("--classroom-padding", type=float, default=0.0)
     parser.add_argument("--confirm-seconds", type=float, default=3.0)
     parser.add_argument("--confirm-ratio", type=float, default=0.50)
     parser.add_argument("--hold-seconds", type=float, default=5.0)
@@ -2717,6 +2724,7 @@ def main() -> None:
         desk_required_per_col=args.desk_required_per_col,
         reference_max_frames=args.reference_max_frames,
         reference_sample_step=args.reference_sample_step,
+        desk_reference_seconds=args.desk_reference_seconds,
         confirm_seconds=args.confirm_seconds,
         confirm_ratio=args.confirm_ratio,
         hold_seconds=args.hold_seconds,
@@ -2727,6 +2735,7 @@ def main() -> None:
         pending_hold_seconds=args.pending_hold_seconds,
         first_extend_ratio=args.first_extend,
         last_extend_ratio=args.last_extend,
+        classroom_padding=args.classroom_padding,
         outputs=live_outputs,
         simple_vis=args.simple_vis,
         max_students=args.max_students,

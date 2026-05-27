@@ -1402,23 +1402,25 @@ class PersonDeskBindingPipelineV3:
         desk_mode: str,
         desk_num_cols: int,
         desk_required_per_col: int,
-        desk_init_sample_count: int,
-        desk_pending_confirm_hits: int,
-        reference_max_frames: int,
-        reference_sample_step: int,
-        confirm_seconds: float,
-        confirm_ratio: float,
-        hold_seconds: float,
-        re_confirm_seconds: float,
-        lock_seconds: float,
-        release_miss_seconds: float,
-        pending_switch_seconds: float,
-        pending_hold_seconds: float,
-        first_extend_ratio: float,
-        last_extend_ratio: float,
-        outputs: set[str],
-        display: bool,
-        simple_vis: bool,
+        desk_init_sample_count: int = 5,
+        desk_pending_confirm_hits: int = 1,
+        reference_max_frames: int = 0,
+        reference_sample_step: int = 5,
+        desk_reference_seconds: float = 0.0,
+        confirm_seconds: float = 3.0,
+        confirm_ratio: float = 0.50,
+        hold_seconds: float = 5.0,
+        re_confirm_seconds: float = 5.0,
+        lock_seconds: float = 20.0,
+        release_miss_seconds: float = 12.0,
+        pending_switch_seconds: float = 1.2,
+        pending_hold_seconds: float = 2.0,
+        first_extend_ratio: float = 0.6,
+        last_extend_ratio: float = 1.2,
+        classroom_padding: float = 0.0,
+        outputs: set[str] | None = None,
+        display: bool = False,
+        simple_vis: bool = True,
         max_students: int = 30,
         max_teachers: int = 2,
         frame_callback_stride: int = 3,
@@ -1443,8 +1445,11 @@ class PersonDeskBindingPipelineV3:
         self.half = half
         self.tracker = tracker
         self.person_classes = person_classes
-        self.reference_max_frames = reference_max_frames
+        self.reference_max_frames = int(reference_max_frames or 0)
         self.reference_sample_step = max(1, reference_sample_step)
+        self.desk_reference_seconds = max(0.0, float(desk_reference_seconds or 0.0))
+        self.effective_reference_max_frames = self.reference_max_frames
+        self.binding_start_frame = 0
         self.confirm_seconds = confirm_seconds
         self.confirm_ratio = confirm_ratio
         self.hold_seconds = hold_seconds
@@ -1455,7 +1460,8 @@ class PersonDeskBindingPipelineV3:
         self.pending_hold_seconds = pending_hold_seconds
         self.first_extend_ratio = first_extend_ratio
         self.last_extend_ratio = last_extend_ratio
-        self.outputs = set(outputs)
+        self.classroom_padding = max(0.0, float(classroom_padding or 0.0))
+        self.outputs = set(outputs or set())
         self.display = display
         self.simple_vis = simple_vis
         self.max_students = max_students
@@ -1514,10 +1520,33 @@ class PersonDeskBindingPipelineV3:
 
     # ── 参考帧桌子检测 ───────────────────────────────────────
 
+    def _video_fps(self) -> float:
+        cap = cv2.VideoCapture(self.source)
+        if not cap.isOpened():
+            raise RuntimeError(f"无法打开视频: {self.source}")
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+        finally:
+            cap.release()
+        return fps if fps and fps > 1e-6 else 25.0
+
+    def _resolve_reference_max_frames(self) -> int:
+        if self.desk_reference_seconds <= 0:
+            self.effective_reference_max_frames = self.reference_max_frames
+            self.binding_start_frame = 0
+            return self.reference_max_frames
+
+        fps = self._video_fps()
+        max_frames = max(1, int(round(self.desk_reference_seconds * fps)))
+        self.effective_reference_max_frames = max_frames
+        self.binding_start_frame = max_frames
+        return max_frames
+
     def _select_reference_desks(self):
+        max_frames = self._resolve_reference_max_frames()
         return self.desk_detector.select_best_layout_from_video(
             self.source,
-            max_frames=self.reference_max_frames,
+            max_frames=max_frames,
             sample_step=self.reference_sample_step,
             save_dir=self.output_dir,
             log=True,
@@ -1671,6 +1700,10 @@ class PersonDeskBindingPipelineV3:
             print(f"  序列选择: {sequence_selection.get('method')} "
                   f"sample_step={sequence_selection.get('sample_step')}, "
                   f"max_frames={sequence_selection.get('max_frames')}")
+        if self.desk_reference_seconds > 0:
+            print(f"  桌子建模时长: 前 {self.desk_reference_seconds:.2f}s "
+                  f"({self.effective_reference_max_frames} 帧)")
+            print(f"  人员绑定起点: 第 {self.binding_start_frame} 帧之后")
         if layout.get("best_sampled_frame_image"):
             print(f"  最佳具体帧图: {layout.get('best_sampled_frame_image')}")
         if layout.get("best_sampled_frame_repaired_image"):
@@ -1685,8 +1718,10 @@ class PersonDeskBindingPipelineV3:
         )
         zones = zone_builder.build(desks)
         zone_lookup = {z["desk_id"]: z for z in zones}
-        # 增大padding确保边缘学生在包围区内
-        classroom_polygon = build_classroom_polygon_from_desks(desks, padding=100.0)
+        classroom_polygon = build_classroom_polygon_from_desks(
+            desks,
+            padding=self.classroom_padding,
+        )
 
         print(f"  绑定区域数: {len(zones)}")
         for z in zones:
@@ -1707,6 +1742,9 @@ class PersonDeskBindingPipelineV3:
         self._emit_layout({
             "source": self.source,
             "reference_frame_idx": reference["frame_idx"],
+            "desk_reference_seconds": float(self.desk_reference_seconds),
+            "reference_max_frames": int(self.effective_reference_max_frames),
+            "binding_start_frame": int(self.binding_start_frame),
             "frame_width": int(reference["frame"].shape[1]),
             "frame_height": int(reference["frame"].shape[0]),
             "desk_count": len(desks),
@@ -1794,6 +1832,9 @@ class PersonDeskBindingPipelineV3:
               f"位移 {teacher_detector.net_displacement_thresh:.0f}px")
         print(f"  视频: {width}x{height} @ {fps:.1f}fps, "
               f"总帧: {total_frames}")
+        if self.binding_start_frame > 0:
+            print(f"  前 {self.binding_start_frame} 帧仅用于桌子模型建立，"
+                  "逐帧人绑定从该帧之后开始")
 
         # ── 输出准备 ─────────────────────────────────────────
         video_writer = None
@@ -1842,6 +1883,14 @@ class PersonDeskBindingPipelineV3:
                 ret, frame = cap.read()
                 if not ret:
                     break
+
+                if frame_idx < self.binding_start_frame:
+                    if frame_idx % 30 == 0 and total_frames > 0:
+                        pct = 100.0 * frame_idx / total_frames
+                        print(f"  {frame_idx}/{total_frames} ({pct:.1f}%) "
+                              "桌子模型建立区间，跳过人绑定")
+                    frame_idx += 1
+                    continue
 
                 track_kwargs = {
                     "source": frame,
@@ -2195,6 +2244,9 @@ class PersonDeskBindingPipelineV3:
             "source": self.source,
             "version": "v3_zone_binding_iou",
             "reference_frame_idx": reference["frame_idx"],
+            "desk_reference_seconds": float(self.desk_reference_seconds),
+            "reference_max_frames": int(self.effective_reference_max_frames),
+            "binding_start_frame": int(self.binding_start_frame),
             "desk_count": len(desks),
             "zone_count": len(zones),
             "occupied_seats": len(occupied_bind_ids),
@@ -2227,7 +2279,11 @@ class PersonDeskBindingPipelineV3:
                 "teacher_net_displacement_thresh": teacher_detector.net_displacement_thresh,
                 "first_extend_ratio": self.first_extend_ratio,
                 "last_extend_ratio": self.last_extend_ratio,
+                "classroom_padding": self.classroom_padding,
                 "simple_vis": self.simple_vis,
+                "desk_reference_seconds": float(self.desk_reference_seconds),
+                "reference_max_frames": int(self.effective_reference_max_frames),
+                "binding_start_seconds": round(self.binding_start_frame / fps, 3),
             },
             "classroom_polygon": (classroom_polygon.tolist()
                                   if classroom_polygon is not None else None),
@@ -2360,12 +2416,16 @@ def main():
     p.add_argument("--reference-max-frames", type=int, default=0,
                    help="参考桌子布局最多扫描帧数；<=0 表示扫描完整视频")
     p.add_argument("--reference-sample-step", type=int, default=5)
+    p.add_argument("--desk-reference-seconds", type=float, default=0.0,
+                   help="只用视频开头 N 秒建立固定桌子模型；>0 时人绑定从 N 秒之后开始")
 
     # V3 核心: 区间构建参数
     p.add_argument("--first-extend", type=float, default=0.6,
                    help="第一排座位向下(近相机)延伸比例 (基于间距)")
     p.add_argument("--last-extend", type=float, default=1.2,
                    help="最后排座位向上(远相机)延伸比例 (基于间距)")
+    p.add_argument("--classroom-padding", type=float, default=0.0,
+                   help="教室包围大框向外扩展像素；默认0表示只连接最边缘桌子")
 
     # 时间确认参数
     p.add_argument("--confirm-seconds", type=float, default=3.0)
@@ -2417,6 +2477,7 @@ def main():
         desk_pending_confirm_hits=args.desk_pending_confirm_hits,
         reference_max_frames=args.reference_max_frames,
         reference_sample_step=args.reference_sample_step,
+        desk_reference_seconds=args.desk_reference_seconds,
         confirm_seconds=args.confirm_seconds,
         confirm_ratio=args.confirm_ratio,
         hold_seconds=args.hold_seconds,
@@ -2427,6 +2488,7 @@ def main():
         pending_hold_seconds=args.pending_hold_seconds,
         first_extend_ratio=args.first_extend,
         last_extend_ratio=args.last_extend,
+        classroom_padding=args.classroom_padding,
         outputs=outputs,
         display=args.display,
         simple_vis=args.simple_vis,
