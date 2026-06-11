@@ -1387,6 +1387,7 @@ class PersonDeskBindingPipelineV3:
     def __init__(
         self,
         source: str,
+        desk_reference_source: str | None,
         person_weights: str,
         desk_weights: str,
         output_dir: str,
@@ -1431,12 +1432,15 @@ class PersonDeskBindingPipelineV3:
     ):
         if not os.path.isfile(source):
             raise FileNotFoundError(f"视频不存在: {source}")
+        if desk_reference_source and not os.path.isfile(desk_reference_source):
+            raise FileNotFoundError(f"桌子参考视频不存在: {desk_reference_source}")
         if not os.path.isfile(person_weights):
             raise FileNotFoundError(f"人物模型不存在: {person_weights}")
         if not os.path.isfile(desk_weights):
             raise FileNotFoundError(f"桌子模型不存在: {desk_weights}")
 
         self.source = source
+        self.desk_reference_source = desk_reference_source or source
         self.output_dir = output_dir
         self.person_conf = person_conf
         self.person_iou = person_iou
@@ -1520,10 +1524,10 @@ class PersonDeskBindingPipelineV3:
 
     # ── 参考帧桌子检测 ───────────────────────────────────────
 
-    def _video_fps(self) -> float:
-        cap = cv2.VideoCapture(self.source)
+    def _video_fps(self, video_path: str | None = None) -> float:
+        cap = cv2.VideoCapture(video_path or self.source)
         if not cap.isOpened():
-            raise RuntimeError(f"无法打开视频: {self.source}")
+            raise RuntimeError(f"无法打开视频: {video_path or self.source}")
         try:
             fps = cap.get(cv2.CAP_PROP_FPS)
         finally:
@@ -1536,16 +1540,17 @@ class PersonDeskBindingPipelineV3:
             self.binding_start_frame = 0
             return self.reference_max_frames
 
-        fps = self._video_fps()
-        max_frames = max(1, int(round(self.desk_reference_seconds * fps)))
-        self.effective_reference_max_frames = max_frames
-        self.binding_start_frame = max_frames
-        return max_frames
+        reference_fps = self._video_fps(self.desk_reference_source)
+        source_fps = self._video_fps(self.source)
+        reference_max_frames = max(1, int(round(self.desk_reference_seconds * reference_fps)))
+        self.effective_reference_max_frames = reference_max_frames
+        self.binding_start_frame = max(1, int(round(self.desk_reference_seconds * source_fps)))
+        return reference_max_frames
 
     def _select_reference_desks(self):
         max_frames = self._resolve_reference_max_frames()
         return self.desk_detector.select_best_layout_from_video(
-            self.source,
+            self.desk_reference_source,
             max_frames=max_frames,
             sample_step=self.reference_sample_step,
             save_dir=self.output_dir,
@@ -1686,6 +1691,7 @@ class PersonDeskBindingPipelineV3:
         # ── Step 1: 桌子检测 → 6×5 网格 ─────────────────────
         print("=" * 60)
         print("Step 1: 建立桌子布局...")
+        print(f"  桌子参考视频: {self.desk_reference_source}")
         reference = self._select_reference_desks()
         layout = reference["layout"]
         desks = layout["desks"]
@@ -1741,6 +1747,7 @@ class PersonDeskBindingPipelineV3:
 
         self._emit_layout({
             "source": self.source,
+            "desk_reference_source": self.desk_reference_source,
             "reference_frame_idx": reference["frame_idx"],
             "desk_reference_seconds": float(self.desk_reference_seconds),
             "reference_max_frames": int(self.effective_reference_max_frames),
@@ -2242,6 +2249,7 @@ class PersonDeskBindingPipelineV3:
 
         summary = {
             "source": self.source,
+            "desk_reference_source": self.desk_reference_source,
             "version": "v3_zone_binding_iou",
             "reference_frame_idx": reference["frame_idx"],
             "desk_reference_seconds": float(self.desk_reference_seconds),
@@ -2380,6 +2388,8 @@ def main():
         "人桌绑定 V3 (相邻桌子区间绑定)")
 
     p.add_argument("--source", required=True, help="输入视频路径")
+    p.add_argument("--desk-reference-source", default=None,
+                   help="可选：单独用于建立桌位框架的视频；不填则使用 --source")
     p.add_argument("--weights",
                    default="exam_seat_binding/weight/yolo11speopel.pt",
                    help="人物模型权重")
@@ -2405,7 +2415,7 @@ def main():
     p.add_argument("--display", action="store_true")
 
     # 桌子布局参数
-    p.add_argument("--desk-mode", default="auto",
+    p.add_argument("--desk-mode", default="scheme1",
                    choices=["normal", "scheme1", "scheme2", "auto"])
     p.add_argument("--desk-num-cols", type=int, default=5)
     p.add_argument("--desk-required-per-col", type=int, default=6)
@@ -2458,6 +2468,7 @@ def main():
 
     pipeline = PersonDeskBindingPipelineV3(
         source=args.source,
+        desk_reference_source=args.desk_reference_source,
         person_weights=args.weights,
         desk_weights=args.desk_weights,
         output_dir=args.output,
