@@ -843,6 +843,8 @@ class HeadLineSeatAssigner:
         max_right_offset: float = 120.0,
         max_up_offset: float = 80.0,
         max_box_distance: float = 0.0,
+        column_order_min_count: int = 3,
+        column_order_weight: float = 0.85,
     ):
         """
         Bind each head to the desk detection that lies down-left of it.
@@ -875,7 +877,7 @@ class HeadLineSeatAssigner:
             else auto_box_distance
         )
 
-        candidates = []
+        candidate_rows = []
         for person in people:
             tid = int(person["track_id"])
             anchor = head_anchor_pts.get(tid)
@@ -923,29 +925,138 @@ class HeadLineSeatAssigner:
                     + center_up_gap * 1.65
                     - lower_left_bonus
                 )
-                candidates.append(
-                    (
-                        float(score),
-                        float(box_dist),
-                        float(desk_down_gap),
-                        float(center_right_gap),
-                        tid,
-                        zone,
-                        {
+                candidate_rows.append(
+                    {
+                        "score": float(score),
+                        "box_dist": float(box_dist),
+                        "desk_down_gap": float(desk_down_gap),
+                        "center_right_gap": float(center_right_gap),
+                        "tid": tid,
+                        "zone": zone,
+                        "col": int(zone["column_index"]),
+                        "info": {
                             "left_down_box_distance": float(box_dist),
                             "left_down_desk_left_gap": float(desk_left_gap),
                             "left_down_desk_down_gap": float(desk_down_gap),
                             "left_down_desk_right_gap": float(desk_right_gap),
                             "left_down_desk_up_gap": float(desk_up_gap),
                         },
-                    )
+                    }
                 )
 
-        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]))
+        candidate_rows.sort(
+            key=lambda item: (
+                item["score"],
+                item["box_dist"],
+                item["desk_down_gap"],
+                item["center_right_gap"],
+                item["tid"],
+            )
+        )
         used_people = set()
         used_seats = set(occupied)
         assignments = {}
-        for score, box_dist, desk_down_gap, _center_right_gap, tid, zone, info in candidates:
+
+        by_col: dict[int, list] = {}
+        for item in candidate_rows:
+            by_col.setdefault(int(item["col"]), []).append(item)
+
+        for col in sorted(by_col):
+            col_items = by_col[col]
+            tids = sorted({int(item["tid"]) for item in col_items})
+            if len(tids) < int(column_order_min_count):
+                continue
+
+            candidate_seat_nos = {int(item["zone"]["desk_no"]) for item in col_items}
+            col_zones = [
+                zone for zone in self.zones_by_col.get(int(col), [])
+                if int(zone["desk_no"]) in candidate_seat_nos
+                and int(zone["desk_no"]) not in used_seats
+            ]
+            if not col_zones:
+                continue
+            col_zones.sort(
+                key=lambda zone: self.col_zone_depths[int(col)][int(zone["desk_no"])]
+            )
+            tid_depth = {
+                tid: self._project_depth(head_anchor_pts[tid], int(col))
+                for tid in tids
+                if tid in head_anchor_pts
+            }
+            ordered_tids = sorted(tid_depth, key=lambda tid: tid_depth[tid])
+            if not ordered_tids:
+                continue
+
+            people_rank_den = max(1, len(ordered_tids) - 1)
+            zone_rank_den = max(1, len(col_zones) - 1)
+            tid_rank = {
+                tid: idx / people_rank_den
+                for idx, tid in enumerate(ordered_tids)
+            }
+            zone_rank = {
+                int(zone["desk_no"]): idx / zone_rank_den
+                for idx, zone in enumerate(col_zones)
+            }
+            if len(col_zones) >= 2:
+                zone_depths = [
+                    self.col_zone_depths[int(col)][int(zone["desk_no"])]
+                    for zone in col_zones
+                ]
+                typical_step = float(np.median([abs(b - a) for a, b in zip(zone_depths[:-1], zone_depths[1:])]))
+            else:
+                typical_step = self.col_depth_limit.get(int(col), median_h)
+
+            item_by_pair = {
+                (int(item["tid"]), int(item["zone"]["desk_no"])): item
+                for item in col_items
+            }
+            cost_matrix = np.full((len(ordered_tids), len(col_zones)), 1e6, dtype=np.float32)
+            for row, tid in enumerate(ordered_tids):
+                for col_idx, zone in enumerate(col_zones):
+                    seat_no = int(zone["desk_no"])
+                    item = item_by_pair.get((int(tid), seat_no))
+                    if item is None:
+                        continue
+                    rank_gap = abs(float(tid_rank[int(tid)]) - float(zone_rank[seat_no]))
+                    cost_matrix[row, col_idx] = float(item["score"]) + rank_gap * typical_step * float(column_order_weight)
+
+            for row, col_idx in self._solve_cost_matrix(cost_matrix):
+                if row >= len(ordered_tids) or col_idx >= len(col_zones):
+                    continue
+                if float(cost_matrix[row, col_idx]) >= 1e6:
+                    continue
+                tid = int(ordered_tids[row])
+                zone = col_zones[col_idx]
+                seat_no = int(zone["desk_no"])
+                if tid in used_people or seat_no in used_seats:
+                    continue
+                item = item_by_pair.get((tid, seat_no))
+                if item is None:
+                    continue
+                rank_gap = abs(float(tid_rank[tid]) - float(zone_rank[seat_no]))
+                assignment = self._assignment_from_zone(
+                    tid,
+                    zone,
+                    head_anchor_pts[tid],
+                    item["box_dist"],
+                    item["desk_down_gap"],
+                    float(cost_matrix[row, col_idx]),
+                    "head_left_down_desk_column_order",
+                )
+                for key, value in item["info"].items():
+                    assignment[key] = round(float(value), 4)
+                assignment["left_down_column_rank_gap"] = round(rank_gap, 4)
+                assignments[tid] = assignment
+                used_people.add(tid)
+                used_seats.add(seat_no)
+
+        for item in candidate_rows:
+            score = item["score"]
+            box_dist = item["box_dist"]
+            desk_down_gap = item["desk_down_gap"]
+            tid = int(item["tid"])
+            zone = item["zone"]
+            info = item["info"]
             seat_no = int(zone["desk_no"])
             if tid in used_people or seat_no in used_seats:
                 continue
@@ -2659,6 +2770,29 @@ def run(args):
             locked_seats = set()
             bound_track_ids = set()
             large_move_track_ids = set()
+            if frame_idx >= bind_start_frame:
+                for person in head_people:
+                    tid = int(person["track_id"])
+                    bound_seat = seat_manager.get_display_seat(tid, frame_idx)
+                    if bound_seat is None:
+                        continue
+                    anchor = head_anchor_pts.get(tid)
+                    if anchor is None:
+                        continue
+                    far_from_bound, locked_assignment = assigner.is_anchor_far_from_seat(
+                        int(bound_seat),
+                        anchor,
+                        line_scale=args.large_move_line_scale,
+                        depth_scale=args.large_move_depth_scale,
+                        center_scale=args.large_move_center_scale,
+                    )
+                    if not far_from_bound and locked_assignment is not None:
+                        bound_track_ids.add(tid)
+                        locked_seats.add(int(bound_seat))
+                        locked_assignment["binding_method"] = "bound_sticky_until_far"
+                        locked_assignments[tid] = locked_assignment
+                    else:
+                        large_move_track_ids.add(tid)
 
             if frame_idx >= bind_start_frame:
                 bindable_head_people = [
@@ -2672,6 +2806,8 @@ def run(args):
                     max_right_offset=args.left_down_max_right_offset,
                     max_up_offset=args.left_down_max_up_offset,
                     max_box_distance=args.left_down_max_box_distance,
+                    column_order_min_count=args.left_down_column_order_min_count,
+                    column_order_weight=args.left_down_column_order_weight,
                 )
             else:
                 assignments = {}
@@ -2932,6 +3068,8 @@ def run(args):
         "left_down_max_right_offset": float(args.left_down_max_right_offset),
         "left_down_max_up_offset": float(args.left_down_max_up_offset),
         "left_down_max_box_distance": float(args.left_down_max_box_distance),
+        "left_down_column_order_min_count": int(args.left_down_column_order_min_count),
+        "left_down_column_order_weight": float(args.left_down_column_order_weight),
         "column_order_line_scale": float(args.column_order_line_scale),
         "column_order_depth_scale": float(args.column_order_depth_scale),
         "column_order_min_line": float(args.column_order_min_line),
@@ -3077,6 +3215,18 @@ def build_arg_parser():
         type=float,
         default=0.0,
         help="Maximum head-anchor to desk-box distance; 0 uses an automatic desk-size based limit",
+    )
+    p.add_argument(
+        "--left-down-column-order-min-count",
+        type=int,
+        default=3,
+        help="Use same-column head order correction when at least this many heads have candidates in a desk column",
+    )
+    p.add_argument(
+        "--left-down-column-order-weight",
+        type=float,
+        default=0.85,
+        help="Cost weight for preserving front-back order within a desk column",
     )
 
     p.add_argument("--desk-mode", default="scheme1", choices=["normal", "scheme1", "scheme2", "auto"])
