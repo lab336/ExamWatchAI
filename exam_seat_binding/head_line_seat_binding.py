@@ -845,6 +845,7 @@ class HeadLineSeatAssigner:
         max_box_distance: float = 0.0,
         column_order_min_count: int = 3,
         column_order_weight: float = 0.85,
+        column_projection_weight: float = 1.25,
     ):
         """
         Bind each head to the desk detection that lies down-left of it.
@@ -878,6 +879,7 @@ class HeadLineSeatAssigner:
         )
 
         candidate_rows = []
+        seen_pairs = set()
         for person in people:
             tid = int(person["track_id"])
             anchor = head_anchor_pts.get(tid)
@@ -925,6 +927,7 @@ class HeadLineSeatAssigner:
                     + center_up_gap * 1.65
                     - lower_left_bonus
                 )
+                seen_pairs.add((tid, seat_no))
                 candidate_rows.append(
                     {
                         "score": float(score),
@@ -940,6 +943,59 @@ class HeadLineSeatAssigner:
                             "left_down_desk_down_gap": float(desk_down_gap),
                             "left_down_desk_right_gap": float(desk_right_gap),
                             "left_down_desk_up_gap": float(desk_up_gap),
+                        },
+                    }
+                )
+
+        for person in people:
+            tid = int(person["track_id"])
+            anchor = head_anchor_pts.get(tid)
+            if anchor is None:
+                continue
+            col, lateral_gap = self._pick_column_by_lateral_order(anchor)
+            if col is None:
+                continue
+            col = int(col)
+            line_dist = self._axis_distance(anchor, col)
+            line_limit = max(180.0, self.col_line_limit.get(col, 160.0) * 2.8)
+            if line_dist > line_limit:
+                continue
+            depth_value = self._project_depth(anchor, col)
+            depth_limit = max(140.0, self.col_depth_limit.get(col, 120.0) * 1.65)
+            for zone in self.zones_by_col.get(col, []):
+                seat_no = int(zone["desk_no"])
+                if seat_no in occupied or (tid, seat_no) in seen_pairs:
+                    continue
+                depth_gap = abs(self.col_zone_depths[col][seat_no] - depth_value)
+                if depth_gap > depth_limit:
+                    continue
+                box_dist = point_xyxy_distance(anchor, zone["desk_xyxy"])
+                score = (
+                    depth_gap * float(column_projection_weight)
+                    + line_dist * 1.10
+                    + float(lateral_gap) * 0.45
+                    + box_dist * 0.18
+                    + 90.0
+                )
+                seen_pairs.add((tid, seat_no))
+                candidate_rows.append(
+                    {
+                        "score": float(score),
+                        "box_dist": float(box_dist),
+                        "desk_down_gap": float(depth_gap),
+                        "center_right_gap": float(lateral_gap),
+                        "tid": tid,
+                        "zone": zone,
+                        "col": col,
+                        "info": {
+                            "left_down_box_distance": float(box_dist),
+                            "left_down_desk_left_gap": 0.0,
+                            "left_down_desk_down_gap": float(depth_gap),
+                            "left_down_desk_right_gap": 0.0,
+                            "left_down_desk_up_gap": 0.0,
+                            "column_projection_candidate": True,
+                            "column_projection_line_distance": float(line_dist),
+                            "column_projection_depth_gap": float(depth_gap),
                         },
                     }
                 )
@@ -967,11 +1023,9 @@ class HeadLineSeatAssigner:
             if len(tids) < int(column_order_min_count):
                 continue
 
-            candidate_seat_nos = {int(item["zone"]["desk_no"]) for item in col_items}
             col_zones = [
                 zone for zone in self.zones_by_col.get(int(col), [])
-                if int(zone["desk_no"]) in candidate_seat_nos
-                and int(zone["desk_no"]) not in used_seats
+                if int(zone["desk_no"]) not in used_seats
             ]
             if not col_zones:
                 continue
@@ -2581,6 +2635,10 @@ def run(args):
     track_seat_votes: dict[int, Counter] = {}
     seat_track_votes: dict[int, Counter] = {}
     seen_tracks: set[int] = set()
+    teacher_track_ids: set[int] = set()
+    outside_track_frames: Counter = Counter()
+    moving_outside_track_frames: Counter = Counter()
+    no_candidate_track_frames: Counter = Counter()
 
     csv_file = open(output_csv, "w", newline="", encoding="utf-8-sig")
     csv_writer = csv.DictWriter(
@@ -2624,6 +2682,7 @@ def run(args):
             "motion_moving_count",
             "motion_net_distance",
             "motion_speed",
+            "teacher_like",
             "binding_method",
             "head_line_distance",
             "head_depth_gap",
@@ -2752,13 +2811,34 @@ def run(args):
                         or box_area(body["xyxy"]) < box_area(prev_body)
                     ):
                         body_xyxy_by_tid[int(tid)] = body["xyxy"]
-            for tid in head_dets:
-                inside_student_area_by_tid[int(tid)] = True
             visible_head_track_ids = set(int(tid) for tid in head_dets)
             motion_by_tid = {
                 int(tid): motion_filter.update(int(tid), frame_idx, anchor)
                 for tid, anchor in head_anchor_pts.items()
             }
+            teacher_confirm_frames = max(1, int(round(float(args.teacher_confirm_seconds) * fps)))
+            teacher_no_candidate_frames = max(1, int(round(float(args.teacher_no_candidate_seconds) * fps)))
+            for tid in visible_head_track_ids:
+                motion_info = motion_by_tid.get(tid, motion_filter.get(tid))
+                outside_area = not bool(inside_student_area_by_tid.get(tid, True))
+                moving_far = (
+                    bool(motion_info.get("is_moving", False))
+                    or float(motion_info.get("motion_net_distance", 0.0)) >= float(args.teacher_moving_distance)
+                    or float(motion_info.get("motion_speed", 0.0)) >= float(args.teacher_moving_speed)
+                )
+                if outside_area:
+                    outside_track_frames[tid] += 1
+                else:
+                    outside_track_frames[tid] = 0
+                if outside_area and moving_far:
+                    moving_outside_track_frames[tid] += 1
+                else:
+                    moving_outside_track_frames[tid] = 0
+                if (
+                    outside_track_frames[tid] >= teacher_confirm_frames
+                    and moving_outside_track_frames[tid] >= max(1, teacher_confirm_frames // 2)
+                ):
+                    teacher_track_ids.add(tid)
             bindable_motion_track_ids = {
                 tid for tid, info in motion_by_tid.items()
                 if bool(info.get("can_bind", False))
@@ -2798,6 +2878,11 @@ def run(args):
                 bindable_head_people = [
                     person for person in head_people
                     if int(person["track_id"]) not in bound_track_ids
+                    and int(person["track_id"]) not in teacher_track_ids
+                    and (
+                        bool(inside_student_area_by_tid.get(int(person["track_id"]), True))
+                        or not bool(motion_by_tid.get(int(person["track_id"]), {}).get("is_moving", False))
+                    )
                 ]
                 assignments = assigner.assign_left_down_desk_batch(
                     people=bindable_head_people,
@@ -2808,6 +2893,7 @@ def run(args):
                     max_box_distance=args.left_down_max_box_distance,
                     column_order_min_count=args.left_down_column_order_min_count,
                     column_order_weight=args.left_down_column_order_weight,
+                    column_projection_weight=args.left_down_column_projection_weight,
                 )
             else:
                 assignments = {}
@@ -2821,12 +2907,22 @@ def run(args):
                 assignment = assignments.get(tid)
                 bound_seat = seat_manager.get_display_seat(tid, frame_idx)
                 allow_occupied_takeover = False
+                if frame_idx >= bind_start_frame and bound_seat is None and assignment is None:
+                    no_candidate_track_frames[tid] += 1
+                    if no_candidate_track_frames[tid] >= teacher_no_candidate_frames:
+                        teacher_track_ids.add(tid)
+                else:
+                    no_candidate_track_frames[tid] = 0
+                is_teacher_like = frame_idx >= bind_start_frame and tid in teacher_track_ids and bound_seat is None
+                if is_teacher_like:
+                    assignment = None
                 if (
                     args.occupied_handoff
                     and
                     bound_seat is None
                     and assignment is None
                     and tid in bindable_motion_track_ids
+                    and not is_teacher_like
                 ):
                     handoff_assignment = None
                     handoff_score = None
@@ -2905,6 +3001,9 @@ def run(args):
                     label = f"ID{stable_track_id:02d}"
                 elif assignment:
                     label = f"ID{candidate_track_id:02d} pending"
+                elif is_teacher_like:
+                    color = (90, 90, 255)
+                    label = f"raw{tid} teacher"
                 elif motion_info.get("motion_state") == "moving":
                     color = (80, 180, 255)
                     label = f"raw{tid} moving"
@@ -2976,6 +3075,7 @@ def run(args):
                         "motion_moving_count": motion_info.get("moving_count"),
                         "motion_net_distance": round(float(motion_info.get("motion_net_distance", 0.0)), 4),
                         "motion_speed": round(float(motion_info.get("motion_speed", 0.0)), 4),
+                        "teacher_like": bool(is_teacher_like),
                         "binding_method": assignment.get("binding_method") if assignment else None,
                         "head_line_distance": assignment.get("head_line_distance") if assignment else None,
                         "head_depth_gap": assignment.get("head_depth_gap") if assignment else None,
@@ -3070,6 +3170,12 @@ def run(args):
         "left_down_max_box_distance": float(args.left_down_max_box_distance),
         "left_down_column_order_min_count": int(args.left_down_column_order_min_count),
         "left_down_column_order_weight": float(args.left_down_column_order_weight),
+        "left_down_column_projection_weight": float(args.left_down_column_projection_weight),
+        "teacher_confirm_seconds": float(args.teacher_confirm_seconds),
+        "teacher_no_candidate_seconds": float(args.teacher_no_candidate_seconds),
+        "teacher_moving_distance": float(args.teacher_moving_distance),
+        "teacher_moving_speed": float(args.teacher_moving_speed),
+        "teacher_track_ids": sorted(int(v) for v in teacher_track_ids),
         "column_order_line_scale": float(args.column_order_line_scale),
         "column_order_depth_scale": float(args.column_order_depth_scale),
         "column_order_min_line": float(args.column_order_min_line),
@@ -3227,6 +3333,36 @@ def build_arg_parser():
         type=float,
         default=0.85,
         help="Cost weight for preserving front-back order within a desk column",
+    )
+    p.add_argument(
+        "--left-down-column-projection-weight",
+        type=float,
+        default=1.25,
+        help="Cost weight for same-column projection candidates used by ordered binding",
+    )
+    p.add_argument(
+        "--teacher-confirm-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds outside the 5x6 seat area with clear movement before treating a track as teacher-like",
+    )
+    p.add_argument(
+        "--teacher-no-candidate-seconds",
+        type=float,
+        default=4.0,
+        help="Seconds a never-bound track may remain without any seat candidate before treating it as teacher-like",
+    )
+    p.add_argument(
+        "--teacher-moving-distance",
+        type=float,
+        default=180.0,
+        help="Motion-window displacement used as teacher-like movement evidence outside the seat area",
+    )
+    p.add_argument(
+        "--teacher-moving-speed",
+        type=float,
+        default=90.0,
+        help="Motion-window speed used as teacher-like movement evidence outside the seat area",
     )
 
     p.add_argument("--desk-mode", default="scheme1", choices=["normal", "scheme1", "scheme2", "auto"])
