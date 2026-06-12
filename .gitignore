@@ -58,3 +58,4 @@ detect/output/
 runs/
 *.log
 .DS_Store       
+exam_seat_binding/Video-Depth-Anything

@@ -1,12 +1,11 @@
 """
-Head-line based exam seat binding.
+Head-to-desk detection based exam seat binding.
 
 Pipeline:
 1. Use the first N seconds of video to build the fixed desk layout with
    exam_seat_binding/desk_layout_detector.py.
 2. Track only head detections from model/yolo26m/best2.pt.
-3. Bind each tracked head to the nearest desk column line, then to the nearest
-   seat depth in that column.
+3. Bind each tracked head to the detected desk box at its lower-left side.
 
 Example:
 python exam_seat_binding/head_line_seat_binding.py \
@@ -108,6 +107,14 @@ def point_in_xyxy(point_xy, xyxy, margin=0.0):
     x, y = [float(v) for v in point_xy]
     x1, y1, x2, y2 = [float(v) for v in xyxy]
     return (x1 - margin) <= x <= (x2 + margin) and (y1 - margin) <= y <= (y2 + margin)
+
+
+def point_xyxy_distance(point_xy, xyxy):
+    x, y = [float(v) for v in point_xy]
+    x1, y1, x2, y2 = [float(v) for v in xyxy]
+    dx = max(float(x1) - x, 0.0, x - float(x2))
+    dy = max(float(y1) - y, 0.0, y - float(y2))
+    return float(np.hypot(dx, dy))
 
 
 def head_anchor_from_box(xyxy, mode="center", y_offset=0.0):
@@ -218,6 +225,115 @@ def video_fps(path):
     finally:
         cap.release()
     return fps if fps and fps > 1e-6 else 25.0
+
+
+def normalize_depth_map(depth_map, low_percentile: float = 5.0, high_percentile: float = 95.0):
+    if depth_map is None:
+        return None
+    depth = np.asarray(depth_map, dtype=np.float32)
+    valid = depth[np.isfinite(depth)]
+    if valid.size == 0:
+        return None
+    lo = float(np.percentile(valid, float(low_percentile)))
+    hi = float(np.percentile(valid, float(high_percentile)))
+    if hi <= lo + 1e-6:
+        return np.zeros_like(depth, dtype=np.float32)
+    norm = (depth - lo) / (hi - lo)
+    return np.clip(norm, 0.0, 1.0).astype(np.float32)
+
+
+def median_depth_in_xyxy(depth_map, xyxy, sample_ratio: float = 0.35):
+    if depth_map is None:
+        return None
+    depth = np.asarray(depth_map, dtype=np.float32)
+    h, w = depth.shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in xyxy]
+    if x2 <= x1 or y2 <= y1:
+        return None
+    ratio = max(0.05, min(1.0, float(sample_ratio)))
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    bw = max(2.0, (x2 - x1) * ratio)
+    bh = max(2.0, (y2 - y1) * ratio)
+    sx1 = int(max(0, min(w - 1, round(cx - bw / 2.0))))
+    sx2 = int(max(0, min(w, round(cx + bw / 2.0))))
+    sy1 = int(max(0, min(h - 1, round(cy - bh / 2.0))))
+    sy2 = int(max(0, min(h, round(cy + bh / 2.0))))
+    if sx2 <= sx1 or sy2 <= sy1:
+        return None
+    patch = depth[sy1:sy2, sx1:sx2]
+    values = patch[np.isfinite(patch)]
+    if values.size == 0:
+        return None
+    return float(np.median(values))
+
+
+class VideoDepthPrior:
+    def __init__(
+        self,
+        weights_path: str,
+        encoder: str = "vitb",
+        device: str = "",
+        input_size: int = 518,
+        max_res: int = 960,
+        fp32: bool = False,
+    ):
+        weights_path = str(weights_path)
+        if not os.path.isfile(weights_path):
+            raise FileNotFoundError(f"Depth weights not found: {weights_path}")
+
+        try:
+            import torch
+        except Exception as exc:
+            raise RuntimeError("Depth prior requires torch to be installed") from exc
+
+        depth_root = Path(__file__).resolve().parent / "Video-Depth-Anything"
+        if str(depth_root) not in sys.path:
+            sys.path.insert(0, str(depth_root))
+        from video_depth_anything.video_depth_stream import VideoDepthAnything
+
+        model_configs = {
+            "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
+            "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
+            "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+        }
+        if encoder not in model_configs:
+            raise ValueError(f"Unsupported depth encoder: {encoder}")
+
+        self.torch = torch
+        raw_device = str(device or "").strip()
+        if raw_device.isdigit():
+            raw_device = f"cuda:{raw_device}"
+        if not raw_device:
+            raw_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model_device = raw_device
+        self.infer_device = "cuda" if raw_device.startswith("cuda") else raw_device
+        self.input_size = int(input_size)
+        self.max_res = int(max_res)
+        self.fp32 = bool(fp32)
+        self.model = VideoDepthAnything(**model_configs[encoder])
+        self.model.load_state_dict(torch.load(weights_path, map_location="cpu"), strict=True)
+        self.model = self.model.to(self.model_device).eval()
+
+    def infer(self, frame_bgr):
+        original_h, original_w = frame_bgr.shape[:2]
+        frame = frame_bgr
+        if self.max_res > 0 and max(original_h, original_w) > self.max_res:
+            scale = float(self.max_res) / float(max(original_h, original_w))
+            resized_w = max(1, int(round(original_w * scale)))
+            resized_h = max(1, int(round(original_h * scale)))
+            frame = cv2.resize(frame_bgr, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        depth = self.model.infer_video_depth_one(
+            frame_rgb,
+            input_size=self.input_size,
+            device=self.infer_device,
+            fp32=self.fp32,
+        )
+        depth = np.asarray(depth, dtype=np.float32)
+        if depth.shape[:2] != (original_h, original_w):
+            depth = cv2.resize(depth, (original_w, original_h), interpolation=cv2.INTER_LINEAR)
+        return depth
 
 
 def build_student_area_polygon(desks: list, padding: float = 80.0):
@@ -719,6 +835,136 @@ class HeadLineSeatAssigner:
                 pairs.append((row, col))
             return pairs
 
+    def assign_left_down_desk_batch(
+        self,
+        people: list,
+        head_anchor_pts: dict[int, np.ndarray],
+        occupied_seat_nos: set[int] | None = None,
+        max_right_offset: float = 120.0,
+        max_up_offset: float = 80.0,
+        max_box_distance: float = 0.0,
+    ):
+        """
+        Bind each head to the desk detection that lies down-left of it.
+
+        Image coordinates grow right/down. A valid desk should not be far to
+        the right of the head, and should not sit clearly above it. Among valid
+        desks, the score prefers the nearest box with a lower-left relation.
+        """
+        occupied = set(int(v) for v in (occupied_seat_nos or set()))
+        all_zones = [
+            zone
+            for col in sorted(self.zones_by_col)
+            for zone in self.zones_by_col[col]
+        ]
+        if not people or not all_zones:
+            return {}
+
+        desk_widths = []
+        desk_heights = []
+        for zone in all_zones:
+            x1, y1, x2, y2 = [float(v) for v in zone["desk_xyxy"]]
+            desk_widths.append(max(1.0, x2 - x1))
+            desk_heights.append(max(1.0, y2 - y1))
+        median_w = float(np.median(desk_widths)) if desk_widths else 100.0
+        median_h = float(np.median(desk_heights)) if desk_heights else 70.0
+        auto_box_distance = max(180.0, float(np.hypot(median_w, median_h)) * 2.8)
+        box_distance_limit = (
+            float(max_box_distance)
+            if float(max_box_distance) > 0
+            else auto_box_distance
+        )
+
+        candidates = []
+        for person in people:
+            tid = int(person["track_id"])
+            anchor = head_anchor_pts.get(tid)
+            if anchor is None:
+                continue
+            hx, hy = float(anchor[0]), float(anchor[1])
+
+            for zone in all_zones:
+                seat_no = int(zone["desk_no"])
+                if seat_no in occupied:
+                    continue
+
+                x1, y1, x2, y2 = [float(v) for v in zone["desk_xyxy"]]
+                cx, cy = [float(v) for v in zone["desk_center"]]
+
+                right_violation = max(0.0, cx - hx - float(max_right_offset))
+                up_violation = max(0.0, hy - cy - float(max_up_offset))
+                if right_violation > median_w * 0.80 or up_violation > median_h * 1.20:
+                    continue
+
+                box_dist = point_xyxy_distance(anchor, zone["desk_xyxy"])
+                if box_dist > box_distance_limit:
+                    continue
+
+                desk_left_gap = max(0.0, hx - x2)
+                desk_right_gap = max(0.0, x1 - hx)
+                desk_down_gap = max(0.0, y1 - hy)
+                desk_up_gap = max(0.0, hy - y2)
+                center_right_gap = max(0.0, cx - hx)
+                center_up_gap = max(0.0, hy - cy)
+
+                lower_left_bonus = 0.0
+                if cx <= hx and cy >= hy:
+                    lower_left_bonus = min(80.0, median_w * 0.35 + median_h * 0.35)
+                if x1 <= hx <= x2 and y1 >= hy:
+                    lower_left_bonus += 30.0
+
+                score = (
+                    box_dist * 0.90
+                    + desk_left_gap * 0.45
+                    + desk_down_gap * 0.60
+                    + desk_right_gap * 2.80
+                    + desk_up_gap * 3.20
+                    + center_right_gap * 1.30
+                    + center_up_gap * 1.65
+                    - lower_left_bonus
+                )
+                candidates.append(
+                    (
+                        float(score),
+                        float(box_dist),
+                        float(desk_down_gap),
+                        float(center_right_gap),
+                        tid,
+                        zone,
+                        {
+                            "left_down_box_distance": float(box_dist),
+                            "left_down_desk_left_gap": float(desk_left_gap),
+                            "left_down_desk_down_gap": float(desk_down_gap),
+                            "left_down_desk_right_gap": float(desk_right_gap),
+                            "left_down_desk_up_gap": float(desk_up_gap),
+                        },
+                    )
+                )
+
+        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]))
+        used_people = set()
+        used_seats = set(occupied)
+        assignments = {}
+        for score, box_dist, desk_down_gap, _center_right_gap, tid, zone, info in candidates:
+            seat_no = int(zone["desk_no"])
+            if tid in used_people or seat_no in used_seats:
+                continue
+            assignment = self._assignment_from_zone(
+                tid,
+                zone,
+                head_anchor_pts[tid],
+                box_dist,
+                desk_down_gap,
+                score,
+                "head_left_down_desk_detection",
+            )
+            for key, value in info.items():
+                assignment[key] = round(float(value), 4)
+            assignments[tid] = assignment
+            used_people.add(tid)
+            used_seats.add(seat_no)
+        return assignments
+
     def assign_column_order_batch(
         self,
         people: list,
@@ -911,11 +1157,47 @@ class HeadLineSeatAssigner:
         depth_scale: float = 1.35,
         min_depth: float = 150.0,
         max_rms: float = 55.0,
-        min_count: int = 6,
+        min_count: int = 3,
+        max_seat_distance: float = 0.0,
+        head_depth_by_tid: dict[int, float] | None = None,
+        seat_depth_by_no: dict[int, float] | None = None,
+        depth_max_diff: float = 0.0,
+        depth_weight: float = 0.0,
+        body_xyxy_by_tid: dict[int, list] | None = None,
+        body_seat_min_overlap: float = 0.02,
+        body_seat_weight: float = 120.0,
     ):
         import itertools
 
+        def zone_for_projected_depth(col_zones, col_depths, depth_value, tolerance):
+            if not col_zones:
+                return None, float("inf"), None
+            if depth_value < col_depths[0]:
+                gap = abs(float(col_depths[0]) - float(depth_value))
+                return (col_zones[0], gap, "before_first") if gap <= tolerance else (None, gap, None)
+            if depth_value > col_depths[-1]:
+                gap = abs(float(depth_value) - float(col_depths[-1]))
+                return (col_zones[-1], gap, "after_last") if gap <= tolerance else (None, gap, None)
+            for idx in range(len(col_depths) - 1):
+                start = float(col_depths[idx])
+                end = float(col_depths[idx + 1])
+                lo = min(start, end)
+                hi = max(start, end)
+                if lo <= float(depth_value) <= hi:
+                    center_gap = min(abs(float(depth_value) - start), abs(float(depth_value) - end))
+                    return col_zones[idx], center_gap, "between_seats"
+            gaps = [abs(float(depth_value) - float(v)) for v in col_depths]
+            best_idx = int(np.argmin(gaps))
+            return (
+                col_zones[best_idx],
+                float(gaps[best_idx]),
+                "nearest_center",
+            ) if gaps[best_idx] <= tolerance else (None, float(gaps[best_idx]), None)
+
         people_by_tid = {int(person["track_id"]): person for person in people}
+        head_depth_by_tid = head_depth_by_tid or {}
+        seat_depth_by_no = seat_depth_by_no or {}
+        body_xyxy_by_tid = body_xyxy_by_tid or {}
         used_people = set()
         used_seats = set(int(v) for v in occupied_seat_nos)
         assignments = {}
@@ -930,13 +1212,8 @@ class HeadLineSeatAssigner:
                 self.zones_by_col[col],
                 key=lambda z: self.col_zone_depths[col][int(z["desk_no"])],
             )
-            zones = [z for z in all_zones if int(z["desk_no"]) not in used_seats]
-            target_count = len(zones)
-            if target_count < int(min_count):
+            if not all_zones:
                 continue
-            if target_count != int(min_count):
-                zones = zones[: int(min_count)]
-                target_count = len(zones)
 
             col_line_scale = float(line_scale)
             if int(col) == int(left_col):
@@ -951,14 +1228,22 @@ class HeadLineSeatAssigner:
             )
 
             candidates = []
-            zone_depth_values = [self.col_zone_depths[col][int(z["desk_no"])] for z in zones]
+            zone_depth_values = [self.col_zone_depths[col][int(z["desk_no"])] for z in all_zones]
             min_zone_depth = min(zone_depth_values) - depth_limit
             max_zone_depth = max(zone_depth_values) + depth_limit
+            seat_close_limit = (
+                float(max_seat_distance)
+                if float(max_seat_distance) > 0
+                else max(90.0, self.col_depth_limit.get(col, 150.0) * 0.90)
+            )
             for tid, person in people_by_tid.items():
                 if tid in used_people:
                     continue
                 anchor = head_anchor_pts.get(tid)
                 if anchor is None:
+                    continue
+                lateral_col, lateral_gap = self._pick_column_by_lateral_order(anchor)
+                if int(lateral_col) != int(col):
                     continue
                 axis_dist = self._axis_distance(anchor, col)
                 if axis_dist > line_limit:
@@ -966,12 +1251,45 @@ class HeadLineSeatAssigner:
                 depth_value = self._project_depth(anchor, col)
                 if depth_value < min_zone_depth or depth_value > max_zone_depth:
                     continue
-                nearest_depth_gap = min(abs(depth_value - v) for v in zone_depth_values)
-                if nearest_depth_gap > depth_limit:
+                projected_zone, projection_gap, projection_region = zone_for_projected_depth(
+                    all_zones,
+                    zone_depth_values,
+                    depth_value,
+                    depth_limit,
+                )
+                if projected_zone is None:
                     continue
-                lateral_col, lateral_gap = self._pick_column_by_lateral_order(anchor)
+                seat_no = int(projected_zone["desk_no"])
+                if seat_no in used_seats:
+                    continue
+                seat_box_distance = point_xyxy_distance(anchor, projected_zone["desk_xyxy"])
+                if seat_box_distance > seat_close_limit:
+                    continue
+                body_overlap = None
+                body_xyxy = body_xyxy_by_tid.get(int(tid))
+                if body_xyxy is not None:
+                    body_poly = projected_zone.get("display_polygon") or projected_zone.get("polygon")
+                    body_overlap = xyxy_polygon_area_ratio(body_xyxy, body_poly)
+                    if body_overlap < float(body_seat_min_overlap):
+                        continue
+                depth_prior_head = head_depth_by_tid.get(int(tid))
+                depth_prior_seat = seat_depth_by_no.get(int(seat_no))
+                depth_prior_diff = None
+                if depth_prior_head is not None and depth_prior_seat is not None:
+                    if np.isfinite(depth_prior_head) and np.isfinite(depth_prior_seat):
+                        depth_prior_diff = abs(float(depth_prior_head) - float(depth_prior_seat))
+                        if float(depth_max_diff) > 0 and depth_prior_diff > float(depth_max_diff):
+                            continue
                 nearest_bonus = -40.0 if lateral_col == col else 0.0
-                candidate_score = axis_dist + nearest_depth_gap * 0.55 + float(lateral_gap) * 0.35 + nearest_bonus
+                candidate_score = (
+                    axis_dist
+                    + float(projection_gap) * 0.45
+                    + float(lateral_gap) * 0.35
+                    + float(seat_box_distance) * 0.85
+                    + (float(depth_prior_diff) * float(depth_weight) if depth_prior_diff is not None else 0.0)
+                    - (float(body_overlap) * float(body_seat_weight) if body_overlap is not None else 0.0)
+                    + nearest_bonus
+                )
                 candidates.append(
                     {
                         "track_id": tid,
@@ -979,54 +1297,87 @@ class HeadLineSeatAssigner:
                         "anchor": anchor,
                         "axis_dist": float(axis_dist),
                         "depth": float(depth_value),
-                        "nearest_depth_gap": float(nearest_depth_gap),
+                        "nearest_depth_gap": float(projection_gap),
                         "nearest_col": lateral_col,
+                        "projected_zone": projected_zone,
+                        "projection_region": projection_region,
+                        "seat_box_distance": float(seat_box_distance),
+                        "depth_prior_head": None if depth_prior_head is None else float(depth_prior_head),
+                        "depth_prior_seat": None if depth_prior_seat is None else float(depth_prior_seat),
+                        "depth_prior_diff": depth_prior_diff,
+                        "body_seat_overlap": body_overlap,
                         "score": float(candidate_score),
                     }
                 )
 
-            if len(candidates) < target_count:
+            if len(candidates) < int(min_count):
                 continue
             candidates.sort(key=lambda item: (item["score"], item["track_id"]))
-            candidates = candidates[: max(target_count, int(max_candidates))]
+            candidates = candidates[: max(int(min_count), int(max_candidates))]
 
             best = None
-            for group in itertools.combinations(candidates, target_count):
-                ordered = sorted(group, key=lambda item: item["depth"])
-                angles = [
-                    three_point_angle_deg(a["anchor"], b["anchor"], c["anchor"])
-                    for a, b, c in zip(ordered[:-2], ordered[1:-1], ordered[2:])
-                ]
-                min_group_angle = min(angles) if angles else 180.0
-                max_group_angle = max(angles) if angles else 180.0
-                if min_group_angle < min_angle or max_group_angle > max_angle:
-                    continue
-                rms = line_fit_rms([item["anchor"] for item in ordered])
-                if rms > float(max_rms):
-                    continue
+            max_group_size = min(len(candidates), len(all_zones), int(max_candidates))
+            min_group_size = min(int(min_count), max_group_size)
+            for group_size in range(max_group_size, min_group_size - 1, -1):
+                for group in itertools.combinations(candidates, group_size):
+                    ordered = sorted(group, key=lambda item: item["depth"])
+                    angles = [
+                        three_point_angle_deg(a["anchor"], b["anchor"], c["anchor"])
+                        for a, b, c in zip(ordered[:-2], ordered[1:-1], ordered[2:])
+                    ]
+                    min_group_angle = min(angles) if angles else 180.0
+                    max_group_angle = max(angles) if angles else 180.0
+                    if min_group_angle < min_angle or max_group_angle > max_angle:
+                        continue
+                    rms = line_fit_rms([item["anchor"] for item in ordered])
+                    if rms > float(max_rms):
+                        continue
 
-                score = rms * 3.0 + max(0.0, 180.0 - min_group_angle) * 8.0
-                pair_rows = []
-                failed = False
-                for item, zone in zip(ordered, zones):
-                    seat_no = int(zone["desk_no"])
-                    depth_gap = abs(self.col_zone_depths[col][seat_no] - item["depth"])
-                    if depth_gap > depth_limit:
-                        failed = True
-                        break
-                    score += depth_gap * 1.15 + item["axis_dist"] * 0.85
-                    if item["nearest_col"] == col:
-                        score -= 35.0
-                    pair_rows.append((item, zone, depth_gap))
-                if failed:
-                    continue
-                if best is None or score < best[0]:
-                    best = (score, min_group_angle, max_group_angle, rms, pair_rows)
+                    score = rms * 3.0 + max(0.0, 180.0 - min_group_angle) * 8.0
+                    pair_rows = []
+                    seen_seats = set()
+                    failed = False
+                    for item in ordered:
+                        zone = item["projected_zone"]
+                        seat_no = int(zone["desk_no"])
+                        if seat_no in seen_seats or seat_no in used_seats:
+                            failed = True
+                            break
+                        depth_gap = abs(self.col_zone_depths[col][seat_no] - item["depth"])
+                        if depth_gap > depth_limit:
+                            failed = True
+                            break
+                        score += (
+                            depth_gap * 0.75
+                            + item["axis_dist"] * 0.85
+                            + item["seat_box_distance"] * 1.10
+                            + (
+                                float(item["depth_prior_diff"]) * float(depth_weight)
+                                if item.get("depth_prior_diff") is not None
+                                else 0.0
+                            )
+                            - (
+                                float(item["body_seat_overlap"]) * float(body_seat_weight)
+                                if item.get("body_seat_overlap") is not None
+                                else 0.0
+                            )
+                        )
+                        if item["nearest_col"] == col:
+                            score -= 35.0
+                        seen_seats.add(seat_no)
+                        pair_rows.append((item, zone, depth_gap))
+                    if failed:
+                        continue
+                    best_key = (-len(pair_rows), score)
+                    if best is None or best_key < best[0]:
+                        best = (best_key, score, min_group_angle, max_group_angle, rms, pair_rows)
+                if best is not None:
+                    break
 
             if best is None:
                 continue
 
-            score, min_group_angle, max_group_angle, rms, pair_rows = best
+            _, score, min_group_angle, max_group_angle, rms, pair_rows = best
             for item, zone, depth_gap in pair_rows:
                 tid = int(item["track_id"])
                 seat_no = int(zone["desk_no"])
@@ -1039,11 +1390,34 @@ class HeadLineSeatAssigner:
                     item["axis_dist"],
                     depth_gap,
                     score,
-                    "head_6_line_fit",
+                    "head_line_perp_projection",
                 )
                 assignment["head_column_min_angle"] = round(float(min_group_angle), 3)
                 assignment["head_column_max_angle"] = round(float(max_group_angle), 3)
                 assignment["head_column_rms"] = round(float(rms), 4)
+                assignment["head_projected_depth"] = round(float(item["depth"]), 4)
+                assignment["head_projection_region"] = item["projection_region"]
+                assignment["head_seat_box_distance"] = round(float(item["seat_box_distance"]), 4)
+                assignment["depth_prior_head"] = (
+                    None
+                    if item.get("depth_prior_head") is None
+                    else round(float(item["depth_prior_head"]), 6)
+                )
+                assignment["depth_prior_seat"] = (
+                    None
+                    if item.get("depth_prior_seat") is None
+                    else round(float(item["depth_prior_seat"]), 6)
+                )
+                assignment["depth_prior_diff"] = (
+                    None
+                    if item.get("depth_prior_diff") is None
+                    else round(float(item["depth_prior_diff"]), 6)
+                )
+                assignment["body_seat_overlap"] = (
+                    None
+                    if item.get("body_seat_overlap") is None
+                    else round(float(item["body_seat_overlap"]), 6)
+                )
                 assignments[tid] = assignment
                 used_people.add(tid)
                 used_seats.add(seat_no)
@@ -1154,6 +1528,66 @@ class HeadLineSeatAssigner:
         assignment["bound_sticky_line_limit"] = round(float(line_limit), 4)
         assignment["bound_sticky_depth_limit"] = round(float(depth_limit), 4)
         return ok, assignment
+
+    def is_anchor_closest_to_seat(
+        self,
+        seat_no: int,
+        head_anchor,
+        max_rank_gap: int = 0,
+    ) -> tuple[bool, dict | None]:
+        target_assignment = self.assignment_for_seat(
+            -1,
+            int(seat_no),
+            head_anchor,
+            method="bound_sticky_closest",
+        )
+        if target_assignment is None:
+            return False, None
+
+        ranked = []
+        for col, col_zones in self.zones_by_col.items():
+            for zone in col_zones:
+                candidate_seat = int(zone["desk_no"])
+                assignment = self.assignment_for_seat(
+                    -1,
+                    candidate_seat,
+                    head_anchor,
+                    method="closest_check",
+                )
+                if assignment is None:
+                    continue
+                center_dist = l2(head_anchor, zone["desk_center"])
+                box_dist = point_xyxy_distance(head_anchor, zone["desk_xyxy"])
+                score = (
+                    float(assignment["head_line_distance"]) * 1.25
+                    + float(assignment["head_depth_gap"]) * 1.0
+                    + center_dist * 0.22
+                    + box_dist * 0.90
+                )
+                ranked.append((float(score), candidate_seat, center_dist, box_dist))
+
+        if not ranked:
+            return False, target_assignment
+        ranked.sort(key=lambda item: (item[0], item[1]))
+        target_rank = next(
+            (idx for idx, item in enumerate(ranked) if int(item[1]) == int(seat_no)),
+            None,
+        )
+        closest_score, closest_seat, _, _ = ranked[0]
+        target_score = float(target_assignment["cost"])
+        for score, candidate_seat, center_dist, box_dist in ranked:
+            if int(candidate_seat) == int(seat_no):
+                target_score = float(score)
+                target_assignment["bound_closest_rank"] = int(target_rank or 0)
+                target_assignment["bound_closest_best_seat"] = int(closest_seat)
+                target_assignment["bound_closest_best_score"] = round(float(closest_score), 4)
+                target_assignment["bound_closest_score"] = round(float(score), 4)
+                target_assignment["bound_closest_center_distance"] = round(float(center_dist), 4)
+                target_assignment["bound_closest_box_distance"] = round(float(box_dist), 4)
+                break
+
+        ok = target_rank is not None and int(target_rank) <= int(max_rank_gap)
+        return ok, target_assignment
 
     def is_anchor_far_from_seat(
         self,
@@ -1962,6 +2396,11 @@ def run(args):
     print(f"Loaded head/person model: {args.weights}")
     print(f"Model classes: {names}")
 
+    depth_prior = None
+    latest_depth_frame = -1
+    if args.use_depth_prior:
+        print("Ignoring --use-depth-prior: this script now binds by detection only.")
+
     cap = cv2.VideoCapture(args.source)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {args.source}")
@@ -2077,6 +2516,11 @@ def run(args):
             "binding_method",
             "head_line_distance",
             "head_depth_gap",
+            "depth_prior_head",
+            "depth_prior_seat",
+            "depth_prior_diff",
+            "depth_prior_frame",
+            "body_seat_overlap",
             "cost",
         ],
     )
@@ -2090,6 +2534,8 @@ def run(args):
             ret, frame = cap.read()
             if not ret:
                 break
+
+            depth_norm = None
 
             track_kwargs = {
                 "source": frame,
@@ -2126,6 +2572,7 @@ def run(args):
             )
             head_people = []
             head_anchor_pts = {}
+            head_depth_by_tid = {}
             head_dets = {}
             body_dets = []
             inside_student_area_by_tid = {}
@@ -2212,48 +2659,19 @@ def run(args):
             locked_seats = set()
             bound_track_ids = set()
             large_move_track_ids = set()
-            if frame_idx >= bind_start_frame:
-                for person in head_people:
-                    tid = int(person["track_id"])
-                    bound_seat = seat_manager.get_display_seat(tid, frame_idx)
-                    if bound_seat is None:
-                        continue
-                    bound_track_ids.add(tid)
-                    locked_seats.add(int(bound_seat))
-                    anchor = head_anchor_pts.get(tid)
-                    if anchor is None:
-                        continue
-                    far_from_bound, locked_assignment = assigner.is_anchor_far_from_seat(
-                        int(bound_seat),
-                        anchor,
-                        line_scale=args.large_move_line_scale,
-                        depth_scale=args.large_move_depth_scale,
-                        center_scale=args.large_move_center_scale,
-                    )
-                    if not far_from_bound and locked_assignment is not None:
-                        locked_assignments[tid] = locked_assignment
-                    else:
-                        large_move_track_ids.add(tid)
 
             if frame_idx >= bind_start_frame:
                 bindable_head_people = [
                     person for person in head_people
                     if int(person["track_id"]) not in bound_track_ids
                 ]
-                assignments = assigner.assign_head_line_fit_batch(
+                assignments = assigner.assign_left_down_desk_batch(
                     people=bindable_head_people,
                     head_anchor_pts=head_anchor_pts,
                     occupied_seat_nos=set(locked_seats),
-                    min_angle=args.head_fit_min_angle,
-                    max_angle=args.head_fit_max_angle,
-                    max_candidates=args.head_fit_max_candidates,
-                    line_scale=args.head_fit_line_scale,
-                    first_col_line_scale=args.head_fit_first_col_line_scale,
-                    min_line=args.head_fit_min_line,
-                    depth_scale=args.head_fit_depth_scale,
-                    min_depth=args.head_fit_min_depth,
-                    max_rms=args.head_fit_max_rms,
-                    min_count=args.head_fit_min_count,
+                    max_right_offset=args.left_down_max_right_offset,
+                    max_up_offset=args.left_down_max_up_offset,
+                    max_box_distance=args.left_down_max_box_distance,
                 )
             else:
                 assignments = {}
@@ -2267,17 +2685,9 @@ def run(args):
                 assignment = assignments.get(tid)
                 bound_seat = seat_manager.get_display_seat(tid, frame_idx)
                 allow_occupied_takeover = False
-                if bound_seat is not None and tid not in locked_assignments:
-                    near_bound, sticky_assignment = assigner.is_anchor_near_seat(
-                        int(bound_seat),
-                        anchor,
-                        line_scale=args.sticky_line_scale,
-                        depth_scale=args.sticky_depth_scale,
-                        center_scale=args.sticky_center_scale,
-                    )
-                    if near_bound:
-                        assignment = sticky_assignment
-                elif (
+                if (
+                    args.occupied_handoff
+                    and
                     bound_seat is None
                     and assignment is None
                     and tid in bindable_motion_track_ids
@@ -2286,6 +2696,13 @@ def run(args):
                     handoff_score = None
                     for occupied_seat, owner_tid in seat_manager.seat_owner.items():
                         if int(owner_tid) == tid or int(owner_tid) in visible_head_track_ids:
+                            continue
+                        owner_state = seat_manager.states.get(int(owner_tid), {})
+                        last_seen = int(owner_state.get("last_seen_frame", -1))
+                        if (
+                            last_seen >= 0
+                            and int(frame_idx) - last_seen < int(round(args.occupied_handoff_missing_seconds * fps))
+                        ):
                             continue
                         near_occupied, occupied_assignment = assigner.is_anchor_near_seat(
                             int(occupied_seat),
@@ -2296,6 +2713,21 @@ def run(args):
                         )
                         if not near_occupied or occupied_assignment is None:
                             continue
+                        body_xyxy = body_xyxy_by_tid.get(int(tid))
+                        if body_xyxy is not None:
+                            target_zone = next(
+                                (
+                                    z for z in zones
+                                    if int(z["desk_no"]) == int(occupied_seat)
+                                ),
+                                None,
+                            )
+                            if target_zone is not None:
+                                body_poly = target_zone.get("display_polygon") or target_zone.get("polygon")
+                                body_overlap = xyxy_polygon_area_ratio(body_xyxy, body_poly)
+                                if body_overlap < float(args.occupied_handoff_body_min_overlap):
+                                    continue
+                                occupied_assignment["body_seat_overlap"] = round(float(body_overlap), 6)
                         score = float(occupied_assignment.get("cost", 0.0))
                         if handoff_assignment is None or score < float(handoff_score):
                             handoff_assignment = occupied_assignment
@@ -2411,6 +2843,14 @@ def run(args):
                         "binding_method": assignment.get("binding_method") if assignment else None,
                         "head_line_distance": assignment.get("head_line_distance") if assignment else None,
                         "head_depth_gap": assignment.get("head_depth_gap") if assignment else None,
+                        "depth_prior_head": (
+                            assignment.get("depth_prior_head")
+                            if assignment else head_depth_by_tid.get(int(tid))
+                        ),
+                        "depth_prior_seat": assignment.get("depth_prior_seat") if assignment else None,
+                        "depth_prior_diff": assignment.get("depth_prior_diff") if assignment else None,
+                        "depth_prior_frame": latest_depth_frame if depth_norm is not None else None,
+                        "body_seat_overlap": assignment.get("body_seat_overlap") if assignment else None,
                         "cost": assignment.get("cost") if assignment else None,
                     }
                 )
@@ -2488,7 +2928,10 @@ def run(args):
         "depth_margin_scale": float(args.depth_margin_scale),
         "min_line_margin": float(args.min_line_margin),
         "min_depth_margin": float(args.min_depth_margin),
-        "assignment_method": "head_line_fit",
+        "assignment_method": "head_left_down_desk_detection",
+        "left_down_max_right_offset": float(args.left_down_max_right_offset),
+        "left_down_max_up_offset": float(args.left_down_max_up_offset),
+        "left_down_max_box_distance": float(args.left_down_max_box_distance),
         "column_order_line_scale": float(args.column_order_line_scale),
         "column_order_depth_scale": float(args.column_order_depth_scale),
         "column_order_min_line": float(args.column_order_min_line),
@@ -2505,6 +2948,25 @@ def run(args):
         "head_fit_min_depth": float(args.head_fit_min_depth),
         "head_fit_max_rms": float(args.head_fit_max_rms),
         "head_fit_min_count": int(args.head_fit_min_count),
+        "head_fit_max_seat_distance": float(args.head_fit_max_seat_distance),
+        "use_depth_prior": False,
+        "depth_prior_ignored": bool(args.use_depth_prior),
+        "depth_weights": args.depth_weights,
+        "depth_encoder": args.depth_encoder,
+        "depth_stride": int(args.depth_stride),
+        "depth_input_size": int(args.depth_input_size),
+        "depth_max_res": int(args.depth_max_res),
+        "depth_low_percentile": float(args.depth_low_percentile),
+        "depth_high_percentile": float(args.depth_high_percentile),
+        "depth_head_sample_ratio": float(args.depth_head_sample_ratio),
+        "depth_seat_sample_ratio": float(args.depth_seat_sample_ratio),
+        "depth_max_diff": float(args.depth_max_diff),
+        "depth_weight": float(args.depth_weight),
+        "body_seat_min_overlap": float(args.body_seat_min_overlap),
+        "body_seat_weight": float(args.body_seat_weight),
+        "occupied_handoff": bool(args.occupied_handoff),
+        "occupied_handoff_missing_seconds": float(args.occupied_handoff_missing_seconds),
+        "occupied_handoff_body_min_overlap": float(args.occupied_handoff_body_min_overlap),
         "projection_fallback": bool(args.projection_fallback),
         "projection_line_scale": float(args.projection_line_scale),
         "projection_depth_scale": float(args.projection_depth_scale),
@@ -2513,6 +2975,7 @@ def run(args):
         "sticky_line_scale": float(args.sticky_line_scale),
         "sticky_depth_scale": float(args.sticky_depth_scale),
         "sticky_center_scale": float(args.sticky_center_scale),
+        "sticky_closest_rank_gap": int(args.sticky_closest_rank_gap),
         "handoff_line_scale": float(args.handoff_line_scale),
         "handoff_depth_scale": float(args.handoff_depth_scale),
         "handoff_center_scale": float(args.handoff_center_scale),
@@ -2597,6 +3060,24 @@ def build_arg_parser():
     p.add_argument("--head-area-max", type=float, default=6500.0, help="Fallback head area limit when class names are unclear")
     p.add_argument("--head-anchor", choices=["center", "top", "bottom"], default="center")
     p.add_argument("--head-y-offset", type=float, default=0.0, help="Pixel offset added to the selected head anchor y")
+    p.add_argument(
+        "--left-down-max-right-offset",
+        type=float,
+        default=120.0,
+        help="Desk center may be this many pixels to the right of the head and still count as lower-left",
+    )
+    p.add_argument(
+        "--left-down-max-up-offset",
+        type=float,
+        default=80.0,
+        help="Desk center may be this many pixels above the head and still count as lower-left",
+    )
+    p.add_argument(
+        "--left-down-max-box-distance",
+        type=float,
+        default=0.0,
+        help="Maximum head-anchor to desk-box distance; 0 uses an automatic desk-size based limit",
+    )
 
     p.add_argument("--desk-mode", default="scheme1", choices=["normal", "scheme1", "scheme2", "auto"])
     p.add_argument("--desk-num-cols", type=int, default=5)
@@ -2745,8 +3226,77 @@ def build_arg_parser():
     p.add_argument(
         "--head-fit-min-count",
         type=int,
-        default=6,
+        default=3,
         help="Require this many unbound heads in a desk column before fitting/binding",
+    )
+    p.add_argument(
+        "--head-fit-max-seat-distance",
+        type=float,
+        default=0.0,
+        help="Maximum distance from head center to its projected seat box; 0 uses an automatic row-step based limit",
+    )
+    p.add_argument(
+        "--use-depth-prior",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Deprecated; ignored because binding now uses detections only",
+    )
+    p.add_argument(
+        "--depth-weights",
+        default="exam_seat_binding/Video-Depth-Anything/model/video_depth_anything_vitb.pth",
+        help="Video-Depth-Anything checkpoint path",
+    )
+    p.add_argument("--depth-encoder", choices=["vits", "vitb", "vitl"], default="vitb")
+    p.add_argument("--depth-device", default="", help="Depth device; empty follows --device/auto")
+    p.add_argument("--depth-input-size", type=int, default=518)
+    p.add_argument("--depth-max-res", type=int, default=960, help="Resize largest frame side before depth inference; 0 disables")
+    p.add_argument("--depth-stride", type=int, default=5, help="Run depth inference every N frames and reuse the latest map")
+    p.add_argument("--depth-fp32", action="store_true", help="Run depth inference in fp32 instead of autocast")
+    p.add_argument("--depth-low-percentile", type=float, default=5.0)
+    p.add_argument("--depth-high-percentile", type=float, default=95.0)
+    p.add_argument("--depth-head-sample-ratio", type=float, default=0.35)
+    p.add_argument("--depth-seat-sample-ratio", type=float, default=0.35)
+    p.add_argument(
+        "--depth-max-diff",
+        type=float,
+        default=0.08,
+        help="Reject head-seat candidates whose normalized monocular-depth gap is larger; <=0 disables rejection",
+    )
+    p.add_argument(
+        "--depth-weight",
+        type=float,
+        default=180.0,
+        help="Cost penalty weight for normalized monocular-depth gap",
+    )
+    p.add_argument(
+        "--body-seat-min-overlap",
+        type=float,
+        default=0.02,
+        help="When a person_visible box exists, require this overlap ratio with the projected seat area",
+    )
+    p.add_argument(
+        "--body-seat-weight",
+        type=float,
+        default=120.0,
+        help="Cost bonus weight for person_visible overlap with the projected seat area",
+    )
+    p.add_argument(
+        "--occupied-handoff",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow a new track ID to take over an occupied seat after the old owner has been missing",
+    )
+    p.add_argument(
+        "--occupied-handoff-missing-seconds",
+        type=float,
+        default=2.0,
+        help="Old seat owner must be missing this long before occupied handoff is considered",
+    )
+    p.add_argument(
+        "--occupied-handoff-body-min-overlap",
+        type=float,
+        default=0.04,
+        help="If a body box exists, require this body-seat overlap for occupied handoff",
     )
     p.add_argument(
         "--projection-line-scale",
@@ -2781,6 +3331,12 @@ def build_arg_parser():
         help="Large depth tolerance for keeping an already-bound student on the same seat",
     )
     p.add_argument("--sticky-center-scale", type=float, default=1.9)
+    p.add_argument(
+        "--sticky-closest-rank-gap",
+        type=int,
+        default=0,
+        help="Keep a confirmed binding when its seat is within this nearest-seat rank for the current head",
+    )
     p.add_argument(
         "--handoff-line-scale",
         type=float,
@@ -2843,7 +3399,7 @@ def build_arg_parser():
         default=30.0,
         help="Seconds of continuous large movement required before releasing a confirmed binding",
     )
-    p.add_argument("--miss-hold-seconds", type=float, default=12.0)
+    p.add_argument("--miss-hold-seconds", type=float, default=60.0)
     p.add_argument("--reacquire-seconds", type=float, default=1.0)
     p.add_argument(
         "--evidence-vote-window-seconds",
