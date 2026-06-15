@@ -2016,7 +2016,7 @@ class EvidenceSeatManager:
         release_seconds: float = 8.0,
         miss_hold_seconds: float = 12.0,
         reacquire_seconds: float = 1.0,
-        initial_fast_bind_seconds: float = 0.2,
+        initial_fast_bind_seconds: float = 0.6,
         large_move_release_seconds: float | None = None,
         evidence_vote_window_seconds: float = 2.5,
         initial_vote_ratio: float = 0.65,
@@ -2204,6 +2204,8 @@ class EvidenceSeatManager:
                     self._clear_pending(tid)
                     return None
                 required = self.reacquire_confirm_frames
+                if fast_initial_confirm and best_seat == proposed:
+                    required = min(required, self.initial_fast_confirm_frames)
                 if count >= required and best_seat == proposed:
                     self._bind(tid, proposed, frame_idx)
                 return proposed
@@ -2224,7 +2226,7 @@ class EvidenceSeatManager:
                 else self.initial_vote_ratio
             )
             if fast_initial_confirm and best_seat == proposed:
-                required_ratio = min(required_ratio, 0.55)
+                required_ratio = min(required_ratio, self.initial_vote_ratio)
             if count >= required and vote_ratio >= required_ratio:
                 self._bind(tid, best_seat, frame_idx)
                 return best_seat
@@ -2963,6 +2965,13 @@ def run(args):
                 is_teacher_like = frame_idx >= bind_start_frame and tid in teacher_track_ids and bound_seat is None
                 if is_teacher_like:
                     assignment = None
+                strong_initial_assignment = bool(
+                    assignment
+                    and assignment.get("binding_method") in {
+                        "head_left_down_desk_column_order",
+                        "head_left_down_desk_detection",
+                    }
+                )
                 if (
                     args.occupied_handoff
                     and
@@ -3016,6 +3025,18 @@ def run(args):
                         assignment = handoff_assignment
                         allow_occupied_takeover = True
                 current_seat = int(assignment["desk_no"]) if assignment else None
+                if (
+                    bound_seat is None
+                    and current_seat is not None
+                    and strong_initial_assignment
+                ):
+                    owner_tid = seat_manager.seat_owner.get(int(current_seat))
+                    if owner_tid is not None and int(owner_tid) != tid:
+                        owner_visible = int(owner_tid) in visible_head_track_ids
+                        owner_far_from_bound = int(owner_tid) in large_move_track_ids
+                        if (not owner_visible) or owner_far_from_bound:
+                            assignment["binding_method"] = "same_seat_track_handoff"
+                            allow_occupied_takeover = True
                 release_evidence = (
                     "large_move" if tid in large_move_track_ids else None
                 )
@@ -3027,11 +3048,11 @@ def run(args):
                         release_evidence=release_evidence,
                         allow_occupied_takeover=allow_occupied_takeover,
                         fast_initial_confirm=bool(
-                            assignment
-                            and assignment.get("binding_method") in {
-                                "head_left_down_desk_column_order",
-                                "head_left_down_desk_detection",
-                            }
+                            strong_initial_assignment
+                            or (
+                                assignment
+                                and assignment.get("binding_method") == "same_seat_track_handoff"
+                            )
                         ),
                     )
                     if frame_idx >= bind_start_frame
@@ -3783,7 +3804,7 @@ def build_arg_parser():
     p.add_argument(
         "--initial-fast-bind-seconds",
         type=float,
-        default=0.2,
+        default=0.6,
         help="Fast confirmation time for strong initial desk-order/head-left-down candidates",
     )
     p.add_argument("--switch-seconds", type=float, default=10.0)
