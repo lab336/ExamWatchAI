@@ -140,6 +140,26 @@ def load_person_binding_pipeline_class():
         return pipeline_cls
 
 
+def load_head_line_binding_module():
+    try:
+        from exam_seat_binding import head_line_seat_binding
+
+        return head_line_seat_binding
+    except Exception as package_exc:
+        module_path = Path(__file__).resolve().with_name("head_line_seat_binding.py")
+        spec = importlib.util.spec_from_file_location(
+            "head_line_seat_binding_fallback",
+            module_path,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(
+                f"无法加载人头-桌框绑定模块: {module_path}"
+            ) from package_exc
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+
 @dataclass(slots=True)
 class SeatBox:
     seat_no: int
@@ -185,6 +205,7 @@ class LiveBindingConfig:
     person_weights: str
     desk_weights: str
     output_dir: str
+    binding_strategy: str = "head_line"
     person_conf: float = 0.18
     person_iou: float = 0.60
     desk_conf: float = 0.70
@@ -620,52 +641,10 @@ class RealBindingSession:
         self.started = True
         self._set_status("正在初始化检测模型...")
         try:
-            pipeline_cls = load_person_binding_pipeline_class()
-
-            pipeline = pipeline_cls(
-                source=self.config.source,
-                person_weights=self.config.person_weights,
-                desk_weights=self.config.desk_weights,
-                output_dir=self.config.output_dir,
-                person_conf=self.config.person_conf,
-                person_iou=self.config.person_iou,
-                desk_conf=self.config.desk_conf,
-                desk_iou=self.config.desk_iou,
-                device=self.config.device,
-                img_size=self.config.img_size,
-                half=self.config.half,
-                tracker=self.config.tracker,
-                person_classes=self.config.person_classes,
-                desk_mode=self.config.desk_mode,
-                desk_num_cols=self.config.desk_num_cols,
-                desk_required_per_col=self.config.desk_required_per_col,
-                reference_max_frames=self.config.reference_max_frames,
-                reference_sample_step=self.config.reference_sample_step,
-                desk_reference_seconds=self.config.desk_reference_seconds,
-                confirm_seconds=self.config.confirm_seconds,
-                confirm_ratio=self.config.confirm_ratio,
-                hold_seconds=self.config.hold_seconds,
-                re_confirm_seconds=self.config.re_confirm_seconds,
-                lock_seconds=self.config.lock_seconds,
-                release_miss_seconds=self.config.release_miss_seconds,
-                pending_switch_seconds=self.config.pending_switch_seconds,
-                pending_hold_seconds=self.config.pending_hold_seconds,
-                first_extend_ratio=self.config.first_extend_ratio,
-                last_extend_ratio=self.config.last_extend_ratio,
-                classroom_padding=self.config.classroom_padding,
-                outputs=self.config.outputs,
-                display=False,
-                simple_vis=self.config.simple_vis,
-                max_students=self.config.max_students,
-                max_teachers=self.config.max_teachers,
-                frame_callback_stride=self.config.frame_callback_stride,
-                frame_callback_max_width=self.config.frame_callback_max_width,
-                layout_callback=lambda payload: self._store_latest("pending_layout", payload),
-                frame_callback=self._store_frame,
-                finish_callback=lambda payload: self._store_latest("pending_finish", payload),
-            )
-            self._set_status("正在逐帧检测...")
-            pipeline.run()
+            if self.config.binding_strategy == "head_line":
+                self._run_head_line_binding()
+            else:
+                self._run_v3_binding()
             self._set_status("检测完成")
         except Exception as exc:
             self._store_latest(
@@ -678,6 +657,73 @@ class RealBindingSession:
             self._set_status(f"检测失败: {exc}")
         finally:
             self.finished = True
+
+    def _run_v3_binding(self) -> None:
+        pipeline_cls = load_person_binding_pipeline_class()
+
+        pipeline = pipeline_cls(
+            source=self.config.source,
+            person_weights=self.config.person_weights,
+            desk_weights=self.config.desk_weights,
+            output_dir=self.config.output_dir,
+            person_conf=self.config.person_conf,
+            person_iou=self.config.person_iou,
+            desk_conf=self.config.desk_conf,
+            desk_iou=self.config.desk_iou,
+            device=self.config.device,
+            img_size=self.config.img_size,
+            half=self.config.half,
+            tracker=self.config.tracker,
+            person_classes=self.config.person_classes,
+            desk_mode=self.config.desk_mode,
+            desk_num_cols=self.config.desk_num_cols,
+            desk_required_per_col=self.config.desk_required_per_col,
+            reference_max_frames=self.config.reference_max_frames,
+            reference_sample_step=self.config.reference_sample_step,
+            desk_reference_seconds=self.config.desk_reference_seconds,
+            confirm_seconds=self.config.confirm_seconds,
+            confirm_ratio=self.config.confirm_ratio,
+            hold_seconds=self.config.hold_seconds,
+            re_confirm_seconds=self.config.re_confirm_seconds,
+            lock_seconds=self.config.lock_seconds,
+            release_miss_seconds=self.config.release_miss_seconds,
+            pending_switch_seconds=self.config.pending_switch_seconds,
+            pending_hold_seconds=self.config.pending_hold_seconds,
+            first_extend_ratio=self.config.first_extend_ratio,
+            last_extend_ratio=self.config.last_extend_ratio,
+            classroom_padding=self.config.classroom_padding,
+            outputs=self.config.outputs,
+            display=False,
+            simple_vis=self.config.simple_vis,
+            max_students=self.config.max_students,
+            max_teachers=self.config.max_teachers,
+            frame_callback_stride=self.config.frame_callback_stride,
+            frame_callback_max_width=self.config.frame_callback_max_width,
+            layout_callback=lambda payload: self._store_latest("pending_layout", payload),
+            frame_callback=self._store_frame,
+            finish_callback=lambda payload: self._store_latest("pending_finish", payload),
+        )
+        self._set_status("正在逐帧检测...")
+        pipeline.run()
+
+    def _run_head_line_binding(self) -> None:
+        head_line_mod = load_head_line_binding_module()
+        parser = head_line_mod.build_arg_parser()
+        argv = [
+            "--source", self.config.source,
+            "--output", self.config.output_dir,
+        ]
+        if "binding_video" not in self.config.outputs:
+            argv.append("--no-video")
+
+        args = parser.parse_args(argv)
+        args.layout_callback = lambda payload: self._store_latest("pending_layout", payload)
+        args.frame_callback = self._store_frame
+        args.finish_callback = lambda payload: self._store_latest("pending_finish", payload)
+        args.frame_callback_stride = self.config.frame_callback_stride
+        args.frame_callback_max_width = self.config.frame_callback_max_width
+        self._set_status("正在运行人头-左下桌框绑定策略...")
+        head_line_mod.run(args)
 
     def poll(self) -> dict[str, Any]:
         with self.lock:
@@ -1314,6 +1360,7 @@ if QT_AVAILABLE:
             self.refresh_ms = max(120, int(refresh_ms))
             self.mode = mode
             self.live_config = live_config
+            self.initial_source = str(source or "")
             self.base_refresh_ms = max(120, int(refresh_ms))
             self.playback_speed = 0.75
             self.live_session: RealBindingSession | None = None
@@ -1762,12 +1809,41 @@ if QT_AVAILABLE:
             self.source_label.setWordWrap(True)
             footer_layout.addWidget(self.source_label)
 
+            config_grid = QGridLayout()
+            config_grid.setHorizontalSpacing(8)
+            config_grid.setVerticalSpacing(8)
+            footer_layout.addLayout(config_grid)
+            self._build_live_config_controls(config_grid)
+
             self.error_label = QLabel("")
             self.error_label.setObjectName("errorText")
             self.error_label.setWordWrap(True)
             self.error_label.hide()
             footer_layout.addWidget(self.error_label)
             self._update_playback_buttons()
+
+        def _config_line_edit(self, text: str = "", width: int | None = None) -> QLineEdit:
+            edit = QLineEdit()
+            edit.setText(text)
+            if width is not None:
+                edit.setFixedWidth(width)
+            return edit
+
+        def _build_live_config_controls(self, grid: QGridLayout) -> None:
+            cfg = self.live_config
+            source_text = cfg.source if cfg is not None else self.initial_source
+            output_text = cfg.output_dir if cfg is not None else ""
+
+            self.video_input_edit = self._config_line_edit(source_text)
+            self.output_input_edit = self._config_line_edit(output_text)
+
+            grid.addWidget(QLabel("检测视频"), 0, 0)
+            grid.addWidget(self.video_input_edit, 0, 1)
+            grid.addWidget(self._make_button("选择", self._browse_video), 0, 2)
+            grid.addWidget(QLabel("输出目录"), 0, 3)
+            grid.addWidget(self.output_input_edit, 0, 4)
+            grid.addWidget(self._make_button("选择", self._browse_output_dir), 0, 5)
+            grid.addWidget(self._make_button("启动检测", self._start_live_from_controls, primary=True), 0, 6)
 
         def _make_button(self, text: str, callback, primary: bool = False) -> QPushButton:
             button = QPushButton(text)
@@ -1997,6 +2073,8 @@ if QT_AVAILABLE:
             if wants_live or auto_live:
                 if self.live_config is not None:
                     self.mode = "live"
+                    source = self.live_config.source
+                    source_path = Path(source).expanduser().resolve() if source else None
                     self.provider = FrameProvider(source)
                     self.pending_live_frame_queue.clear()
                     self.live_session = RealBindingSession(self.live_config)
@@ -2026,7 +2104,7 @@ if QT_AVAILABLE:
                     self.latest_progress_text = "等待座位布局与首帧回调"
                     self.source_error = None
                     self.source_traceback = None
-                    self.load_button.setEnabled(False)
+                    self.load_button.setEnabled(True)
                     self._update_poll_timer()
                     self._update_playback_buttons()
                     return
@@ -2082,7 +2160,8 @@ if QT_AVAILABLE:
 
         def _load_source(self) -> None:
             if self.mode == "live":
-                self.detail_text_label.setText("真实检测模式下，请重新启动并通过 --source 指定视频。")
+                self._browse_video()
+                self._start_live_from_controls()
                 return
             file_path, _ = QFileDialog.getOpenFileName(
                 self,
@@ -2103,6 +2182,55 @@ if QT_AVAILABLE:
             self.current_frame_idx, self.current_total_frames, self.current_fps = self.provider.progress_state()
             self.last_presented_mock_at = 0.0
             self._update_poll_timer()
+            self._refresh_dashboard()
+
+        def _browse_video(self) -> None:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择检测视频",
+                self.video_input_edit.text().strip(),
+                "Video (*.mp4 *.avi *.mov *.mkv *.flv *.wmv);;All Files (*.*)",
+            )
+            if file_path:
+                self.video_input_edit.setText(file_path)
+
+        def _browse_output_dir(self) -> None:
+            selected_path = QFileDialog.getExistingDirectory(
+                self,
+                "选择输出目录",
+                self.output_input_edit.text().strip(),
+            )
+            if selected_path:
+                self.output_input_edit.setText(selected_path)
+
+        def _start_live_from_controls(self) -> None:
+            if self.live_config is None:
+                self.source_error = "当前未启用真实检测配置。"
+                self._update_status_widgets()
+                return
+            source = self.video_input_edit.text().strip()
+            if not source:
+                self.source_error = "请先选择检测视频。"
+                self._update_status_widgets()
+                return
+            output_dir = self.output_input_edit.text().strip()
+            if not output_dir:
+                self.source_error = "请先设置输出目录。"
+                self._update_status_widgets()
+                return
+
+            self.live_config.source = source
+            self.live_config.output_dir = output_dir
+            self.live_config.binding_strategy = "head_line"
+
+            self.records.clear()
+            self.events_table.setRowCount(0)
+            self.live_session = None
+            self.live_status_map = None
+            self.source_error = None
+            self.source_traceback = None
+            self.mode = "live"
+            self._configure_data_source(source, self.room_name)
             self._refresh_dashboard()
 
         def _focus_seat(self, seat_no: int) -> None:
@@ -2627,11 +2755,12 @@ else:
 
 def parse_args() -> argparse.Namespace:
     project_root = Path(__file__).resolve().parents[1]
-    default_source = resolve_demo_source(project_root)
+    default_head_line_source = project_root / "data" / "1.10" / "clipleft" / "merged_output.mp4"
+    default_source = default_head_line_source if default_head_line_source.exists() else resolve_demo_source(project_root)
     default_layout = project_root / "detect" / "seats.json"
-    default_person_weights = project_root / "exam_seat_binding" / "weight" / "yolo11speopel.pt"
+    default_person_weights = project_root / "model" / "yolo26m" / "best2.pt"
     default_desk_weights = project_root / "exam_seat_binding" / "weight" / "yolo11desk.pt"
-    default_output_dir = project_root / "exam_seat_binding" / "output"
+    default_output_dir = project_root / "exam_seat_binding" / "output" / "head_line_binding1"
 
     parser = argparse.ArgumentParser(description="ExamWatchAI PyQt 检测巡检 UI")
     parser.add_argument(
@@ -2657,8 +2786,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weights", type=str, default=str(default_person_weights), help="人物模型权重")
     parser.add_argument("--desk-weights", type=str, default=str(default_desk_weights), help="桌子模型权重")
     parser.add_argument("--output", type=str, default=str(default_output_dir), help="真实检测输出目录")
+    parser.add_argument(
+        "--binding-strategy",
+        choices=["head_line", "v3"],
+        default="head_line",
+        help="真实检测绑定策略：head_line 使用人头-左下桌框策略，v3 使用旧版人桌绑定流水线",
+    )
     parser.add_argument("--pipeline-outputs", type=str, default="csv,json,zone_map", help="真实检测附带保存的输出")
-    parser.add_argument("--conf", type=float, default=0.18)
+    parser.add_argument("--conf", type=float, default=0.3)
     parser.add_argument("--iou", type=float, default=0.60)
     parser.add_argument("--desk-conf", type=float, default=0.70)
     parser.add_argument("--desk-iou", type=float, default=0.45)
@@ -2672,7 +2807,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--desk-required-per-col", type=int, default=6)
     parser.add_argument("--reference-max-frames", type=int, default=120)
     parser.add_argument("--reference-sample-step", type=int, default=5)
-    parser.add_argument("--desk-reference-seconds", type=float, default=0.0,
+    parser.add_argument("--desk-reference-seconds", type=float, default=30.0,
                         help="只用视频开头 N 秒建立固定桌子模型；>0 时人绑定从 N 秒之后开始")
     parser.add_argument("--first-extend", type=float, default=0.6)
     parser.add_argument("--last-extend", type=float, default=1.2)
@@ -2710,6 +2845,7 @@ def main() -> None:
         person_weights=args.weights,
         desk_weights=args.desk_weights,
         output_dir=args.output,
+        binding_strategy=args.binding_strategy,
         person_conf=args.conf,
         person_iou=args.iou,
         desk_conf=args.desk_conf,

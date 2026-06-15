@@ -2532,6 +2532,11 @@ def run(args):
         raise FileNotFoundError(f"Desk weights not found: {args.desk_weights}")
 
     os.makedirs(args.output, exist_ok=True)
+    layout_callback = getattr(args, "layout_callback", None)
+    frame_callback = getattr(args, "frame_callback", None)
+    finish_callback = getattr(args, "finish_callback", None)
+    callback_stride = max(1, int(getattr(args, "frame_callback_stride", 1) or 1))
+    callback_max_width = int(getattr(args, "frame_callback_max_width", 0) or 0)
     video_name = Path(args.source).stem
     output_video = os.path.join(args.output, f"head_line_bound_{video_name}.mp4")
     output_csv = os.path.join(args.output, f"head_line_bound_{video_name}.csv")
@@ -2563,6 +2568,28 @@ def run(args):
     print(f"Desk layout frame: {reference['frame_idx']}")
     print(f"Desks: {len(desks)}, column lines: {len(column_lines)}")
     print(f"Layout preview: {layout_preview}")
+    if callable(layout_callback):
+        layout_callback(
+            {
+                "zones": [
+                    {
+                        "desk_no": int(z["desk_no"]),
+                        "desk_id": z["desk_id"],
+                        "column_index": int(z["column_index"]),
+                        "row_index": int(z["row_index"]),
+                        "desk_xyxy": z["desk_xyxy"],
+                        "polygon": np.asarray(z["polygon"]).astype(float).tolist(),
+                        "display_polygon": (
+                            np.asarray(z["display_polygon"]).astype(float).tolist()
+                            if z.get("display_polygon") is not None else None
+                        ),
+                    }
+                    for z in zones
+                ],
+                "frame_width": int(reference["frame"].shape[1]),
+                "frame_height": int(reference["frame"].shape[0]),
+            }
+        )
 
     assigner = HeadLineSeatAssigner(zones=zones, column_lines=column_lines)
     tune_head_line_assigner(
@@ -2918,6 +2945,7 @@ def run(args):
                 assignments = {}
             assignments.update(locked_assignments)
 
+            frame_rows = []
             for person in head_people:
                 tid = int(person["track_id"])
                 det = head_dets[tid]
@@ -3061,61 +3089,61 @@ def run(args):
                 )
                 draw_label(annotated, label, x1, max(0, y1 - 8), color)
 
-                csv_writer.writerow(
-                    {
-                        "frame_idx": frame_idx,
-                        "timestamp": round(frame_idx / fps, 3),
-                        "track_id": stable_track_id,
-                        "student_id": stable_track_id,
-                        "track_id_raw": tid,
-                        "cls": int(det["cls"]),
-                        "class_name": det["class_name"],
-                        "conf": round(float(det["conf"]), 5),
-                        "head_x1": round(x1, 2),
-                        "head_y1": round(y1, 2),
-                        "head_x2": round(x2, 2),
-                        "head_y2": round(y2, 2),
-                        "head_cx": round((x1 + x2) / 2.0, 2),
-                        "head_cy": round((y1 + y2) / 2.0, 2),
-                        "anchor_x": round(float(anchor[0]), 2),
-                        "anchor_y": round(float(anchor[1]), 2),
-                        "seat_no_current": current_seat,
-                        "seat_no_display": int(display_seat) if display_seat is not None else None,
-                        "desk_id_current": assignment["desk_id"] if assignment else None,
-                        "col_idx": assignment["col_idx"] if assignment else None,
-                        "row_idx": assignment["row_idx"] if assignment else None,
-                        "role": "student" if display_seat is not None else "candidate",
-                        "inside_student_area": bool(inside_student_area),
-                        "pending_seat_no": seat_debug.get("pending_seat_no"),
-                        "pending_count": seat_debug.get("pending_count"),
-                        "evidence_vote_ratio": round(float(seat_debug.get("evidence_vote_ratio", 0.0)), 4),
-                        "release_count": seat_debug.get("release_count"),
-                        "large_move_count": seat_debug.get("large_move_count"),
-                        "soft_unmatched_count": seat_debug.get("soft_unmatched_count"),
-                        "release_evidence": release_evidence,
-                        "allow_occupied_takeover": allow_occupied_takeover,
-                        "motion_state": motion_info.get("motion_state"),
-                        "motion_can_bind": bool(motion_info.get("can_bind", False)),
-                        "motion_bind_cooldown": bool(motion_info.get("motion_bind_cooldown", False)),
-                        "motion_stationary_count": motion_info.get("stationary_count"),
-                        "motion_moving_count": motion_info.get("moving_count"),
-                        "motion_net_distance": round(float(motion_info.get("motion_net_distance", 0.0)), 4),
-                        "motion_speed": round(float(motion_info.get("motion_speed", 0.0)), 4),
-                        "teacher_like": bool(is_teacher_like),
-                        "binding_method": assignment.get("binding_method") if assignment else None,
-                        "head_line_distance": assignment.get("head_line_distance") if assignment else None,
-                        "head_depth_gap": assignment.get("head_depth_gap") if assignment else None,
-                        "depth_prior_head": (
-                            assignment.get("depth_prior_head")
-                            if assignment else head_depth_by_tid.get(int(tid))
-                        ),
-                        "depth_prior_seat": assignment.get("depth_prior_seat") if assignment else None,
-                        "depth_prior_diff": assignment.get("depth_prior_diff") if assignment else None,
-                        "depth_prior_frame": latest_depth_frame if depth_norm is not None else None,
-                        "body_seat_overlap": assignment.get("body_seat_overlap") if assignment else None,
-                        "cost": assignment.get("cost") if assignment else None,
-                    }
-                )
+                row_data = {
+                    "frame_idx": frame_idx,
+                    "timestamp": round(frame_idx / fps, 3),
+                    "track_id": stable_track_id,
+                    "student_id": stable_track_id,
+                    "track_id_raw": tid,
+                    "cls": int(det["cls"]),
+                    "class_name": det["class_name"],
+                    "conf": round(float(det["conf"]), 5),
+                    "head_x1": round(x1, 2),
+                    "head_y1": round(y1, 2),
+                    "head_x2": round(x2, 2),
+                    "head_y2": round(y2, 2),
+                    "head_cx": round((x1 + x2) / 2.0, 2),
+                    "head_cy": round((y1 + y2) / 2.0, 2),
+                    "anchor_x": round(float(anchor[0]), 2),
+                    "anchor_y": round(float(anchor[1]), 2),
+                    "seat_no_current": current_seat,
+                    "seat_no_display": int(display_seat) if display_seat is not None else None,
+                    "desk_id_current": assignment["desk_id"] if assignment else None,
+                    "col_idx": assignment["col_idx"] if assignment else None,
+                    "row_idx": assignment["row_idx"] if assignment else None,
+                    "role": "student" if display_seat is not None else "candidate",
+                    "inside_student_area": bool(inside_student_area),
+                    "pending_seat_no": seat_debug.get("pending_seat_no"),
+                    "pending_count": seat_debug.get("pending_count"),
+                    "evidence_vote_ratio": round(float(seat_debug.get("evidence_vote_ratio", 0.0)), 4),
+                    "release_count": seat_debug.get("release_count"),
+                    "large_move_count": seat_debug.get("large_move_count"),
+                    "soft_unmatched_count": seat_debug.get("soft_unmatched_count"),
+                    "release_evidence": release_evidence,
+                    "allow_occupied_takeover": allow_occupied_takeover,
+                    "motion_state": motion_info.get("motion_state"),
+                    "motion_can_bind": bool(motion_info.get("can_bind", False)),
+                    "motion_bind_cooldown": bool(motion_info.get("motion_bind_cooldown", False)),
+                    "motion_stationary_count": motion_info.get("stationary_count"),
+                    "motion_moving_count": motion_info.get("moving_count"),
+                    "motion_net_distance": round(float(motion_info.get("motion_net_distance", 0.0)), 4),
+                    "motion_speed": round(float(motion_info.get("motion_speed", 0.0)), 4),
+                    "teacher_like": bool(is_teacher_like),
+                    "binding_method": assignment.get("binding_method") if assignment else None,
+                    "head_line_distance": assignment.get("head_line_distance") if assignment else None,
+                    "head_depth_gap": assignment.get("head_depth_gap") if assignment else None,
+                    "depth_prior_head": (
+                        assignment.get("depth_prior_head")
+                        if assignment else head_depth_by_tid.get(int(tid))
+                    ),
+                    "depth_prior_seat": assignment.get("depth_prior_seat") if assignment else None,
+                    "depth_prior_diff": assignment.get("depth_prior_diff") if assignment else None,
+                    "depth_prior_frame": latest_depth_frame if depth_norm is not None else None,
+                    "body_seat_overlap": assignment.get("body_seat_overlap") if assignment else None,
+                    "cost": assignment.get("cost") if assignment else None,
+                }
+                csv_writer.writerow(row_data)
+                frame_rows.append(row_data)
 
             cv2.putText(
                 annotated,
@@ -3127,6 +3155,38 @@ def run(args):
                 2,
                 cv2.LINE_AA,
             )
+
+            if callable(frame_callback) and frame_idx % callback_stride == 0:
+                callback_frame = annotated
+                callback_raw = frame
+                if callback_max_width > 0 and width > callback_max_width:
+                    scale = float(callback_max_width) / float(width)
+                    callback_size = (
+                        int(round(width * scale)),
+                        int(round(height * scale)),
+                    )
+                    callback_frame = cv2.resize(annotated, callback_size, interpolation=cv2.INTER_AREA)
+                    callback_raw = cv2.resize(frame, callback_size, interpolation=cv2.INTER_AREA)
+                frame_callback(
+                    {
+                        "frame_bgr": callback_frame.copy(),
+                        "frame_bgr_raw": callback_raw.copy(),
+                        "frame_idx": int(frame_idx),
+                        "frame_width": int(width),
+                        "frame_height": int(height),
+                        "fps": float(fps),
+                        "total_frames": int(total_frames),
+                        "rows": list(frame_rows),
+                        "student_count": sum(1 for row in frame_rows if row.get("seat_no_display") is not None),
+                        "teacher_count": sum(1 for row in frame_rows if row.get("teacher_like")),
+                        "unknown_count": sum(
+                            1
+                            for row in frame_rows
+                            if row.get("seat_no_display") is None
+                            and row.get("seat_no_current") is not None
+                        ),
+                    }
+                )
 
             if writer is not None:
                 writer.write(annotated)
@@ -3295,6 +3355,21 @@ def run(args):
     }
     with open(output_json, "w", encoding="utf-8") as fp:
         json.dump(payload, fp, ensure_ascii=False, indent=2)
+
+    if callable(finish_callback):
+        finish_callback(
+            {
+                "saved_outputs": {
+                    "csv": output_csv,
+                    "json": output_json,
+                    "binding_video": output_video if writer is not None else None,
+                    "layout_preview": layout_preview,
+                },
+                "tracks": tracks,
+                "seat_track_bindings": seat_bindings,
+                "processed_frames": int(frame_idx),
+            }
+        )
 
     print(f"Done. Video: {output_video if writer is not None else '(disabled)'}")
     print(f"CSV: {output_csv}")
