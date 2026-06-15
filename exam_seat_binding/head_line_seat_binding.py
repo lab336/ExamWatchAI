@@ -13,6 +13,8 @@ python exam_seat_binding/head_line_seat_binding.py \
   --weights model/yolo26m/best2.pt \
   --desk-reference-seconds 30 \
   --output exam_seat_binding/output/head_line_binding2
+
+  python exam_seat_binding/head_line_seat_binding.py   --source data/1.10/clipleft/merged_output.mp4   --weights model/yolo26m/best2.pt   --desk-reference-seconds 30   --output exam_seat_binding/output/head_line_binding113
 """
 
 import argparse
@@ -2010,9 +2012,11 @@ class EvidenceSeatManager:
         fps: float,
         initial_bind_seconds: float = 3.0,
         switch_seconds: float = 6.0,
+        switch_release_seconds: float = 3.0,
         release_seconds: float = 8.0,
         miss_hold_seconds: float = 12.0,
         reacquire_seconds: float = 1.0,
+        initial_fast_bind_seconds: float = 0.2,
         large_move_release_seconds: float | None = None,
         evidence_vote_window_seconds: float = 2.5,
         initial_vote_ratio: float = 0.65,
@@ -2021,9 +2025,11 @@ class EvidenceSeatManager:
         self.fps = max(1.0, float(fps))
         self.initial_confirm_frames = max(1, int(round(float(initial_bind_seconds) * self.fps)))
         self.switch_confirm_frames = max(1, int(round(float(switch_seconds) * self.fps)))
+        self.switch_release_frames = max(1, int(round(float(switch_release_seconds) * self.fps)))
         self.release_confirm_frames = max(1, int(round(float(release_seconds) * self.fps)))
         self.miss_hold_frames = max(self.release_confirm_frames, int(round(float(miss_hold_seconds) * self.fps)))
         self.reacquire_confirm_frames = max(1, int(round(float(reacquire_seconds) * self.fps)))
+        self.initial_fast_confirm_frames = max(1, int(round(float(initial_fast_bind_seconds) * self.fps)))
         self.evidence_vote_window_frames = max(
             self.initial_confirm_frames,
             int(round(float(evidence_vote_window_seconds) * self.fps)),
@@ -2168,6 +2174,7 @@ class EvidenceSeatManager:
         proposed_seat_no: int | None,
         release_evidence: str | None = None,
         allow_occupied_takeover: bool = False,
+        fast_initial_confirm: bool = False,
     ):
         tid = int(track_id)
         self.cleanup(frame_idx)
@@ -2209,11 +2216,15 @@ class EvidenceSeatManager:
                 if best_seat in self.ever_bound_seats
                 else self.initial_confirm_frames
             )
+            if fast_initial_confirm and best_seat == proposed:
+                required = min(required, self.initial_fast_confirm_frames)
             required_ratio = (
                 min(self.initial_vote_ratio, 0.55)
                 if best_seat in self.ever_bound_seats
                 else self.initial_vote_ratio
             )
+            if fast_initial_confirm and best_seat == proposed:
+                required_ratio = min(required_ratio, 0.55)
             if count >= required and vote_ratio >= required_ratio:
                 self._bind(tid, best_seat, frame_idx)
                 return best_seat
@@ -2248,8 +2259,16 @@ class EvidenceSeatManager:
             self._clear_votes(tid)
             return int(current_seat)
 
-        st["release_count"] = 0
-        st["large_move_count"] = 0
+        if release_evidence != "large_move":
+            st["release_count"] = 0
+            st["large_move_count"] = 0
+            st["soft_unmatched_count"] += 1
+            self._clear_pending(tid)
+            self._clear_votes(tid)
+            return int(current_seat)
+
+        st["large_move_count"] += 1
+        st["release_count"] = st["large_move_count"]
         st["soft_unmatched_count"] = 0
         best_seat, count, vote_ratio = self._push_vote(
             tid,
@@ -2257,14 +2276,12 @@ class EvidenceSeatManager:
             proposed,
             window_frames=self.switch_vote_window_frames,
         )
-        if best_seat == int(current_seat):
-            self._clear_pending(tid)
-            self._clear_votes(tid)
-            return int(current_seat)
-        if not self._seat_is_available(best_seat, tid, frame_idx):
-            self._clear_pending(tid)
-            return int(current_seat)
-        if count >= self.switch_confirm_frames and vote_ratio >= self.switch_vote_ratio:
+        if (
+            best_seat == proposed
+            and count >= max(self.switch_confirm_frames, self.switch_release_frames)
+            and vote_ratio >= self.switch_vote_ratio
+            and self._seat_is_available(best_seat, tid, frame_idx)
+        ):
             self._bind(tid, best_seat, frame_idx)
             return best_seat
         return int(current_seat)
@@ -2603,9 +2620,11 @@ def run(args):
         fps=fps,
         initial_bind_seconds=args.initial_bind_seconds,
         switch_seconds=args.switch_seconds,
+        switch_release_seconds=args.switch_release_seconds,
         release_seconds=args.release_seconds,
         miss_hold_seconds=args.miss_hold_seconds,
         reacquire_seconds=args.reacquire_seconds,
+        initial_fast_bind_seconds=args.initial_fast_bind_seconds,
         large_move_release_seconds=args.large_move_release_seconds,
         evidence_vote_window_seconds=args.evidence_vote_window_seconds,
         initial_vote_ratio=args.initial_vote_ratio,
@@ -2970,7 +2989,7 @@ def run(args):
                         allow_occupied_takeover = True
                 current_seat = int(assignment["desk_no"]) if assignment else None
                 release_evidence = (
-                    "large_move" if tid in large_move_track_ids and current_seat is None else None
+                    "large_move" if tid in large_move_track_ids else None
                 )
                 display_seat = (
                     seat_manager.update(
@@ -2979,6 +2998,13 @@ def run(args):
                         current_seat,
                         release_evidence=release_evidence,
                         allow_occupied_takeover=allow_occupied_takeover,
+                        fast_initial_confirm=bool(
+                            assignment
+                            and assignment.get("binding_method") in {
+                                "head_left_down_desk_column_order",
+                                "head_left_down_desk_detection",
+                            }
+                        ),
                     )
                     if frame_idx >= bind_start_frame
                     else None
@@ -3233,7 +3259,9 @@ def run(args):
         "large_move_depth_scale": float(args.large_move_depth_scale),
         "large_move_center_scale": float(args.large_move_center_scale),
         "initial_bind_seconds": float(args.initial_bind_seconds),
+        "initial_fast_bind_seconds": float(args.initial_fast_bind_seconds),
         "switch_seconds": float(args.switch_seconds),
+        "switch_release_seconds": float(args.switch_release_seconds),
         "release_seconds": float(args.release_seconds),
         "large_move_release_seconds": float(args.large_move_release_seconds),
         "miss_hold_seconds": float(args.miss_hold_seconds),
@@ -3677,7 +3705,19 @@ def build_arg_parser():
     p.add_argument("--large-move-center-scale", type=float, default=3.0)
 
     p.add_argument("--initial-bind-seconds", type=float, default=1.0)
+    p.add_argument(
+        "--initial-fast-bind-seconds",
+        type=float,
+        default=0.2,
+        help="Fast confirmation time for strong initial desk-order/head-left-down candidates",
+    )
     p.add_argument("--switch-seconds", type=float, default=10.0)
+    p.add_argument(
+        "--switch-release-seconds",
+        type=float,
+        default=3.0,
+        help="Large-move evidence required before a confirmed track may switch to another seat",
+    )
     p.add_argument("--release-seconds", type=float, default=8.0)
     p.add_argument(
         "--large-move-release-seconds",
@@ -3685,7 +3725,7 @@ def build_arg_parser():
         default=30.0,
         help="Seconds of continuous large movement required before releasing a confirmed binding",
     )
-    p.add_argument("--miss-hold-seconds", type=float, default=60.0)
+    p.add_argument("--miss-hold-seconds", type=float, default=300.0)
     p.add_argument("--reacquire-seconds", type=float, default=1.0)
     p.add_argument(
         "--evidence-vote-window-seconds",
@@ -3702,7 +3742,7 @@ def build_arg_parser():
     p.add_argument(
         "--switch-vote-ratio",
         type=float,
-        default=0.80,
+        default=0.95,
         help="Minimum dominant-seat vote ratio required before switching a confirmed seat",
     )
 
