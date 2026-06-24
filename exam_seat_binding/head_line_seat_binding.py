@@ -1696,6 +1696,82 @@ class HeadLineSeatAssigner:
         assignment["bound_sticky_depth_limit"] = round(float(depth_limit), 4)
         return ok, assignment
 
+    def is_head_box_matched_to_seat(
+        self,
+        seat_no: int,
+        head_xyxy,
+        head_anchor,
+        max_right_offset: float = 80.0,
+        max_up_offset: float = 50.0,
+        max_box_distance: float = 0.0,
+    ) -> tuple[bool, dict | None]:
+        assignment = self.assignment_for_seat(-1, seat_no, head_anchor, method="switch_head_box_match")
+        if assignment is None:
+            return False, None
+
+        zone = None
+        for candidate in self.zones_by_col.get(int(assignment["col_idx"]), []):
+            if int(candidate["desk_no"]) == int(seat_no):
+                zone = candidate
+                break
+        if zone is None:
+            return False, assignment
+
+        all_zones = [
+            item
+            for col_zones in self.zones_by_col.values()
+            for item in col_zones
+        ]
+        desk_widths = []
+        desk_heights = []
+        for item in all_zones:
+            dx1, dy1, dx2, dy2 = [float(v) for v in item["desk_xyxy"]]
+            desk_widths.append(max(1.0, dx2 - dx1))
+            desk_heights.append(max(1.0, dy2 - dy1))
+        median_w = float(np.median(desk_widths)) if desk_widths else 100.0
+        median_h = float(np.median(desk_heights)) if desk_heights else 70.0
+        box_distance_limit = (
+            float(max_box_distance)
+            if float(max_box_distance) > 0
+            else max(120.0, float(np.hypot(median_w, median_h)) * 1.8)
+        )
+
+        hx1, hy1, hx2, hy2 = [float(v) for v in head_xyxy]
+        hx, hy = [float(v) for v in head_anchor]
+        dx1, dy1, dx2, dy2 = [float(v) for v in zone["desk_xyxy"]]
+        dcx, dcy = [float(v) for v in zone["desk_center"]]
+
+        right_violation = max(0.0, dcx - hx - float(max_right_offset))
+        up_violation = max(0.0, hy - dcy - float(max_up_offset))
+        box_dist = point_xyxy_distance(head_anchor, zone["desk_xyxy"])
+        desk_right_gap = max(0.0, dx1 - hx2 - float(max_right_offset))
+        desk_above_gap = max(0.0, hy1 - dy2 - float(max_up_offset))
+        vertical_gap = max(0.0, dy1 - hy2)
+        horizontal_overlap = max(0.0, min(hx2, dx2) - max(hx1, dx1))
+        overlap_ratio = horizontal_overlap / max(1.0, min(hx2 - hx1, dx2 - dx1))
+
+        ok = (
+            right_violation <= median_w * 0.30
+            and up_violation <= median_h * 0.45
+            and desk_right_gap <= median_w * 0.35
+            and desk_above_gap <= median_h * 0.40
+            and box_dist <= box_distance_limit
+            and (
+                overlap_ratio >= 0.05
+                or abs(dcx - hx) <= median_w * 1.25
+            )
+        )
+        assignment["switch_match_right_violation"] = round(float(right_violation), 4)
+        assignment["switch_match_up_violation"] = round(float(up_violation), 4)
+        assignment["switch_match_box_distance"] = round(float(box_dist), 4)
+        assignment["switch_match_box_distance_limit"] = round(float(box_distance_limit), 4)
+        assignment["switch_match_desk_right_gap"] = round(float(desk_right_gap), 4)
+        assignment["switch_match_desk_above_gap"] = round(float(desk_above_gap), 4)
+        assignment["switch_match_vertical_gap"] = round(float(vertical_gap), 4)
+        assignment["switch_match_horizontal_overlap_ratio"] = round(float(overlap_ratio), 6)
+        assignment["switch_match_ok"] = bool(ok)
+        return ok, assignment
+
     def is_anchor_closest_to_seat(
         self,
         seat_no: int,
@@ -2732,6 +2808,14 @@ def run(args):
             "motion_speed",
             "teacher_like",
             "binding_method",
+            "switch_match_ok",
+            "switch_match_right_violation",
+            "switch_match_up_violation",
+            "switch_match_box_distance",
+            "switch_match_box_distance_limit",
+            "switch_match_desk_right_gap",
+            "switch_match_desk_above_gap",
+            "switch_match_horizontal_overlap_ratio",
             "head_line_distance",
             "head_depth_gap",
             "depth_prior_head",
@@ -3040,6 +3124,28 @@ def run(args):
                 release_evidence = (
                     "large_move" if tid in large_move_track_ids else None
                 )
+                if (
+                    bound_seat is not None
+                    and current_seat is not None
+                    and int(current_seat) != int(bound_seat)
+                    and release_evidence == "large_move"
+                ):
+                    switch_match_ok, switch_match_assignment = assigner.is_head_box_matched_to_seat(
+                        int(current_seat),
+                        det["xyxy"],
+                        anchor,
+                        max_right_offset=args.switch_match_max_right_offset,
+                        max_up_offset=args.switch_match_max_up_offset,
+                        max_box_distance=args.switch_match_max_box_distance,
+                    )
+                    if switch_match_assignment is not None and assignment is not None:
+                        for key, value in switch_match_assignment.items():
+                            if key.startswith("switch_match_"):
+                                assignment[key] = value
+                    if not switch_match_ok:
+                        if assignment is not None:
+                            assignment["binding_method"] = "switch_rejected_head_box_mismatch"
+                        current_seat = None
                 display_seat = (
                     seat_manager.update(
                         tid,
@@ -3151,6 +3257,28 @@ def run(args):
                     "motion_speed": round(float(motion_info.get("motion_speed", 0.0)), 4),
                     "teacher_like": bool(is_teacher_like),
                     "binding_method": assignment.get("binding_method") if assignment else None,
+                    "switch_match_ok": assignment.get("switch_match_ok") if assignment else None,
+                    "switch_match_right_violation": (
+                        assignment.get("switch_match_right_violation") if assignment else None
+                    ),
+                    "switch_match_up_violation": (
+                        assignment.get("switch_match_up_violation") if assignment else None
+                    ),
+                    "switch_match_box_distance": (
+                        assignment.get("switch_match_box_distance") if assignment else None
+                    ),
+                    "switch_match_box_distance_limit": (
+                        assignment.get("switch_match_box_distance_limit") if assignment else None
+                    ),
+                    "switch_match_desk_right_gap": (
+                        assignment.get("switch_match_desk_right_gap") if assignment else None
+                    ),
+                    "switch_match_desk_above_gap": (
+                        assignment.get("switch_match_desk_above_gap") if assignment else None
+                    ),
+                    "switch_match_horizontal_overlap_ratio": (
+                        assignment.get("switch_match_horizontal_overlap_ratio") if assignment else None
+                    ),
                     "head_line_distance": assignment.get("head_line_distance") if assignment else None,
                     "head_depth_gap": assignment.get("head_depth_gap") if assignment else None,
                     "depth_prior_head": (
@@ -3349,6 +3477,9 @@ def run(args):
         "evidence_vote_window_seconds": float(args.evidence_vote_window_seconds),
         "initial_vote_ratio": float(args.initial_vote_ratio),
         "switch_vote_ratio": float(args.switch_vote_ratio),
+        "switch_match_max_right_offset": float(args.switch_match_max_right_offset),
+        "switch_match_max_up_offset": float(args.switch_match_max_up_offset),
+        "switch_match_max_box_distance": float(args.switch_match_max_box_distance),
         "layout_preview": layout_preview,
         "output_video": output_video if writer is not None else None,
         "output_csv": output_csv,
@@ -3840,6 +3971,24 @@ def build_arg_parser():
         type=float,
         default=0.95,
         help="Minimum dominant-seat vote ratio required before switching a confirmed seat",
+    )
+    p.add_argument(
+        "--switch-match-max-right-offset",
+        type=float,
+        default=80.0,
+        help="When switching seats, the target desk center may be this many pixels to the right of the head anchor",
+    )
+    p.add_argument(
+        "--switch-match-max-up-offset",
+        type=float,
+        default=50.0,
+        help="When switching seats, the target desk center may be this many pixels above the head anchor",
+    )
+    p.add_argument(
+        "--switch-match-max-box-distance",
+        type=float,
+        default=0.0,
+        help="When switching seats, maximum head-anchor to target desk-box distance; 0 uses an automatic desk-size based limit",
     )
 
     p.add_argument("--draw-layout", action=argparse.BooleanOptionalAction, default=True)
