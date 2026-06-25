@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 QT_AVAILABLE = False
 QT_IMPORT_ERROR = None
 try:
-    from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
+    from PyQt6.QtCore import QEvent, QRectF, Qt, QTimer, pyqtSignal
     from PyQt6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter, QPen, QPixmap
     from PyQt6.QtWidgets import (
         QApplication,
@@ -38,6 +38,7 @@ try:
         QLineEdit,
         QMainWindow,
         QPushButton,
+        QSizeGrip,
         QSizePolicy,
         QSplitter,
         QSlider,
@@ -50,10 +51,10 @@ try:
 except Exception as exc:  # pragma: no cover - optional dependency
     QT_IMPORT_ERROR = exc
 
-try:
-    import imageio.v2 as imageio
-except Exception:  # pragma: no cover - optional dependency
-    imageio = None
+# try:
+#     import imageio.v2 as imageio
+# except Exception:  # pragma: no cover - optional dependency
+#     imageio = None
 
 try:
     import cv2
@@ -1504,6 +1505,93 @@ if QT_AVAILABLE:
             painter.end()
 
 
+    class AppTitleBar(QFrame):
+        def __init__(self, title: str, font_families: list[str]):
+            super().__init__()
+            self.setObjectName("appTitleBar")
+            self.setFixedHeight(58)
+            self._drag_offset = None
+
+            layout = QHBoxLayout(self)
+            layout.setContentsMargins(18, 0, 16, 0)
+            layout.setSpacing(12)
+
+            logo = QLabel("EW")
+            logo.setObjectName("appLogo")
+            logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            logo.setFixedSize(40, 40)
+            logo.setFont(build_qt_font(13, bold=True, families=font_families))
+            layout.addWidget(logo)
+
+            title_label = QLabel(title)
+            title_label.setObjectName("appTitle")
+            title_label.setFont(build_qt_font(16, bold=True, families=font_families))
+            layout.addWidget(title_label)
+            layout.addStretch(1)
+
+            self.min_button = self._window_button("-", self._minimize)
+            self.max_button = self._window_button("[]", self._toggle_max_restore)
+            self.close_button = self._window_button("X", self._close)
+            self.close_button.setProperty("windowRole", "close")
+
+            layout.addWidget(self.min_button)
+            layout.addWidget(self.max_button)
+            layout.addWidget(self.close_button)
+
+        def _window_button(self, text: str, callback) -> QPushButton:
+            button = QPushButton(text)
+            button.setObjectName("windowButton")
+            button.setFixedSize(34, 30)
+            button.clicked.connect(callback)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            return button
+
+        def _minimize(self) -> None:
+            self.window().showMinimized()
+
+        def _toggle_max_restore(self) -> None:
+            window = self.window()
+            if window.isMaximized():
+                window.showNormal()
+                self.max_button.setText("[]")
+            else:
+                window.showMaximized()
+                self.max_button.setText("<>")
+
+        def _close(self) -> None:
+            self.window().close()
+
+        def mousePressEvent(self, event) -> None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._drag_offset = event.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
+                event.accept()
+                return
+            super().mousePressEvent(event)
+
+        def mouseMoveEvent(self, event) -> None:
+            if (
+                self._drag_offset is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+                and not self.window().isMaximized()
+                and not self.window().isFullScreen()
+            ):
+                self.window().move(event.globalPosition().toPoint() - self._drag_offset)
+                event.accept()
+                return
+            super().mouseMoveEvent(event)
+
+        def mouseReleaseEvent(self, event) -> None:
+            self._drag_offset = None
+            super().mouseReleaseEvent(event)
+
+        def mouseDoubleClickEvent(self, event) -> None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._toggle_max_restore()
+                event.accept()
+                return
+            super().mouseDoubleClickEvent(event)
+
+
     class DetectionDashboard(QMainWindow):
         def __init__(
             self,
@@ -1516,6 +1604,7 @@ if QT_AVAILABLE:
         ):
             super().__init__()
             self.setWindowTitle("ExamWatchAI 检测巡检界面")
+            self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
             self.resize(1680, 960)
             self.setMinimumSize(1180, 760)
 
@@ -1548,6 +1637,13 @@ if QT_AVAILABLE:
             self.replay_rows_by_frame: dict[int, list[dict[str, Any]]] = {}
             self.slider_is_scrubbing = False
             self.live_buffer_target = 3
+            self.control_sidebar_expanded = True
+            self.control_sidebar_last_width = 340
+            self.playback_frame_accumulator = 0.0
+            self.resize_edge_margin = 8
+            self.resize_edges: tuple[bool, bool, bool, bool] | None = None
+            self.resize_start_pos = None
+            self.resize_start_geometry = None
 
             self.seats, self.layout_base_size = load_seat_layout(
                 Path(layout_path) if layout_path else None
@@ -1583,6 +1679,10 @@ if QT_AVAILABLE:
 
             self._configure_window_style()
             self._build_layout()
+            self.setMouseTracking(True)
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
             self._configure_data_source(source, room_name)
             self._refresh_dashboard()
 
@@ -1625,6 +1725,37 @@ if QT_AVAILABLE:
                     background: {APP_BG};
                     color: {TEXT_PRIMARY};
                     font-family: {self.ui_font_stack};
+                }}
+                QFrame#appTitleBar {{
+                    background: #0D1320;
+                    border-bottom: 1px solid rgba(94, 181, 255, 0.28);
+                }}
+                QLabel#appLogo {{
+                    background: #111B2D;
+                    color: #7BC8FF;
+                    border: 2px solid #0EA5E9;
+                    border-radius: 9px;
+                }}
+                QLabel#appTitle {{
+                    color: #F8FBFF;
+                    background: transparent;
+                    letter-spacing: 0px;
+                }}
+                QPushButton#windowButton {{
+                    background: transparent;
+                    color: #AAB3D6;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 0;
+                    font-weight: 700;
+                }}
+                QPushButton#windowButton:hover {{
+                    background: rgba(94, 181, 255, 0.16);
+                    color: {TEXT_PRIMARY};
+                }}
+                QPushButton#windowButton[windowRole="close"]:hover {{
+                    background: #FF5E62;
+                    color: #FFFFFF;
                 }}
                 QFrame#panel {{
                     background: {PANEL_BG};
@@ -1789,9 +1920,61 @@ if QT_AVAILABLE:
         def _build_layout(self) -> None:
             central = QWidget()
             self.setCentralWidget(central)
-            shell = QVBoxLayout(central)
+            root_layout = QVBoxLayout(central)
+            root_layout.setContentsMargins(0, 0, 0, 0)
+            root_layout.setSpacing(0)
+
+            self.app_title_bar = AppTitleBar("ExamWatchAI 检测巡检界面", self.ui_font_families)
+            root_layout.addWidget(self.app_title_bar)
+
+            content_widget = QWidget()
+            shell = QHBoxLayout(content_widget)
             shell.setContentsMargins(18, 18, 18, 18)
             shell.setSpacing(12)
+            root_layout.addWidget(content_widget, 1)
+
+            self.main_shell_splitter = QSplitter(Qt.Orientation.Horizontal)
+            self.main_shell_splitter.setChildrenCollapsible(False)
+            self.main_shell_splitter.setHandleWidth(10)
+            shell.addWidget(self.main_shell_splitter)
+
+            self.control_sidebar = QFrame()
+            self.control_sidebar.setObjectName("panel")
+            self.control_sidebar.setMinimumWidth(260)
+            self.control_sidebar.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Expanding,
+            )
+            sidebar_outer = QVBoxLayout(self.control_sidebar)
+            sidebar_outer.setContentsMargins(14, 14, 14, 14)
+            sidebar_outer.setSpacing(12)
+
+            sidebar_header = QHBoxLayout()
+            sidebar_header.setSpacing(8)
+            self.sidebar_title_label = QLabel("控制台")
+            self.sidebar_title_label.setObjectName("panelTitle")
+            self.sidebar_title_label.setFont(build_qt_font(13, bold=True, families=self.ui_font_families))
+            sidebar_header.addWidget(self.sidebar_title_label, 1)
+            self.sidebar_toggle_button = self._make_button("收起", self._toggle_control_sidebar)
+            sidebar_header.addWidget(self.sidebar_toggle_button)
+            sidebar_outer.addLayout(sidebar_header)
+
+            self.sidebar_content = QWidget()
+            control_layout = QVBoxLayout(self.sidebar_content)
+            control_layout.setContentsMargins(0, 0, 0, 0)
+            control_layout.setSpacing(12)
+            sidebar_outer.addWidget(self.sidebar_content, 1)
+            sidebar_outer.addStretch(1)
+            self.main_shell_splitter.addWidget(self.control_sidebar)
+
+            workspace_container = QWidget()
+            workspace_layout = QVBoxLayout(workspace_container)
+            workspace_layout.setContentsMargins(0, 0, 0, 0)
+            workspace_layout.setSpacing(0)
+            self.main_shell_splitter.addWidget(workspace_container)
+            self.main_shell_splitter.setStretchFactor(0, 0)
+            self.main_shell_splitter.setStretchFactor(1, 1)
+            self.main_shell_splitter.setSizes([340, 1320])
 
             main_panel, main_body = self._create_panel("实时检测画面", "主监控 / 绑定框")
             seat_panel, seat_body = self._create_panel("座位态势图", "30席位状态总览")
@@ -1827,13 +2010,7 @@ if QT_AVAILABLE:
             self.left_column_splitter.setSizes([620, 340])
             self.right_column_splitter.setSizes([620, 340])
             self.workspace_splitter.setSizes([980, 640])
-            shell.addWidget(self.workspace_splitter, 1)
-
-            footer = QWidget()
-            footer_layout = QVBoxLayout(footer)
-            footer_layout.setContentsMargins(0, 2, 0, 0)
-            footer_layout.setSpacing(10)
-            shell.addWidget(footer)
+            workspace_layout.addWidget(self.workspace_splitter, 1)
 
             metrics_row = QHBoxLayout()
             metrics_row.setSpacing(10)
@@ -1918,79 +2095,78 @@ if QT_AVAILABLE:
             self.detail_text_label.setWordWrap(True)
             detail_body.addWidget(self.detail_text_label)
 
-            controls_row = QHBoxLayout()
-            controls_row.setSpacing(10)
-            footer_layout.addLayout(controls_row)
-
-            left_controls = QHBoxLayout()
-            left_controls.setSpacing(10)
-            right_controls = QHBoxLayout()
-            right_controls.setSpacing(10)
-            controls_row.addLayout(left_controls, 1)
-            controls_row.addLayout(right_controls)
-
+            playback_title = QLabel("播放控制")
+            playback_title.setObjectName("subtitle")
+            control_layout.addWidget(playback_title)
+            playback_bar = QGridLayout()
+            playback_bar.setHorizontalSpacing(8)
+            playback_bar.setVerticalSpacing(8)
             self.play_button = self._make_button("播放", self._resume_playback, primary=True)
-            left_controls.addWidget(self.play_button)
             self.pause_button = self._make_button("暂停", self._pause_playback)
-            left_controls.addWidget(self.pause_button)
             self.stop_button = self._make_button("停止", self._stop_playback)
-            left_controls.addWidget(self.stop_button)
-            left_controls.addWidget(self._make_button("复位界面", self._reset_dashboard))
-            left_controls.addWidget(self._make_button("清空记录", self._clear_records))
-            self.load_button = self._make_button("加载素材", self._load_source)
-            left_controls.addWidget(self.load_button)
+            playback_bar.addWidget(self.play_button, 0, 0)
+            playback_bar.addWidget(self.pause_button, 0, 1)
+            playback_bar.addWidget(self.stop_button, 1, 0)
+            playback_bar.addWidget(self._make_button("复位界面", self._reset_dashboard), 1, 1)
+            playback_bar.addWidget(self._make_button("清空记录", self._clear_records), 2, 0)
 
             speed_label = QLabel("播放速度")
             speed_label.setStyleSheet(f"color:{TEXT_SECONDARY};")
-            right_controls.addWidget(speed_label)
+            playback_bar.addWidget(speed_label, 3, 0)
             self.speed_combo = QComboBox()
             self.speed_combo.addItems(["0.5x", "0.75x", "1.0x", "1.25x", "1.5x"])
             self.speed_combo.setCurrentText("0.75x")
             self.speed_combo.currentTextChanged.connect(self._set_playback_speed)
-            right_controls.addWidget(self.speed_combo)
+            playback_bar.addWidget(self.speed_combo, 3, 1)
 
             locate_label = QLabel("定位座位")
             locate_label.setStyleSheet(f"color:{TEXT_SECONDARY};")
-            right_controls.addWidget(locate_label)
+            playback_bar.addWidget(locate_label, 4, 0)
             self.search_input = QLineEdit()
-            self.search_input.setFixedWidth(84)
             self.search_input.returnPressed.connect(self._focus_seat_from_input)
-            right_controls.addWidget(self.search_input)
-            right_controls.addWidget(self._make_button("定位", self._focus_seat_from_input))
-            right_controls.addWidget(self._make_button("全屏", self._toggle_fullscreen))
+            playback_bar.addWidget(self.search_input, 4, 1)
+            playback_bar.addWidget(self._make_button("定位", self._focus_seat_from_input), 5, 0)
+            playback_bar.addWidget(self._make_button("全屏", self._toggle_fullscreen), 5, 1)
+            control_layout.addLayout(playback_bar)
 
-            status_row = QHBoxLayout()
-            status_row.setSpacing(10)
-            footer_layout.addLayout(status_row)
-
+            status_title = QLabel("运行状态")
+            status_title.setObjectName("subtitle")
+            control_layout.addWidget(status_title)
             self.mode_chip_label = QLabel("等待启动")
             self.mode_chip_label.setObjectName("statusChip")
-            status_row.addWidget(self.mode_chip_label)
+            control_layout.addWidget(self.mode_chip_label)
 
             self.runtime_status_label = QLabel("检测线程尚未启动")
             self.runtime_status_label.setObjectName("statusText")
-            status_row.addWidget(self.runtime_status_label, 2)
+            self.runtime_status_label.setWordWrap(True)
+            control_layout.addWidget(self.runtime_status_label)
 
             self.progress_label = QLabel("等待巡检数据")
             self.progress_label.setObjectName("statusText")
-            status_row.addWidget(self.progress_label, 2)
+            self.progress_label.setWordWrap(True)
+            control_layout.addWidget(self.progress_label)
 
-            self.source_label = QLabel("")
-            self.source_label.setObjectName("statusText")
-            self.source_label.setWordWrap(True)
-            footer_layout.addWidget(self.source_label)
-
+            config_title = QLabel("检测配置")
+            config_title.setObjectName("subtitle")
+            control_layout.addWidget(config_title)
             config_grid = QGridLayout()
             config_grid.setHorizontalSpacing(8)
             config_grid.setVerticalSpacing(8)
-            footer_layout.addLayout(config_grid)
+            control_layout.addLayout(config_grid)
             self._build_live_config_controls(config_grid)
 
             self.error_label = QLabel("")
             self.error_label.setObjectName("errorText")
             self.error_label.setWordWrap(True)
             self.error_label.hide()
-            footer_layout.addWidget(self.error_label)
+            control_layout.addWidget(self.error_label)
+            control_layout.addStretch(1)
+
+            grip_row = QHBoxLayout()
+            grip_row.setContentsMargins(0, 0, 0, 0)
+            grip_row.addStretch(1)
+            grip_row.addWidget(QSizeGrip(self))
+            root_layout.addLayout(grip_row)
             self._update_playback_buttons()
 
         def _config_line_edit(self, text: str = "", width: int | None = None) -> QLineEdit:
@@ -2008,13 +2184,56 @@ if QT_AVAILABLE:
             self.video_input_edit = self._config_line_edit(source_text)
             self.output_input_edit = self._config_line_edit(output_text)
 
-            grid.addWidget(QLabel("检测视频"), 0, 0)
-            grid.addWidget(self.video_input_edit, 0, 1)
-            grid.addWidget(self._make_button("选择", self._browse_video), 0, 2)
-            grid.addWidget(QLabel("输出目录"), 0, 3)
-            grid.addWidget(self.output_input_edit, 0, 4)
-            grid.addWidget(self._make_button("选择", self._browse_output_dir), 0, 5)
-            grid.addWidget(self._make_button("启动检测", self._start_live_from_controls, primary=True), 0, 6)
+            video_label = QLabel("检测视频")
+            video_label.setStyleSheet(f"color:{TEXT_SECONDARY};")
+            output_label = QLabel("输出目录")
+            output_label.setStyleSheet(f"color:{TEXT_SECONDARY};")
+
+            grid.addWidget(video_label, 0, 0, 1, 2)
+            grid.addWidget(self.video_input_edit, 1, 0)
+            grid.addWidget(self._make_button("选择", self._browse_video), 1, 1)
+            grid.addWidget(output_label, 2, 0, 1, 2)
+            grid.addWidget(self.output_input_edit, 3, 0)
+            grid.addWidget(self._make_button("选择", self._browse_output_dir), 3, 1)
+            grid.addWidget(self._make_button("启动检测", self._start_live_from_controls, primary=True), 4, 0, 1, 2)
+
+        def _set_control_sidebar_expanded(self, expanded: bool) -> None:
+            if not hasattr(self, "control_sidebar"):
+                return
+            self.control_sidebar_expanded = bool(expanded)
+            self.sidebar_content.setVisible(self.control_sidebar_expanded)
+            self.sidebar_title_label.setVisible(self.control_sidebar_expanded)
+            self.sidebar_toggle_button.setText("收起" if self.control_sidebar_expanded else "展开")
+            if self.control_sidebar_expanded:
+                self.control_sidebar.setMinimumWidth(260)
+                self.control_sidebar.setMaximumWidth(620)
+                self.control_sidebar.setSizePolicy(
+                    QSizePolicy.Policy.Preferred,
+                    QSizePolicy.Policy.Expanding,
+                )
+                if hasattr(self, "main_shell_splitter"):
+                    sizes = self.main_shell_splitter.sizes()
+                    total = sum(sizes) if sizes else max(1, self.main_shell_splitter.width())
+                    sidebar_width = max(320, min(620, int(self.control_sidebar_last_width)))
+                    self.main_shell_splitter.setSizes([sidebar_width, max(1, total - sidebar_width)])
+            else:
+                self.control_sidebar.setMinimumWidth(68)
+                self.control_sidebar.setMaximumWidth(68)
+                self.control_sidebar.setFixedWidth(68)
+                self.control_sidebar.setSizePolicy(
+                    QSizePolicy.Policy.Fixed,
+                    QSizePolicy.Policy.Expanding,
+                )
+                if hasattr(self, "main_shell_splitter"):
+                    sizes = self.main_shell_splitter.sizes()
+                    if sizes and sizes[0] > 120:
+                        self.control_sidebar_last_width = sizes[0]
+                    total = sum(sizes) if sizes else max(1, self.main_shell_splitter.width())
+                    self.main_shell_splitter.setSizes([68, max(1, total - 68)])
+            self.control_sidebar.updateGeometry()
+
+        def _toggle_control_sidebar(self) -> None:
+            self._set_control_sidebar_expanded(not self.control_sidebar_expanded)
 
         def _make_button(self, text: str, callback, primary: bool = False) -> QPushButton:
             button = QPushButton(text)
@@ -2071,6 +2290,160 @@ if QT_AVAILABLE:
                     if frame_idx is None:
                         continue
                     self.replay_rows_by_frame.setdefault(frame_idx, []).append(row)
+
+        def _result_paths_for(self, source: str | Path, output_dir: str | Path) -> dict[str, str]:
+            video_name = Path(source).stem
+            output_path = Path(output_dir).expanduser()
+            return {
+                "binding_video": str(output_path / f"head_line_bound_{video_name}.mp4"),
+                "csv": str(output_path / f"head_line_bound_{video_name}.csv"),
+                "json": str(output_path / f"head_line_bound_{video_name}.json"),
+                "layout_preview": str(output_path / f"head_line_layout_{video_name}.jpg"),
+            }
+
+        def _binding_video_is_readable(self, video_path: str | Path | None) -> bool:
+            if not video_path:
+                return False
+            path = Path(video_path)
+            if not path.exists() or path.stat().st_size <= 0:
+                return False
+            if cv2 is None:
+                return path.stat().st_size > 1024
+            capture = cv2.VideoCapture(str(path))
+            try:
+                if not capture.isOpened():
+                    return False
+                frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                ok, _frame = capture.read()
+                return bool(ok) and frame_count > 0
+            finally:
+                capture.release()
+
+        def _result_json_is_complete(self, json_path: str | Path | None) -> bool:
+            if not json_path:
+                return False
+            path = Path(json_path)
+            if not path.exists():
+                return False
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return False
+            processed = to_int(payload.get("processed_frames"))
+            total = to_int(payload.get("total_frames"))
+            limit = to_int(payload.get("process_frame_limit")) or 0
+            if processed is None or processed <= 0:
+                return False
+            if total is None or total <= 0:
+                return True
+            expected = min(total, limit) if limit > 0 else total
+            return processed >= max(1, expected - 1)
+
+        def _result_outputs_are_complete(self, outputs: dict[str, str]) -> bool:
+            csv_path = Path(outputs.get("csv", ""))
+            return (
+                csv_path.exists()
+                and self._result_json_is_complete(outputs.get("json"))
+                and self._binding_video_is_readable(outputs.get("binding_video"))
+            )
+
+        def _clear_result_outputs_for(self, source: str | Path, output_dir: str | Path) -> int:
+            video_name = Path(source).stem
+            output_path = Path(output_dir).expanduser()
+            patterns = [
+                f"head_line_bound_{video_name}.mp4",
+                f"head_line_bound_{video_name}.csv",
+                f"head_line_bound_{video_name}.json",
+                f"head_line_layout_{video_name}.jpg",
+                f"best_sampled_frame_{video_name}.jpg",
+                f"best_sampled_frame_repaired_{video_name}.jpg",
+                f"all_sequence_candidates_{video_name}.jpg",
+            ]
+            removed = 0
+            for pattern in patterns:
+                for path in output_path.glob(pattern):
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+            return removed
+
+        def _clear_incomplete_result_outputs_if_needed(
+            self,
+            source: str | Path,
+            output_dir: str | Path,
+        ) -> bool:
+            outputs = self._result_paths_for(source, output_dir)
+            paths = [Path(value) for value in outputs.values()]
+            if not any(path.exists() for path in paths):
+                return False
+            if self._result_outputs_are_complete(outputs):
+                return False
+            removed = self._clear_result_outputs_for(source, output_dir)
+            self.runtime_message = "已清理上次未完成的检测结果"
+            self.latest_progress_text = f"发现上次结果不完整，已清理 {removed} 个输出文件"
+            return True
+
+        def _apply_layout_from_result_json(self, json_path: str | Path | None) -> None:
+            if not json_path:
+                return
+            result_json = Path(json_path)
+            if not result_json.exists():
+                return
+            try:
+                payload = json.loads(result_json.read_text(encoding="utf-8"))
+            except Exception:
+                return
+            zones = payload.get("zones") or []
+            if not zones:
+                return
+            frame_width = self.current_frame.size[0] if self.current_frame is not None else self.layout_base_size[0]
+            frame_height = self.current_frame.size[1] if self.current_frame is not None else self.layout_base_size[1]
+            self._apply_live_layout(
+                {
+                    "zones": zones,
+                    "frame_width": frame_width,
+                    "frame_height": frame_height,
+                }
+            )
+
+        def _load_finished_result_outputs(
+            self,
+            saved_outputs: dict[str, Any],
+            message: str,
+        ) -> bool:
+            binding_video = saved_outputs.get("binding_video")
+            csv_path = saved_outputs.get("csv")
+            json_path = saved_outputs.get("json")
+            if not binding_video or not Path(binding_video).exists():
+                return False
+
+            self.provider = FrameProvider(binding_video)
+            self.provider.reset()
+            self.source_error = self.provider.error
+            self.source_traceback = None
+            self.pending_live_frame_queue.clear()
+            self.live_finished = True
+            self.live_frame_received = True
+            self.last_presented_mock_at = 0.0
+            self.last_presented_live_at = 0.0
+            self.playback_frame_accumulator = 0.0
+            self.current_frame = self.provider.read_next()
+            self.current_clean_frame = self.current_frame.copy()
+            self.current_frame_idx, self.current_total_frames, self.current_fps = self.provider.progress_state()
+            self.latest_live_source_size = self.current_frame.size
+            self._apply_layout_from_result_json(json_path)
+            self._load_replay_rows(csv_path)
+            self._apply_rows_for_frame(self.current_frame_idx, reset_stabilizer=True)
+            self.runtime_message = message
+            self.latest_progress_text = (
+                f"{message} | 帧 {self.current_frame_idx}/{self.current_total_frames or '?'}"
+            )
+            self._update_poll_timer()
+            self._update_playback_buttons()
+            self._refresh_dashboard()
+            return self.source_error is None
 
         def _apply_rows_for_frame(self, frame_idx: int, reset_stabilizer: bool = False) -> None:
             seat_numbers = [seat.seat_no for seat in self.seats]
@@ -2131,13 +2504,13 @@ if QT_AVAILABLE:
 
         def _effective_provider_interval_ms(self) -> int:
             fps = self.provider.playback_fps() if self.provider is not None else 5.0
-            return max(40, min(1500, int(round(1000.0 / max(0.1, fps * self.playback_speed)))))
+            return max(15, min(1500, int(round(1000.0 / max(0.1, fps)))))
 
         def _effective_live_interval_ms(self, fps: float | None = None) -> int:
             base_fps = fps or getattr(self, "latest_live_fps", 25.0) or 25.0
             stride = self.live_config.frame_callback_stride if self.live_config is not None else 1
             return max(
-                70,
+                15,
                 min(
                     1500,
                     int(round((1000.0 * max(1, stride)) / max(0.1, base_fps * self.playback_speed))),
@@ -2147,10 +2520,31 @@ if QT_AVAILABLE:
         def _update_poll_timer(self) -> None:
             if not hasattr(self, "timer"):
                 return
-            if self.mode == "live":
+            if self.mode == "live" and not self.live_finished:
                 self.timer.setInterval(60)
             else:
                 self.timer.setInterval(self._effective_provider_interval_ms())
+
+        def _playback_step_count(self) -> int:
+            self.playback_frame_accumulator += max(0.25, float(self.playback_speed))
+            steps = int(self.playback_frame_accumulator)
+            if steps <= 0:
+                return 0
+            self.playback_frame_accumulator -= steps
+            return min(8, steps)
+
+        def _advance_provider_frames(self, steps: int) -> bool:
+            if steps <= 0 or self.provider is None:
+                return False
+            frame = None
+            for _ in range(steps):
+                frame = self.provider.read_next()
+            if frame is None:
+                return False
+            self.current_frame = frame
+            self.current_clean_frame = frame.copy()
+            self.current_frame_idx, self.current_total_frames, self.current_fps = self.provider.progress_state()
+            return True
 
         def _update_playback_buttons(self) -> None:
             self.play_button.setEnabled(not self.playing)
@@ -2163,6 +2557,7 @@ if QT_AVAILABLE:
                 self.playback_speed = 1.0
             self.last_presented_live_at = 0.0
             self.last_presented_mock_at = 0.0
+            self.playback_frame_accumulator = 0.0
             self._update_poll_timer()
             self._refresh_dashboard()
 
@@ -2171,6 +2566,7 @@ if QT_AVAILABLE:
             self.stop_mode = False
             self.last_presented_live_at = 0.0
             self.last_presented_mock_at = 0.0
+            self.playback_frame_accumulator = 0.0
             if self.mode == "live":
                 self.latest_progress_text = "已恢复播放，正在按当前速度展示实时结果"
             else:
@@ -2192,6 +2588,7 @@ if QT_AVAILABLE:
             self.stop_mode = True
             self.last_presented_live_at = 0.0
             self.last_presented_mock_at = 0.0
+            self.playback_frame_accumulator = 0.0
             if self.mode == "live":
                 self.pending_live_frame_queue.clear()
                 self.latest_progress_text = "已停止显示，点击播放继续查看最新实时结果"
@@ -2224,7 +2621,6 @@ if QT_AVAILABLE:
 
             self.runtime_status_label.setText(self.runtime_message or "等待巡检线程状态")
             self.progress_label.setText(self.latest_progress_text or "等待巡检数据")
-            self.source_label.setText(self._source_text())
 
             if self.source_error:
                 error_text = f"异常: {self.source_error}"
@@ -2261,6 +2657,14 @@ if QT_AVAILABLE:
                     self.mode = "live"
                     source = self.live_config.source
                     source_path = Path(source).expanduser().resolve() if source else None
+                    existing_outputs = self._result_paths_for(source, self.live_config.output_dir)
+                    if self._result_outputs_are_complete(existing_outputs):
+                        self.live_session = None
+                        self.runtime_message = "已加载已有检测结果"
+                        self.latest_progress_text = "正在回放已保存的检测结果"
+                        self._load_finished_result_outputs(existing_outputs, "已加载已有检测结果")
+                        return
+                    self._clear_incomplete_result_outputs_if_needed(source, self.live_config.output_dir)
                     self.provider = FrameProvider(source)
                     self.pending_live_frame_queue.clear()
                     self.live_session = RealBindingSession(self.live_config)
@@ -2285,6 +2689,7 @@ if QT_AVAILABLE:
                     self.replay_binding_stabilizer.reset([seat.seat_no for seat in self.seats])
                     self.live_frame_received = False
                     self.live_finished = False
+                    self.playback_frame_accumulator = 0.0
                     self.latest_live_rows = []
                     self.last_row_by_seat.clear()
                     self.latest_live_source_size = self.layout_base_size
@@ -2293,7 +2698,6 @@ if QT_AVAILABLE:
                     self.latest_progress_text = "等待座位布局与首帧回调"
                     self.source_error = None
                     self.source_traceback = None
-                    self.load_button.setEnabled(True)
                     self._update_poll_timer()
                     self._update_playback_buttons()
                     return
@@ -2307,6 +2711,7 @@ if QT_AVAILABLE:
             self.source_error = self.provider.error
             self.source_traceback = None
             self.live_finished = False
+            self.playback_frame_accumulator = 0.0
             self.replay_rows_by_frame = {}
             self.last_row_by_seat.clear()
             self.binding_stabilizer.reset([seat.seat_no for seat in self.seats])
@@ -2319,7 +2724,6 @@ if QT_AVAILABLE:
             self.latest_live_source_size = self.layout_base_size
             self.runtime_message = "模拟巡检中"
             self.latest_progress_text = "正在使用 mock 数据驱动界面"
-            self.load_button.setEnabled(True)
             self._update_poll_timer()
             self._update_playback_buttons()
 
@@ -2334,6 +2738,7 @@ if QT_AVAILABLE:
             self.last_presented_live_at = 0.0
             self.last_presented_mock_at = 0.0
             self.live_finished = False
+            self.playback_frame_accumulator = 0.0
             self.replay_rows_by_frame = {}
             self.last_row_by_seat.clear()
             self.binding_stabilizer.reset([seat.seat_no for seat in self.seats])
@@ -2376,6 +2781,7 @@ if QT_AVAILABLE:
             self.current_clean_frame = self.current_frame.copy()
             self.current_frame_idx, self.current_total_frames, self.current_fps = self.provider.progress_state()
             self.last_presented_mock_at = 0.0
+            self.playback_frame_accumulator = 0.0
             self._update_poll_timer()
             self._refresh_dashboard()
 
@@ -2433,6 +2839,14 @@ if QT_AVAILABLE:
             self.source_error = None
             self.source_traceback = None
             self.mode = "live"
+            existing_outputs = self._result_paths_for(source, output_dir)
+            if self._result_outputs_are_complete(existing_outputs):
+                self.live_session = None
+                self.runtime_message = "已加载已有检测结果"
+                self.latest_progress_text = "正在回放已保存的检测结果"
+                self._load_finished_result_outputs(existing_outputs, "已加载已有检测结果")
+                return
+            self._clear_incomplete_result_outputs_if_needed(source, output_dir)
             self._configure_data_source(source, self.room_name)
             self._refresh_dashboard()
 
@@ -2463,13 +2877,122 @@ if QT_AVAILABLE:
                 self.showFullScreen()
             else:
                 self.showNormal()
+                if hasattr(self, "app_title_bar"):
+                    self.app_title_bar.max_button.setText("[]")
 
         def keyPressEvent(self, event) -> None:
             if event.key() == Qt.Key.Key_Escape and self.fullscreen:
                 self.fullscreen = False
                 self.showNormal()
+                if hasattr(self, "app_title_bar"):
+                    self.app_title_bar.max_button.setText("[]")
                 return
             super().keyPressEvent(event)
+
+        def eventFilter(self, watched, event) -> bool:
+            if not isinstance(watched, QWidget):
+                return super().eventFilter(watched, event)
+            if watched is not self and not self.isAncestorOf(watched):
+                return super().eventFilter(watched, event)
+
+            event_type = event.type()
+            if event_type not in {
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseMove,
+                QEvent.Type.MouseButtonRelease,
+                QEvent.Type.Leave,
+            }:
+                return super().eventFilter(watched, event)
+
+            if self.isMaximized() or self.isFullScreen():
+                if event_type == QEvent.Type.MouseMove:
+                    self.unsetCursor()
+                return super().eventFilter(watched, event)
+
+            if event_type == QEvent.Type.Leave and self.resize_edges is None:
+                self.unsetCursor()
+                return super().eventFilter(watched, event)
+
+            if event_type == QEvent.Type.MouseButtonRelease:
+                if self.resize_edges is not None:
+                    self.resize_edges = None
+                    self.resize_start_pos = None
+                    self.resize_start_geometry = None
+                    self.unsetCursor()
+                    return True
+                return super().eventFilter(watched, event)
+
+            if not hasattr(event, "position"):
+                return super().eventFilter(watched, event)
+            local_pos = watched.mapTo(self, event.position().toPoint())
+
+            if event_type == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    edges = self._resize_edges_at(local_pos)
+                    if edges is not None:
+                        self.resize_edges = edges
+                        self.resize_start_pos = event.globalPosition().toPoint()
+                        self.resize_start_geometry = self.geometry()
+                        self._apply_resize_cursor(edges)
+                        return True
+                return super().eventFilter(watched, event)
+
+            if event_type == QEvent.Type.MouseMove:
+                if self.resize_edges is not None and event.buttons() & Qt.MouseButton.LeftButton:
+                    self._resize_from_global_pos(event.globalPosition().toPoint())
+                    return True
+                edges = self._resize_edges_at(local_pos)
+                if edges is not None:
+                    self._apply_resize_cursor(edges)
+                else:
+                    self.unsetCursor()
+                return super().eventFilter(watched, event)
+
+            return super().eventFilter(watched, event)
+
+        def _resize_edges_at(self, pos) -> tuple[bool, bool, bool, bool] | None:
+            margin = int(self.resize_edge_margin)
+            width = self.width()
+            height = self.height()
+            x = int(pos.x())
+            y = int(pos.y())
+            left = 0 <= x <= margin
+            right = width - margin <= x <= width
+            top = 0 <= y <= margin
+            bottom = height - margin <= y <= height
+            if left or right or top or bottom:
+                return left, top, right, bottom
+            return None
+
+        def _apply_resize_cursor(self, edges: tuple[bool, bool, bool, bool]) -> None:
+            left, top, right, bottom = edges
+            if (left and top) or (right and bottom):
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            elif (right and top) or (left and bottom):
+                self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+            elif left or right:
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif top or bottom:
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+
+        def _resize_from_global_pos(self, global_pos) -> None:
+            if self.resize_edges is None or self.resize_start_pos is None or self.resize_start_geometry is None:
+                return
+            dx = global_pos.x() - self.resize_start_pos.x()
+            dy = global_pos.y() - self.resize_start_pos.y()
+            left, top, right, bottom = self.resize_edges
+            geom = self.resize_start_geometry.adjusted(0, 0, 0, 0)
+            min_w = self.minimumWidth()
+            min_h = self.minimumHeight()
+            if left:
+                geom.setLeft(min(geom.left() + dx, geom.right() - min_w + 1))
+            if right:
+                geom.setRight(max(geom.right() + dx, geom.left() + min_w - 1))
+            if top:
+                geom.setTop(min(geom.top() + dy, geom.bottom() - min_h + 1))
+            if bottom:
+                geom.setBottom(max(geom.bottom() + dy, geom.top() + min_h - 1))
+            self.setGeometry(geom)
 
         def _apply_live_layout(self, payload: dict[str, Any]) -> None:
             zones = payload.get("zones") or []
@@ -2613,23 +3136,9 @@ if QT_AVAILABLE:
                 self.latest_progress_text = f"检测缓冲中，待播帧 {len(self.pending_live_frame_queue)}"
             elif incoming_frames and not self.playing:
                 self.latest_progress_text = "播放已暂停，实时检测结果正在缓存。"
-            elif (
-                self.playing
-                and not self.live_frame_received
-                and self.provider is not None
-                and self.provider.error is None
-            ):
-                due_interval = self._effective_provider_interval_ms()
-                if (
-                    self.last_presented_mock_at <= 0.0
-                    or (now - self.last_presented_mock_at) * 1000.0 >= due_interval
-                ):
-                    self.current_frame = self.provider.read_next()
-                    self.current_clean_frame = self.current_frame.copy()
-                    self.current_frame_idx, self.current_total_frames, self.current_fps = self.provider.progress_state()
-                    self.last_presented_mock_at = now
-                    self.latest_progress_text = self.runtime_message or "检测线程启动中"
-                    should_refresh = True
+            elif self.playing and not self.live_frame_received:
+                self.latest_progress_text = self.runtime_message or "检测线程启动中"
+                should_refresh = True
             if payload.get("finish") is not None:
                 self.runtime_message = "检测完成"
                 self.source_error = None
@@ -2637,8 +3146,10 @@ if QT_AVAILABLE:
                 self.live_finished = True
                 finish_payload = payload.get("finish") or {}
                 saved_outputs = finish_payload.get("saved_outputs") or {}
-                self._load_replay_rows(saved_outputs.get("csv"))
-                self.latest_progress_text = "检测完成，可拖动进度条回看结果"
+                if not self._load_finished_result_outputs(saved_outputs, "检测完成，正在回放带框结果"):
+                    self._load_replay_rows(saved_outputs.get("csv"))
+                    self.latest_progress_text = "检测完成，但未找到带框视频；请确认输出包含 binding_video"
+                self._update_poll_timer()
                 should_refresh = True
             if should_refresh and not incoming_frames:
                 self._refresh_dashboard()
@@ -2659,15 +3170,14 @@ if QT_AVAILABLE:
                         self.last_presented_mock_at <= 0.0
                         or (now - self.last_presented_mock_at) * 1000.0 >= due_interval
                     ):
-                        self.current_frame = self.provider.read_next()
-                        self.current_clean_frame = self.current_frame.copy()
-                        self.current_frame_idx, self.current_total_frames, self.current_fps = self.provider.progress_state()
-                        self._apply_rows_for_frame(self.current_frame_idx)
-                        self.last_presented_mock_at = now
-                        self.latest_progress_text = (
-                            f"检测结果回放中 | 帧 {self.current_frame_idx}/{self.current_total_frames or '?'}"
-                        )
-                        self._refresh_dashboard()
+                        steps = self._playback_step_count()
+                        if steps > 0 and self._advance_provider_frames(steps):
+                            self._apply_rows_for_frame(self.current_frame_idx)
+                            self.last_presented_mock_at = now
+                            self.latest_progress_text = (
+                                f"检测结果回放中 | 帧 {self.current_frame_idx}/{self.current_total_frames or '?'}"
+                            )
+                            self._refresh_dashboard()
             elif self.playing and self.provider is not None and self.engine is not None:
                 now = time.monotonic()
                 due_interval = self._effective_provider_interval_ms()
@@ -2675,13 +3185,15 @@ if QT_AVAILABLE:
                     self.last_presented_mock_at <= 0.0
                     or (now - self.last_presented_mock_at) * 1000.0 >= due_interval
                 ):
-                    self.current_frame = self.provider.read_next()
-                    self.current_clean_frame = self.current_frame.copy()
-                    self.current_frame_idx, self.current_total_frames, self.current_fps = self.provider.progress_state()
-                    self.snapshot = self.engine.step()
-                    self._append_events(self.snapshot.events)
-                    self.last_presented_mock_at = now
-                    self._refresh_dashboard()
+                    steps = self._playback_step_count()
+                    if steps > 0 and self._advance_provider_frames(steps):
+                        new_events: list[AlertRecord] = []
+                        for _ in range(steps):
+                            self.snapshot = self.engine.step()
+                            new_events.extend(self.snapshot.events)
+                        self._append_events(new_events)
+                        self.last_presented_mock_at = now
+                        self._refresh_dashboard()
 
         def _append_events(self, events: list[AlertRecord]) -> None:
             if not events:
@@ -3118,7 +3630,7 @@ def parse_args() -> argparse.Namespace:
         default="head_line",
         help="真实检测绑定策略：head_line 使用人头-左下桌框策略，v3 使用旧版人桌绑定流水线",
     )
-    parser.add_argument("--pipeline-outputs", type=str, default="csv,json,zone_map", help="真实检测附带保存的输出")
+    parser.add_argument("--pipeline-outputs", type=str, default="binding_video,csv,json,zone_map", help="真实检测附带保存的输出")
     parser.add_argument("--conf", type=float, default=0.3)
     parser.add_argument("--iou", type=float, default=0.60)
     parser.add_argument("--desk-conf", type=float, default=0.70)
