@@ -712,6 +712,8 @@ class RealBindingSession:
         argv = [
             "--source", self.config.source,
             "--output", self.config.output_dir,
+            "--weights", self.config.person_weights,
+            "--desk-weights", self.config.desk_weights,
         ]
         if "binding_video" not in self.config.outputs:
             argv.append("--no-video")
@@ -2758,7 +2760,7 @@ def parse_args() -> argparse.Namespace:
     default_head_line_source = project_root / "data" / "1.10" / "clipleft" / "merged_output.mp4"
     default_source = default_head_line_source if default_head_line_source.exists() else resolve_demo_source(project_root)
     default_layout = project_root / "detect" / "seats.json"
-    default_person_weights = project_root / "model" / "yolo26m" / "best2.pt"
+    default_person_weights = project_root / "exam_seat_binding" / "weight" / "yolo26mheadpeople.pt"
     default_desk_weights = project_root / "exam_seat_binding" / "weight" / "yolo11desk.pt"
     default_output_dir = project_root / "exam_seat_binding" / "output" / "head_line_binding1"
 

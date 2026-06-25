@@ -4,17 +4,17 @@ Head-to-desk detection based exam seat binding.
 Pipeline:
 1. Use the first N seconds of video to build the fixed desk layout with
    exam_seat_binding/desk_layout_detector.py.
-2. Track only head detections from model/yolo26m/best2.pt.
+2. Track head/person detections from exam_seat_binding/weight/yolo26mheadpeople.pt.
 3. Bind each tracked head to the detected desk box at its lower-left side.
 
 Example:
 python exam_seat_binding/head_line_seat_binding.py \
   --source data/1.10/clipleft/merged_output.mp4 \
-  --weights model/yolo26m/best2.pt \
+  --weights exam_seat_binding/weight/yolo26mheadpeople.pt \
   --desk-reference-seconds 30 \
   --output exam_seat_binding/output/head_line_binding2
 
-  python exam_seat_binding/head_line_seat_binding.py   --source data/1.10/clipleft/merged_output.mp4   --weights model/yolo26m/best2.pt   --desk-reference-seconds 30   --output exam_seat_binding/output/head_line_binding113
+  python exam_seat_binding/head_line_seat_binding.py   --source data/1.10/clipleft/merged_output.mp4   --weights exam_seat_binding/weight/yolo26mheadpeople.pt   --desk-reference-seconds 30   --output exam_seat_binding/output/head_line_binding113
 """
 
 import argparse
@@ -3537,7 +3537,11 @@ def build_arg_parser():
         default=None,
         help="Optional video used only for desk layout; defaults to --source",
     )
-    p.add_argument("--weights", default="model/yolo26m/best2.pt", help="Head/person YOLO weights")
+    p.add_argument(
+        "--weights",
+        default="exam_seat_binding/weight/yolo26mheadpeople.pt",
+        help="Head/person YOLO weights",
+    )
     p.add_argument(
         "--desk-weights",
         default="exam_seat_binding/weight/yolo11desk.pt",
