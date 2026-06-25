@@ -1538,6 +1538,7 @@ if QT_AVAILABLE:
             self.fullscreen = False
             self.records: list[AlertRecord] = []
             self.latest_live_rows: list[dict[str, Any]] = []
+            self.last_row_by_seat: dict[int, dict[str, Any]] = {}
             self.pending_live_frame_queue: deque[dict[str, Any]] = deque(maxlen=32)
             self.last_presented_live_at = 0.0
             self.last_presented_mock_at = 0.0
@@ -2075,8 +2076,10 @@ if QT_AVAILABLE:
             seat_numbers = [seat.seat_no for seat in self.seats]
             if reset_stabilizer:
                 self.replay_binding_stabilizer.reset(seat_numbers)
+                self.last_row_by_seat.clear()
             rows = self.replay_rows_by_frame.get(frame_idx, [])
             self.latest_live_rows = list(rows)
+            self._remember_rows_by_seat(self.latest_live_rows)
             raw_snapshot, _ = build_snapshot_from_binding_rows(
                 rows=rows,
                 seat_numbers=seat_numbers,
@@ -2094,6 +2097,7 @@ if QT_AVAILABLE:
             )
             self.live_status_map = dict(snapshot.status_by_seat)
             self.snapshot = snapshot
+            self._prune_cached_rows_for_snapshot(snapshot)
 
         def _seek_playback(self, frame_idx: int) -> None:
             if self.provider is None or not self.provider.can_seek():
@@ -2282,6 +2286,7 @@ if QT_AVAILABLE:
                     self.live_frame_received = False
                     self.live_finished = False
                     self.latest_live_rows = []
+                    self.last_row_by_seat.clear()
                     self.latest_live_source_size = self.layout_base_size
                     self.replay_rows_by_frame = {}
                     self.runtime_message = "模型启动中，正在加载视频与权重"
@@ -2303,6 +2308,7 @@ if QT_AVAILABLE:
             self.source_traceback = None
             self.live_finished = False
             self.replay_rows_by_frame = {}
+            self.last_row_by_seat.clear()
             self.binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             self.replay_binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             self.current_frame = self.provider.read_next()
@@ -2329,6 +2335,7 @@ if QT_AVAILABLE:
             self.last_presented_mock_at = 0.0
             self.live_finished = False
             self.replay_rows_by_frame = {}
+            self.last_row_by_seat.clear()
             self.binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             self.replay_binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             if self.mode == "mock" and self.provider is not None and self.engine is not None:
@@ -2415,6 +2422,7 @@ if QT_AVAILABLE:
             self.events_table.setRowCount(0)
             self.live_session = None
             self.live_status_map = None
+            self.last_row_by_seat.clear()
             self.binding_stabilizer.empty_confirm_seconds = max(
                 0.0,
                 float(self.live_config.empty_confirm_seconds),
@@ -2481,6 +2489,7 @@ if QT_AVAILABLE:
             self.replay_binding_stabilizer.reset(seat_numbers)
             self.live_status_map = None
             self.latest_live_rows = []
+            self.last_row_by_seat.clear()
             self.latest_live_source_size = (frame_width, frame_height)
             self.latest_progress_text = "座位布局已建立，等待实时绑定结果"
 
@@ -2528,6 +2537,7 @@ if QT_AVAILABLE:
             self.current_fps = fps
             rows = payload.get("rows") or []
             self.latest_live_rows = list(rows)
+            self._remember_rows_by_seat(self.latest_live_rows)
             seat_numbers = [seat.seat_no for seat in self.seats]
             raw_snapshot, _ = build_snapshot_from_binding_rows(
                 rows=rows,
@@ -2546,6 +2556,7 @@ if QT_AVAILABLE:
             )
             self.live_status_map = dict(snapshot.status_by_seat)
             self.snapshot = snapshot
+            self._prune_cached_rows_for_snapshot(snapshot)
             total_frames = payload.get("total_frames") or "?"
             self.latest_progress_text = (
                 f"帧 {frame_idx}/{total_frames} | "
@@ -2751,30 +2762,117 @@ if QT_AVAILABLE:
                     break
                 if role in {"student", "unknown", "candidate"} and seat_current == seat_no:
                     pending_candidate = row
-            return confirmed_candidate or pending_candidate
+            return confirmed_candidate or pending_candidate or self.last_row_by_seat.get(seat_no)
 
-        def _row_bbox(self, row: dict[str, Any]) -> tuple[float, float, float, float] | None:
-            x1 = row.get("x1")
-            y1 = row.get("y1")
-            x2 = row.get("x2")
-            y2 = row.get("y2")
-            values = [x1, y1, x2, y2]
+        def _remember_rows_by_seat(self, rows: list[dict[str, Any]]) -> None:
+            for row in rows:
+                role = str(row.get("role", "unknown"))
+                seat_display = to_int(row.get("seat_no_display"))
+                seat_current = to_int(row.get("seat_no_current"))
+                seat_no = seat_display if role == "student" else seat_current
+                if seat_no is None or seat_no not in self.seat_lookup:
+                    continue
+                if self._row_bbox(row) is None:
+                    continue
+                cached = dict(row)
+                cached["_cached_frame_idx"] = self.current_frame_idx
+                self.last_row_by_seat[seat_no] = cached
+
+        def _prune_cached_rows_for_snapshot(self, snapshot: InspectionSnapshot) -> None:
+            for seat_no, status in snapshot.status_by_seat.items():
+                if status == "empty":
+                    self.last_row_by_seat.pop(seat_no, None)
+
+        def _scale_source_box(
+            self,
+            values: tuple[float, float, float, float],
+            frame_size: tuple[int, int] | None = None,
+        ) -> tuple[float, float, float, float] | None:
+            left, top, right, bottom = values
+            if right <= left or bottom <= top:
+                return None
+            src_w, src_h = self.latest_live_source_size
+            dst_w, dst_h = frame_size or self.current_frame.size
+            scale_x = dst_w / max(1.0, float(src_w))
+            scale_y = dst_h / max(1.0, float(src_h))
+            return (
+                left * scale_x,
+                top * scale_y,
+                right * scale_x,
+                bottom * scale_y,
+            )
+
+        def _row_bbox_from_fields(
+            self,
+            row: dict[str, Any],
+            field_names: tuple[str, str, str, str],
+            frame_size: tuple[int, int] | None = None,
+        ) -> tuple[float, float, float, float] | None:
+            values = [row.get(field_name) for field_name in field_names]
             if any(value is None for value in values):
                 return None
             try:
                 left, top, right, bottom = [float(value) for value in values]
             except (TypeError, ValueError):
                 return None
-            if right <= left or bottom <= top:
+            return self._scale_source_box((left, top, right, bottom), frame_size=frame_size)
+
+        def _row_head_bbox(
+            self,
+            row: dict[str, Any],
+            frame_size: tuple[int, int] | None = None,
+        ) -> tuple[float, float, float, float] | None:
+            return self._row_bbox_from_fields(
+                row,
+                ("head_x1", "head_y1", "head_x2", "head_y2"),
+                frame_size=frame_size,
+            )
+
+        def _row_bbox(
+            self,
+            row: dict[str, Any],
+            frame_size: tuple[int, int] | None = None,
+        ) -> tuple[float, float, float, float] | None:
+            for field_names in (
+                ("x1", "y1", "x2", "y2"),
+                ("person_x1", "person_y1", "person_x2", "person_y2"),
+                ("body_x1", "body_y1", "body_x2", "body_y2"),
+                ("head_x1", "head_y1", "head_x2", "head_y2"),
+            ):
+                box = self._row_bbox_from_fields(row, field_names, frame_size=frame_size)
+                if box is not None:
+                    return box
+            return None
+
+        def _estimated_person_focus_box(
+            self,
+            row: dict[str, Any] | None,
+            seat_box: tuple[float, float, float, float],
+            frame_size: tuple[int, int],
+        ) -> tuple[float, float, float, float] | None:
+            if row is None:
                 return None
-            src_w, src_h = self.latest_live_source_size
-            dst_w, dst_h = self.current_frame.size
-            scale_x = dst_w / max(1.0, float(src_w))
-            scale_y = dst_h / max(1.0, float(src_h))
-            left *= scale_x
-            right *= scale_x
-            top *= scale_y
-            bottom *= scale_y
+            full_box = self._row_bbox(row, frame_size=frame_size)
+            head_box = self._row_head_bbox(row, frame_size=frame_size)
+            if full_box is None:
+                return None
+            if head_box is None or full_box != head_box:
+                return full_box
+
+            hx1, hy1, hx2, hy2 = head_box
+            head_w = max(1.0, hx2 - hx1)
+            head_h = max(1.0, hy2 - hy1)
+            head_cx = (hx1 + hx2) / 2.0
+            seat_cx = (seat_box[0] + seat_box[2]) / 2.0
+            seat_cy = (seat_box[1] + seat_box[3]) / 2.0
+            body_cx = head_cx * 0.72 + seat_cx * 0.28
+            top = max(0.0, hy1 - head_h * 0.75)
+            bottom = min(float(frame_size[1]), max(seat_cy, hy2 + head_h * 4.2))
+            half_w = max(head_w * 2.7, (seat_box[2] - seat_box[0]) * 0.65)
+            left = max(0.0, body_cx - half_w)
+            right = min(float(frame_size[0]), body_cx + half_w)
+            if right <= left or bottom <= top:
+                return head_box
             return left, top, right, bottom
 
         def _crop_focus_region(
@@ -2791,9 +2889,9 @@ if QT_AVAILABLE:
                 top = min(y1, seat_y1)
                 right = max(x2, seat_x2)
                 bottom = max(y2, seat_y2)
-                pad_x = max(90.0, (x2 - x1) * 0.85)
-                pad_y_top = max(120.0, (y2 - y1) * 0.75)
-                pad_y_bottom = max(80.0, (y2 - y1) * 0.35)
+                pad_x = max(70.0, (x2 - x1) * 0.45)
+                pad_y_top = max(60.0, (y2 - y1) * 0.32)
+                pad_y_bottom = max(70.0, (y2 - y1) * 0.22)
                 crop_box = (
                     max(0.0, left - pad_x),
                     max(0.0, top - pad_y_top),
@@ -2840,7 +2938,7 @@ if QT_AVAILABLE:
             draw = ImageDraw.Draw(frame, "RGBA")
             focus_seat = self.selected_seat or self.snapshot.focus_seat
             focus_row = self._row_for_seat(focus_seat) if focus_seat is not None else None
-            focus_person_box = self._row_bbox(focus_row) if focus_row is not None else None
+            focus_person_box = self._row_bbox(focus_row, frame_size=frame.size) if focus_row is not None else None
 
             for seat in self.seats:
                 box = self._scaled_box(seat, frame.size)
@@ -2888,7 +2986,12 @@ if QT_AVAILABLE:
             draw = ImageDraw.Draw(frame, "RGBA")
             seat_box = self._scaled_box(seat, frame.size)
             live_row = self._row_for_seat(focus_seat)
-            person_box = self._row_bbox(live_row) if live_row is not None else None
+            person_box = self._estimated_person_focus_box(live_row, seat_box, frame.size)
+            head_box = (
+                self._row_head_bbox(live_row, frame_size=frame.size)
+                if live_row is not None
+                else None
+            )
             status = self.snapshot.status_by_seat.get(focus_seat, "normal")
             behavior = self.snapshot.behavior_by_seat.get(focus_seat, STATUS_LABELS[status])
             _, _, outline_rgb = self._status_colors(status)
@@ -2898,9 +3001,11 @@ if QT_AVAILABLE:
                 self._overlay_tag(
                     draw,
                     (person_box[0], max(18.0, person_box[1] - 42.0)),
-                    f"已绑定学生 {focus_seat:02d}",
+                    f"绑定人 {focus_seat:02d}",
                     (255, 235, 109),
                 )
+            if head_box is not None:
+                draw.rounded_rectangle(head_box, radius=10, outline=(94, 255, 184), width=3)
             crop = self._crop_focus_region(frame, seat_box, person_box)
             self.detail_image_label.set_pil_image(crop)
             detail_parts = [
@@ -2920,12 +3025,24 @@ if QT_AVAILABLE:
                 track_id = live_row.get("track_id")
                 if track_id not in (None, ""):
                     detail_parts.append(f"跟踪ID: {track_id}")
-                person_conf = live_row.get("person_conf")
+                person_conf = live_row.get("person_conf", live_row.get("conf"))
                 if person_conf not in (None, ""):
                     try:
                         detail_parts.append(f"置信度: {float(person_conf):.2f}")
                     except (TypeError, ValueError):
                         pass
+                if head_box is not None:
+                    cx = (head_box[0] + head_box[2]) / 2.0
+                    cy = (head_box[1] + head_box[3]) / 2.0
+                    detail_parts.append(f"位置: ({cx:.0f}, {cy:.0f})")
+                motion_state = live_row.get("motion_state")
+                if motion_state not in (None, ""):
+                    motion_label = {
+                        "stationary": "静止",
+                        "moving": "移动",
+                        "unknown": "未知",
+                    }.get(str(motion_state), str(motion_state))
+                    detail_parts.append(f"运动: {motion_label}")
                 if to_bool(live_row.get("is_bound")):
                     detail_parts.append("绑定: 已确认")
                 elif to_int(live_row.get("seat_no_current")) == focus_seat:
