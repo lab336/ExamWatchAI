@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 QT_AVAILABLE = False
 QT_IMPORT_ERROR = None
 try:
-    from PyQt6.QtCore import QRectF, QSize, Qt, QTimer, pyqtSignal
+    from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
     from PyQt6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter, QPen, QPixmap
     from PyQt6.QtWidgets import (
         QApplication,
@@ -3084,7 +3084,7 @@ def parse_args() -> argparse.Namespace:
     default_head_line_source = project_root / "data" / "1.10" / "clipleft" / "merged_output.mp4"
     default_source = default_head_line_source if default_head_line_source.exists() else resolve_demo_source(project_root)
     default_layout = project_root / "detect" / "seats.json"
-    default_person_weights = project_root / "exam_seat_binding" / "weight" / "yolo26mheadpeople.pt"
+    default_person_weights = project_root / "exam_seat_binding" / "weight" / "besthead.pt"
     default_desk_weights = project_root / "exam_seat_binding" / "weight" / "yolo11desk.pt"
     default_output_dir = project_root / "exam_seat_binding" / "output" / "head_line_binding1"
 
