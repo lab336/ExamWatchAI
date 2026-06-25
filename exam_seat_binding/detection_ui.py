@@ -238,6 +238,7 @@ class LiveBindingConfig:
     max_teachers: int = 2
     frame_callback_stride: int = 3
     frame_callback_max_width: int = 1280
+    empty_confirm_seconds: float = 5.0
 
 
 def chunk_sizes(total: int, count: int) -> list[int]:
@@ -291,6 +292,12 @@ def format_video_time(frame_idx: int, fps: float) -> str:
     seconds = int(total_seconds % 60)
     centiseconds = int(round((total_seconds - int(total_seconds)) * 100))
     return f"{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
+
+
+def frame_seconds(frame_idx: int, fps: float) -> float:
+    if fps <= 1e-6:
+        fps = 25.0
+    return max(0.0, float(frame_idx) / float(fps))
 
 
 def pick_pil_font_spec(weight: str = "regular") -> tuple[str | None, int]:
@@ -549,7 +556,7 @@ def build_snapshot_from_binding_rows(
             behavior_by_seat[seat_display] = REAL_STATUS_NOTE["normal"]
             continue
 
-        if role in {"student", "unknown"} and seat_current is not None:
+        if role in {"student", "unknown", "candidate"} and seat_current is not None:
             pending_seats.add(seat_current)
             if status_by_seat.get(seat_current) != "normal":
                 status_by_seat[seat_current] = "warning"
@@ -601,6 +608,160 @@ def build_snapshot_from_binding_rows(
         events=events,
     )
     return snapshot, status_by_seat
+
+
+class SeatStatusStabilizer:
+    """
+    UI-level hysteresis for seat states.
+
+    Frame callbacks can miss a bound student for one or two frames even when the
+    track is still valid. Treating that as an immediate empty seat makes the
+    dashboard flicker and creates noisy "座位空出" records, so transitions into
+    empty must stay true for a short continuous window.
+    """
+
+    def __init__(self, empty_confirm_seconds: float = 5.0):
+        self.empty_confirm_seconds = max(0.0, float(empty_confirm_seconds))
+        self.status_by_seat: dict[int, str] = {}
+        self.behavior_by_seat: dict[int, str] = {}
+        self.empty_started_at: dict[int, float] = {}
+        self.seen_non_empty: set[int] = set()
+        self.last_seconds: float | None = None
+
+    def reset(
+        self,
+        seat_numbers: list[int] | None = None,
+        *,
+        initial_status: str = "normal",
+        initial_behavior: str = "待检测",
+    ) -> None:
+        self.status_by_seat.clear()
+        self.behavior_by_seat.clear()
+        self.empty_started_at.clear()
+        self.seen_non_empty.clear()
+        self.last_seconds = None
+        if seat_numbers:
+            self.status_by_seat = {seat_no: initial_status for seat_no in seat_numbers}
+            self.behavior_by_seat = {seat_no: initial_behavior for seat_no in seat_numbers}
+
+    def _ensure_seats(self, seat_numbers: list[int]) -> None:
+        existing = set(self.status_by_seat)
+        expected = set(seat_numbers)
+        if existing != expected:
+            self.reset(seat_numbers)
+
+    def apply(
+        self,
+        raw_snapshot: InspectionSnapshot,
+        seat_numbers: list[int],
+        room_name: str,
+        frame_idx: int,
+        fps: float,
+    ) -> InspectionSnapshot:
+        self._ensure_seats(seat_numbers)
+        now_seconds = frame_seconds(frame_idx, fps)
+        if self.last_seconds is not None and now_seconds + 0.25 < self.last_seconds:
+            self.reset(seat_numbers)
+        self.last_seconds = now_seconds
+
+        previous_status = dict(self.status_by_seat)
+        next_status: dict[int, str] = {}
+        next_behavior: dict[int, str] = {}
+
+        for seat_no in seat_numbers:
+            raw_status = raw_snapshot.status_by_seat.get(seat_no, "empty")
+            raw_behavior = raw_snapshot.behavior_by_seat.get(
+                seat_no,
+                REAL_STATUS_NOTE.get(raw_status, ""),
+            )
+            stable_status = self.status_by_seat.get(seat_no, "normal")
+            stable_behavior = self.behavior_by_seat.get(seat_no, "待检测")
+
+            if raw_status == "empty":
+                if stable_status == "empty":
+                    next_status[seat_no] = "empty"
+                    next_behavior[seat_no] = REAL_STATUS_NOTE["empty"]
+                    self.empty_started_at.pop(seat_no, None)
+                    continue
+
+                empty_since = self.empty_started_at.setdefault(seat_no, now_seconds)
+                if now_seconds - empty_since >= self.empty_confirm_seconds:
+                    next_status[seat_no] = "empty"
+                    next_behavior[seat_no] = REAL_STATUS_NOTE["empty"]
+                    self.empty_started_at.pop(seat_no, None)
+                else:
+                    next_status[seat_no] = stable_status
+                    if stable_status == "normal":
+                        next_behavior[seat_no] = "短时未检出，保持已确认"
+                    else:
+                        next_behavior[seat_no] = stable_behavior
+                continue
+
+            self.empty_started_at.pop(seat_no, None)
+            self.seen_non_empty.add(seat_no)
+            next_status[seat_no] = raw_status
+            next_behavior[seat_no] = raw_behavior
+
+        self.status_by_seat = next_status
+        self.behavior_by_seat = next_behavior
+
+        timestamp = format_video_time(frame_idx, fps)
+        events: list[AlertRecord] = []
+        for seat_no in seat_numbers:
+            prev = previous_status.get(seat_no)
+            curr = next_status[seat_no]
+            if prev == curr:
+                continue
+            if curr == "warning":
+                events.append(
+                    AlertRecord(
+                        timestamp=timestamp,
+                        room_name=room_name,
+                        seat_no=seat_no,
+                        level_label=LEVEL_LABELS["warning"],
+                        behavior="待确认",
+                    )
+                )
+            elif prev == "normal" and curr == "empty" and seat_no in self.seen_non_empty:
+                events.append(
+                    AlertRecord(
+                        timestamp=timestamp,
+                        room_name=room_name,
+                        seat_no=seat_no,
+                        level_label=LEVEL_LABELS["warning"],
+                        behavior="座位空出",
+                    )
+                )
+
+        focus_seat = raw_snapshot.focus_seat
+        if focus_seat is not None and next_status.get(focus_seat) == "empty":
+            focus_seat = None
+        if focus_seat is None:
+            warning_seats = [
+                seat_no for seat_no in seat_numbers
+                if next_status[seat_no] in {"warning", "critical"}
+            ]
+            if warning_seats:
+                focus_seat = warning_seats[0]
+        if focus_seat is None:
+            visible_seats = [seat_no for seat_no in seat_numbers if next_status[seat_no] != "empty"]
+            if visible_seats:
+                focus_seat = visible_seats[0]
+
+        alert_count = sum(
+            1 for seat_no in seat_numbers
+            if next_status[seat_no] in {"warning", "critical"}
+        )
+        empty_count = sum(1 for seat_no in seat_numbers if next_status[seat_no] == "empty")
+        return InspectionSnapshot(
+            status_by_seat=next_status,
+            behavior_by_seat=next_behavior,
+            occupied_count=len(seat_numbers) - empty_count,
+            alert_count=alert_count,
+            empty_count=empty_count,
+            focus_seat=focus_seat,
+            events=events,
+        )
 
 
 class RealBindingSession:
@@ -1392,6 +1553,13 @@ if QT_AVAILABLE:
             )
             self.latest_live_source_size = self.layout_base_size
             self.seat_lookup = {seat.seat_no: seat for seat in self.seats}
+            empty_confirm_seconds = (
+                live_config.empty_confirm_seconds if live_config is not None else 5.0
+            )
+            self.binding_stabilizer = SeatStatusStabilizer(empty_confirm_seconds)
+            self.replay_binding_stabilizer = SeatStatusStabilizer(empty_confirm_seconds)
+            self.binding_stabilizer.reset([seat.seat_no for seat in self.seats])
+            self.replay_binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             self.snapshot = self._empty_snapshot()
             self.current_frame = render_placeholder_image(
                 (1920, 1080),
@@ -1889,6 +2057,7 @@ if QT_AVAILABLE:
 
         def _load_replay_rows(self, csv_path: str | Path | None) -> None:
             self.replay_rows_by_frame = {}
+            self.replay_binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             if not csv_path:
                 return
             csv_file = Path(csv_path)
@@ -1902,17 +2071,28 @@ if QT_AVAILABLE:
                         continue
                     self.replay_rows_by_frame.setdefault(frame_idx, []).append(row)
 
-        def _apply_rows_for_frame(self, frame_idx: int) -> None:
+        def _apply_rows_for_frame(self, frame_idx: int, reset_stabilizer: bool = False) -> None:
+            seat_numbers = [seat.seat_no for seat in self.seats]
+            if reset_stabilizer:
+                self.replay_binding_stabilizer.reset(seat_numbers)
             rows = self.replay_rows_by_frame.get(frame_idx, [])
             self.latest_live_rows = list(rows)
-            snapshot, self.live_status_map = build_snapshot_from_binding_rows(
+            raw_snapshot, _ = build_snapshot_from_binding_rows(
                 rows=rows,
-                seat_numbers=[seat.seat_no for seat in self.seats],
+                seat_numbers=seat_numbers,
                 room_name=self.room_name,
                 frame_idx=frame_idx,
                 fps=self.current_fps,
                 previous_status=None,
             )
+            snapshot = self.replay_binding_stabilizer.apply(
+                raw_snapshot=raw_snapshot,
+                seat_numbers=seat_numbers,
+                room_name=self.room_name,
+                frame_idx=frame_idx,
+                fps=self.current_fps,
+            )
+            self.live_status_map = dict(snapshot.status_by_seat)
             self.snapshot = snapshot
 
         def _seek_playback(self, frame_idx: int) -> None:
@@ -1923,7 +2103,7 @@ if QT_AVAILABLE:
             self.current_clean_frame = frame.copy()
             self.current_frame_idx, self.current_total_frames, self.current_fps = self.provider.progress_state()
             if self.mode == "live" and self.live_finished:
-                self._apply_rows_for_frame(self.current_frame_idx)
+                self._apply_rows_for_frame(self.current_frame_idx, reset_stabilizer=True)
                 self.latest_progress_text = f"回看帧 {self.current_frame_idx}/{self.current_total_frames or '?'}"
             self._refresh_dashboard()
 
@@ -2097,6 +2277,8 @@ if QT_AVAILABLE:
                         self.current_total_frames = None
                         self.current_fps = 25.0
                     self.snapshot = self._pending_snapshot()
+                    self.binding_stabilizer.reset([seat.seat_no for seat in self.seats])
+                    self.replay_binding_stabilizer.reset([seat.seat_no for seat in self.seats])
                     self.live_frame_received = False
                     self.live_finished = False
                     self.latest_live_rows = []
@@ -2121,6 +2303,8 @@ if QT_AVAILABLE:
             self.source_traceback = None
             self.live_finished = False
             self.replay_rows_by_frame = {}
+            self.binding_stabilizer.reset([seat.seat_no for seat in self.seats])
+            self.replay_binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             self.current_frame = self.provider.read_next()
             self.current_clean_frame = self.current_frame.copy()
             self.current_frame_idx, self.current_total_frames, self.current_fps = self.provider.progress_state()
@@ -2145,6 +2329,8 @@ if QT_AVAILABLE:
             self.last_presented_mock_at = 0.0
             self.live_finished = False
             self.replay_rows_by_frame = {}
+            self.binding_stabilizer.reset([seat.seat_no for seat in self.seats])
+            self.replay_binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             if self.mode == "mock" and self.provider is not None and self.engine is not None:
                 self.provider.reset()
                 self.engine.reset()
@@ -2229,6 +2415,13 @@ if QT_AVAILABLE:
             self.events_table.setRowCount(0)
             self.live_session = None
             self.live_status_map = None
+            self.binding_stabilizer.empty_confirm_seconds = max(
+                0.0,
+                float(self.live_config.empty_confirm_seconds),
+            )
+            self.replay_binding_stabilizer.empty_confirm_seconds = self.binding_stabilizer.empty_confirm_seconds
+            self.binding_stabilizer.reset([seat.seat_no for seat in self.seats])
+            self.replay_binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             self.source_error = None
             self.source_traceback = None
             self.mode = "live"
@@ -2283,6 +2476,10 @@ if QT_AVAILABLE:
             if self.selected_seat is not None and self.selected_seat not in self.seat_lookup:
                 self.selected_seat = None
             self.snapshot = self._pending_snapshot()
+            seat_numbers = [seat.seat_no for seat in self.seats]
+            self.binding_stabilizer.reset(seat_numbers)
+            self.replay_binding_stabilizer.reset(seat_numbers)
+            self.live_status_map = None
             self.latest_live_rows = []
             self.latest_live_source_size = (frame_width, frame_height)
             self.latest_progress_text = "座位布局已建立，等待实时绑定结果"
@@ -2331,14 +2528,23 @@ if QT_AVAILABLE:
             self.current_fps = fps
             rows = payload.get("rows") or []
             self.latest_live_rows = list(rows)
-            snapshot, self.live_status_map = build_snapshot_from_binding_rows(
+            seat_numbers = [seat.seat_no for seat in self.seats]
+            raw_snapshot, _ = build_snapshot_from_binding_rows(
                 rows=rows,
-                seat_numbers=[seat.seat_no for seat in self.seats],
+                seat_numbers=seat_numbers,
                 room_name=self.room_name,
                 frame_idx=frame_idx,
                 fps=fps,
-                previous_status=self.live_status_map,
+                previous_status=None,
             )
+            snapshot = self.binding_stabilizer.apply(
+                raw_snapshot=raw_snapshot,
+                seat_numbers=seat_numbers,
+                room_name=self.room_name,
+                frame_idx=frame_idx,
+                fps=fps,
+            )
+            self.live_status_map = dict(snapshot.status_by_seat)
             self.snapshot = snapshot
             total_frames = payload.get("total_frames") or "?"
             self.latest_progress_text = (
@@ -2543,7 +2749,7 @@ if QT_AVAILABLE:
                 if role == "student" and seat_display == seat_no:
                     confirmed_candidate = row
                     break
-                if role in {"student", "unknown"} and seat_current == seat_no:
+                if role in {"student", "unknown", "candidate"} and seat_current == seat_no:
                     pending_candidate = row
             return confirmed_candidate or pending_candidate
 
@@ -2708,6 +2914,7 @@ if QT_AVAILABLE:
                     "student": "学生",
                     "teacher": "教师",
                     "unknown": "待确认目标",
+                    "candidate": "待确认目标",
                 }.get(role, role)
                 detail_parts.append(f"角色: {role_label}")
                 track_id = live_row.get("track_id")
@@ -2820,6 +3027,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--re-confirm-seconds", type=float, default=5.0)
     parser.add_argument("--lock-seconds", type=float, default=20.0)
     parser.add_argument("--release-miss-seconds", type=float, default=12.0)
+    parser.add_argument(
+        "--empty-confirm-seconds",
+        type=float,
+        default=5.0,
+        help="UI 中连续未绑定达到 N 秒后才确认座位为空",
+    )
     parser.add_argument("--pending-switch-seconds", type=float, default=1.2)
     parser.add_argument("--pending-hold-seconds", type=float, default=2.0)
     parser.add_argument("--simple-vis", action=argparse.BooleanOptionalAction, default=True)
@@ -2880,6 +3093,7 @@ def main() -> None:
         max_teachers=args.max_teachers,
         frame_callback_stride=args.frame_callback_stride,
         frame_callback_max_width=args.frame_callback_max_width,
+        empty_confirm_seconds=args.empty_confirm_seconds,
     )
 
     qt_app = QApplication(sys.argv)
