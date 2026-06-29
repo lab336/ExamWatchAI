@@ -29,6 +29,7 @@ try:
         QApplication,
         QFileDialog,
         QAbstractItemView,
+        QCheckBox,
         QComboBox,
         QFrame,
         QGridLayout,
@@ -38,6 +39,7 @@ try:
         QLineEdit,
         QMainWindow,
         QPushButton,
+        QScrollArea,
         QSizeGrip,
         QSizePolicy,
         QSplitter,
@@ -204,6 +206,7 @@ class InspectionSnapshot:
 class LiveBindingConfig:
     source: str
     person_weights: str
+    body_weights: str
     desk_weights: str
     output_dir: str
     binding_strategy: str = "head_line"
@@ -876,6 +879,7 @@ class RealBindingSession:
             "--output", self.config.output_dir,
             "--weights", self.config.person_weights,
             "--desk-weights", self.config.desk_weights,
+            "--person-weights", self.config.body_weights,
         ]
         if "binding_video" not in self.config.outputs:
             argv.append("--no-video")
@@ -1628,6 +1632,7 @@ if QT_AVAILABLE:
             self.records: list[AlertRecord] = []
             self.latest_live_rows: list[dict[str, Any]] = []
             self.last_row_by_seat: dict[int, dict[str, Any]] = {}
+            self.seat_overlay_zones: list[dict[str, Any]] = []
             self.pending_live_frame_queue: deque[dict[str, Any]] = deque(maxlen=32)
             self.last_presented_live_at = 0.0
             self.last_presented_mock_at = 0.0
@@ -1639,6 +1644,9 @@ if QT_AVAILABLE:
             self.live_buffer_target = 3
             self.control_sidebar_expanded = True
             self.control_sidebar_last_width = 340
+            self.show_seat_boxes = True
+            self.show_head_boxes = True
+            self.show_person_boxes = True
             self.playback_frame_accumulator = 0.0
             self.resize_edge_margin = 8
             self.resize_edges: tuple[bool, bool, bool, bool] | None = None
@@ -1675,6 +1683,7 @@ if QT_AVAILABLE:
             self.ui_font_family = self.ui_font_families[0]
             self.ui_font_stack = qt_font_stack(self.ui_font_families)
             self.pil_font_small = load_pil_font(22, weight="medium")
+            self.pil_font_tiny = load_pil_font(16, weight="bold")
             self.pil_font_medium = load_pil_font(28, weight="bold")
 
             self._configure_window_style()
@@ -1846,6 +1855,23 @@ if QT_AVAILABLE:
                     border-radius: 8px;
                     padding: 6px 10px;
                 }}
+                QCheckBox {{
+                    color: {TEXT_PRIMARY};
+                    spacing: 10px;
+                    padding: 5px 2px;
+                    background: transparent;
+                }}
+                QCheckBox::indicator {{
+                    width: 18px;
+                    height: 18px;
+                    border-radius: 5px;
+                    border: 1px solid {PANEL_BORDER};
+                    background: {PANEL_MUTED_BG};
+                }}
+                QCheckBox::indicator:checked {{
+                    background: {ACCENT};
+                    border-color: {ACCENT};
+                }}
                 QTableWidget {{
                     background: {PANEL_MUTED_BG};
                     border: none;
@@ -1875,6 +1901,37 @@ if QT_AVAILABLE:
                 }}
                 QSplitter::handle:hover {{
                     background: rgba(94, 181, 255, 0.28);
+                }}
+                QScrollArea#sidebarScrollArea {{
+                    background: transparent;
+                    border: none;
+                }}
+                QScrollArea#sidebarScrollArea > QWidget > QWidget {{
+                    background: transparent;
+                }}
+                QScrollBar:vertical {{
+                    background: rgba(15, 19, 39, 0.42);
+                    width: 10px;
+                    margin: 2px 0 2px 0;
+                    border-radius: 5px;
+                }}
+                QScrollBar::handle:vertical {{
+                    background: rgba(94, 181, 255, 0.45);
+                    min-height: 36px;
+                    border-radius: 5px;
+                }}
+                QScrollBar::handle:vertical:hover {{
+                    background: rgba(94, 181, 255, 0.68);
+                }}
+                QScrollBar::add-line:vertical,
+                QScrollBar::sub-line:vertical {{
+                    height: 0px;
+                    border: none;
+                    background: transparent;
+                }}
+                QScrollBar::add-page:vertical,
+                QScrollBar::sub-page:vertical {{
+                    background: transparent;
                 }}
                 """
             )
@@ -1959,12 +2016,27 @@ if QT_AVAILABLE:
             sidebar_header.addWidget(self.sidebar_toggle_button)
             sidebar_outer.addLayout(sidebar_header)
 
+            self.sidebar_scroll_area = QScrollArea()
+            self.sidebar_scroll_area.setObjectName("sidebarScrollArea")
+            self.sidebar_scroll_area.setWidgetResizable(True)
+            self.sidebar_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+            self.sidebar_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.sidebar_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.sidebar_scroll_area.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Expanding,
+            )
+
             self.sidebar_content = QWidget()
+            self.sidebar_content.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Maximum,
+            )
             control_layout = QVBoxLayout(self.sidebar_content)
             control_layout.setContentsMargins(0, 0, 0, 0)
             control_layout.setSpacing(12)
-            sidebar_outer.addWidget(self.sidebar_content, 1)
-            sidebar_outer.addStretch(1)
+            self.sidebar_scroll_area.setWidget(self.sidebar_content)
+            sidebar_outer.addWidget(self.sidebar_scroll_area, 1)
             self.main_shell_splitter.addWidget(self.control_sidebar)
 
             workspace_container = QWidget()
@@ -2129,6 +2201,32 @@ if QT_AVAILABLE:
             playback_bar.addWidget(self._make_button("全屏", self._toggle_fullscreen), 5, 1)
             control_layout.addLayout(playback_bar)
 
+            visual_title = QLabel("可视化")
+            visual_title.setObjectName("subtitle")
+            control_layout.addWidget(visual_title)
+            visual_grid = QGridLayout()
+            visual_grid.setHorizontalSpacing(8)
+            visual_grid.setVerticalSpacing(4)
+            self.show_seat_boxes_checkbox = self._make_visual_checkbox(
+                "显示座位边框",
+                self.show_seat_boxes,
+                "show_seat_boxes",
+            )
+            self.show_head_boxes_checkbox = self._make_visual_checkbox(
+                "显示 head 框",
+                self.show_head_boxes,
+                "show_head_boxes",
+            )
+            self.show_person_boxes_checkbox = self._make_visual_checkbox(
+                "显示 people 框",
+                self.show_person_boxes,
+                "show_person_boxes",
+            )
+            visual_grid.addWidget(self.show_seat_boxes_checkbox, 0, 0, 1, 2)
+            visual_grid.addWidget(self.show_head_boxes_checkbox, 1, 0, 1, 2)
+            visual_grid.addWidget(self.show_person_boxes_checkbox, 2, 0, 1, 2)
+            control_layout.addLayout(visual_grid)
+
             status_title = QLabel("运行状态")
             status_title.setObjectName("subtitle")
             control_layout.addWidget(status_title)
@@ -2201,7 +2299,7 @@ if QT_AVAILABLE:
             if not hasattr(self, "control_sidebar"):
                 return
             self.control_sidebar_expanded = bool(expanded)
-            self.sidebar_content.setVisible(self.control_sidebar_expanded)
+            self.sidebar_scroll_area.setVisible(self.control_sidebar_expanded)
             self.sidebar_title_label.setVisible(self.control_sidebar_expanded)
             self.sidebar_toggle_button.setText("收起" if self.control_sidebar_expanded else "展开")
             if self.control_sidebar_expanded:
@@ -2241,6 +2339,18 @@ if QT_AVAILABLE:
                 button.setObjectName("primaryButton")
             button.clicked.connect(callback)
             return button
+
+        def _make_visual_checkbox(self, text: str, checked: bool, attr_name: str) -> QCheckBox:
+            checkbox = QCheckBox(text)
+            checkbox.setChecked(bool(checked))
+            checkbox.stateChanged.connect(
+                lambda _state, name=attr_name, item=checkbox: self._on_visual_option_changed(name, item)
+            )
+            return checkbox
+
+        def _on_visual_option_changed(self, attr_name: str, checkbox: QCheckBox) -> None:
+            setattr(self, attr_name, checkbox.isChecked())
+            self._refresh_dashboard()
 
         def _format_progress_time(self, frame_idx: int, total_frames: int | None, fps: float) -> str:
             current_text = format_video_time(max(0, frame_idx), fps)
@@ -2334,6 +2444,18 @@ if QT_AVAILABLE:
             limit = to_int(payload.get("process_frame_limit")) or 0
             if processed is None or processed <= 0:
                 return False
+            if (
+                self.live_config is not None
+                and self.live_config.binding_strategy == "head_line"
+                and self.live_config.body_weights
+            ):
+                expected_person_weights = Path(self.live_config.body_weights).name
+                saved_person_weights = payload.get("person_weights") or payload.get("person_tracking_weights")
+                if (
+                    not saved_person_weights
+                    or Path(str(saved_person_weights)).name != expected_person_weights
+                ):
+                    return False
             if total is None or total <= 0:
                 return True
             expected = min(total, limit) if limit > 0 else total
@@ -2419,7 +2541,12 @@ if QT_AVAILABLE:
             if not binding_video or not Path(binding_video).exists():
                 return False
 
-            self.provider = FrameProvider(binding_video)
+            replay_source = binding_video
+            if self.live_config is not None and self.live_config.source:
+                source_path = Path(self.live_config.source).expanduser()
+                if source_path.exists():
+                    replay_source = str(source_path)
+            self.provider = FrameProvider(replay_source)
             self.provider.reset()
             self.source_error = self.provider.error
             self.source_traceback = None
@@ -2692,6 +2819,7 @@ if QT_AVAILABLE:
                     self.playback_frame_accumulator = 0.0
                     self.latest_live_rows = []
                     self.last_row_by_seat.clear()
+                    self.seat_overlay_zones = []
                     self.latest_live_source_size = self.layout_base_size
                     self.replay_rows_by_frame = {}
                     self.runtime_message = "模型启动中，正在加载视频与权重"
@@ -2714,6 +2842,7 @@ if QT_AVAILABLE:
             self.playback_frame_accumulator = 0.0
             self.replay_rows_by_frame = {}
             self.last_row_by_seat.clear()
+            self.seat_overlay_zones = []
             self.binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             self.replay_binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             self.current_frame = self.provider.read_next()
@@ -2722,6 +2851,7 @@ if QT_AVAILABLE:
             self.snapshot = self.engine.step()
             self.latest_live_rows = []
             self.latest_live_source_size = self.layout_base_size
+            self.seat_overlay_zones = []
             self.runtime_message = "模拟巡检中"
             self.latest_progress_text = "正在使用 mock 数据驱动界面"
             self._update_poll_timer()
@@ -2741,6 +2871,7 @@ if QT_AVAILABLE:
             self.playback_frame_accumulator = 0.0
             self.replay_rows_by_frame = {}
             self.last_row_by_seat.clear()
+            self.seat_overlay_zones = []
             self.binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             self.replay_binding_stabilizer.reset([seat.seat_no for seat in self.seats])
             if self.mode == "mock" and self.provider is not None and self.engine is not None:
@@ -2829,6 +2960,7 @@ if QT_AVAILABLE:
             self.live_session = None
             self.live_status_map = None
             self.last_row_by_seat.clear()
+            self.seat_overlay_zones = []
             self.binding_stabilizer.empty_confirm_seconds = max(
                 0.0,
                 float(self.live_config.empty_confirm_seconds),
@@ -3013,6 +3145,7 @@ if QT_AVAILABLE:
             self.live_status_map = None
             self.latest_live_rows = []
             self.last_row_by_seat.clear()
+            self.seat_overlay_zones = list(zones)
             self.latest_live_source_size = (frame_width, frame_height)
             self.latest_progress_text = "座位布局已建立，等待实时绑定结果"
 
@@ -3084,6 +3217,7 @@ if QT_AVAILABLE:
             self.latest_progress_text = (
                 f"帧 {frame_idx}/{total_frames} | "
                 f"学生 {payload.get('student_count', 0)} | "
+                f"people {payload.get('person_count', 0)} | "
                 f"教师 {payload.get('teacher_count', 0)} | "
                 f"教室内未确认 {payload.get('unknown_count', 0)}"
             )
@@ -3340,6 +3474,28 @@ if QT_AVAILABLE:
                 frame_size=frame_size,
             )
 
+        def _row_person_bbox(
+            self,
+            row: dict[str, Any],
+            frame_size: tuple[int, int] | None = None,
+        ) -> tuple[float, float, float, float] | None:
+            return self._row_bbox_from_fields(
+                row,
+                ("person_x1", "person_y1", "person_x2", "person_y2"),
+                frame_size=frame_size,
+            )
+
+        def _row_body_bbox(
+            self,
+            row: dict[str, Any],
+            frame_size: tuple[int, int] | None = None,
+        ) -> tuple[float, float, float, float] | None:
+            return self._row_bbox_from_fields(
+                row,
+                ("body_x1", "body_y1", "body_x2", "body_y2"),
+                frame_size=frame_size,
+            )
+
         def _row_bbox(
             self,
             row: dict[str, Any],
@@ -3445,37 +3601,169 @@ if QT_AVAILABLE:
             draw.rounded_rectangle(rect, radius=10, fill=(18, 22, 40, 220), outline=rgb_color, width=2)
             draw.text((left + pad_x, top + pad_y - 2), text, fill=TEXT_PRIMARY, font=font)
 
-        def _render_main_view(self) -> None:
-            frame = self.current_frame.copy().convert("RGBA")
-            draw = ImageDraw.Draw(frame, "RGBA")
-            focus_seat = self.selected_seat or self.snapshot.focus_seat
-            focus_row = self._row_for_seat(focus_seat) if focus_seat is not None else None
-            focus_person_box = self._row_bbox(focus_row, frame_size=frame.size) if focus_row is not None else None
+        def _seat_no_for_row(self, row: dict[str, Any]) -> int | None:
+            role = str(row.get("role", "unknown"))
+            seat_display = to_int(row.get("seat_no_display"))
+            seat_current = to_int(row.get("seat_no_current"))
+            if role == "student" and seat_display is not None:
+                return seat_display
+            return seat_current or seat_display
+
+        def _draw_detection_box(
+            self,
+            draw: ImageDraw.ImageDraw,
+            box: tuple[float, float, float, float],
+            label: str,
+            color: tuple[int, int, int],
+            *,
+            width: int = 3,
+        ) -> None:
+            draw.rounded_rectangle(box, radius=10, outline=color, width=width)
+            self._overlay_tag(draw, (box[0], max(18.0, box[1] - 42.0)), label, color)
+
+        def _scale_overlay_point(
+            self,
+            point: list[float] | tuple[float, float],
+            frame_size: tuple[int, int],
+        ) -> tuple[float, float]:
+            base_w, base_h = self.layout_base_size
+            frame_w, frame_h = frame_size
+            sx = frame_w / max(1.0, float(base_w))
+            sy = frame_h / max(1.0, float(base_h))
+            return float(point[0]) * sx, float(point[1]) * sy
+
+        def _draw_compact_label(
+            self,
+            draw: ImageDraw.ImageDraw,
+            text: str,
+            x: float,
+            y: float,
+            bg_color: tuple[int, int, int, int],
+            text_color: tuple[int, int, int] = (0, 0, 0),
+        ) -> None:
+            font = self.pil_font_tiny
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            pad_x = 4
+            pad_y = 2
+            left = max(0.0, float(x))
+            top = max(0.0, float(y))
+            rect = (
+                left,
+                top,
+                left + text_w + pad_x * 2,
+                top + text_h + pad_y * 2,
+            )
+            draw.rectangle(rect, fill=bg_color)
+            draw.text((left + pad_x, top + pad_y - 1), text, fill=text_color, font=font)
+
+        def _draw_seat_grid_overlay(
+            self,
+            draw: ImageDraw.ImageDraw,
+            frame_size: tuple[int, int],
+            focus_seat: int | None,
+        ) -> None:
+            zone_color = (238, 174, 48, 150)
+            desk_color = (50, 230, 72, 230)
+            focus_color = (94, 181, 255, 255)
+            column_colors = [
+                (70, 85, 255, 235),
+                (36, 220, 80, 235),
+                (255, 116, 64, 235),
+                (55, 195, 255, 235),
+                (245, 54, 230, 235),
+            ]
+
+            for zone in self.seat_overlay_zones:
+                raw_polygon = zone.get("display_polygon") or zone.get("polygon")
+                if not raw_polygon or len(raw_polygon) < 3:
+                    continue
+                try:
+                    points = [
+                        self._scale_overlay_point(point, frame_size)
+                        for point in raw_polygon
+                    ]
+                except (TypeError, ValueError, IndexError):
+                    continue
+                draw.line(points + [points[0]], fill=zone_color, width=1)
+
+            seats_by_col: dict[int, list[SeatBox]] = {}
+            for seat in self.seats:
+                seats_by_col.setdefault(int(seat.col_index), []).append(seat)
+
+            for col_idx in sorted(seats_by_col):
+                column = sorted(seats_by_col[col_idx], key=lambda item: item.center_y)
+                centers = []
+                for seat in column:
+                    x1, y1, x2, y2 = self._scaled_box(seat, frame_size)
+                    centers.append(((x1 + x2) / 2.0, (y1 + y2) / 2.0))
+                if len(centers) >= 2:
+                    draw.line(
+                        centers,
+                        fill=column_colors[col_idx % len(column_colors)],
+                        width=3,
+                    )
+                if centers:
+                    label_x, label_y = centers[0]
+                    self._draw_compact_label(
+                        draw,
+                        f"C{col_idx + 1}",
+                        label_x + 5.0,
+                        max(0.0, label_y - 28.0),
+                        column_colors[col_idx % len(column_colors)],
+                    )
 
             for seat in self.seats:
-                box = self._scaled_box(seat, frame.size)
-                status = self.snapshot.status_by_seat.get(seat.seat_no, "normal")
-                behavior = self.snapshot.behavior_by_seat.get(seat.seat_no, "")
-                _, fill_rgba, outline_rgb = self._status_colors(status)
-
-                if status in {"warning", "critical"}:
-                    draw.rounded_rectangle(box, radius=12, fill=fill_rgba, outline=outline_rgb, width=3)
-                    tag_text = f"{seat.seat_no:02d}  {behavior or STATUS_LABELS[status]}"
-                    tag_y = max(16.0, box[1] - 42.0)
-                    self._overlay_tag(draw, (box[0], tag_y), tag_text, outline_rgb)
-
-                if focus_seat == seat.seat_no:
-                    draw.rounded_rectangle(box, radius=14, outline=ACCENT, width=4)
-                    self._overlay_tag(draw, (box[0], box[3] + 10.0), f"聚焦座位 {seat.seat_no:02d}", (94, 181, 255))
-
-            if focus_person_box is not None and focus_seat is not None:
-                draw.rounded_rectangle(focus_person_box, radius=14, outline=(255, 235, 109), width=4)
-                self._overlay_tag(
+                box = self._scaled_box(seat, frame_size)
+                outline = focus_color if focus_seat == seat.seat_no else desk_color
+                width = 3 if focus_seat == seat.seat_no else 2
+                draw.rectangle(box, outline=outline, width=width)
+                self._draw_compact_label(
                     draw,
-                    (focus_person_box[0], max(18.0, focus_person_box[1] - 42.0)),
-                    f"学生 {focus_seat:02d}",
-                    (255, 235, 109),
+                    f"D{seat.seat_no:02d}",
+                    box[0],
+                    max(0.0, box[1] - 20.0),
+                    desk_color,
                 )
+
+        def _render_main_view(self) -> None:
+            base_frame = self.current_clean_frame if self.current_clean_frame is not None else self.current_frame
+            frame = base_frame.copy().convert("RGBA")
+            draw = ImageDraw.Draw(frame, "RGBA")
+            focus_seat = self.selected_seat or self.snapshot.focus_seat
+
+            if self.show_seat_boxes:
+                self._draw_seat_grid_overlay(draw, frame.size, focus_seat)
+
+            for row in self.latest_live_rows:
+                row_seat = self._seat_no_for_row(row)
+                label_id = row_seat if row_seat is not None else to_int(row.get("track_id_raw"))
+                label_suffix = f"{label_id:02d}" if label_id is not None else "?"
+                width = 4 if row_seat is not None and row_seat == focus_seat else 2
+                if self.show_person_boxes:
+                    person_box = (
+                        self._row_person_bbox(row, frame_size=frame.size)
+                        or self._row_body_bbox(row, frame_size=frame.size)
+                    )
+                    if person_box is not None:
+                        self._draw_detection_box(
+                            draw,
+                            person_box,
+                            f"people {label_suffix}",
+                            (255, 235, 109),
+                            width=width,
+                        )
+                if self.show_head_boxes:
+                    head_box = self._row_head_bbox(row, frame_size=frame.size)
+                    if head_box is not None:
+                        self._draw_detection_box(
+                            draw,
+                            head_box,
+                            f"head {label_suffix}",
+                            (94, 255, 184),
+                            width=max(2, width - 1),
+                        )
 
             if self.provider is not None and self.provider.error and self.mode != "live":
                 self._overlay_tag(draw, (24.0, 24.0), self.provider.error[:46], (255, 156, 109))
@@ -3507,17 +3795,24 @@ if QT_AVAILABLE:
             status = self.snapshot.status_by_seat.get(focus_seat, "normal")
             behavior = self.snapshot.behavior_by_seat.get(focus_seat, STATUS_LABELS[status])
             _, _, outline_rgb = self._status_colors(status)
-            draw.rounded_rectangle(seat_box, radius=14, outline=outline_rgb, width=4)
-            if person_box is not None:
-                draw.rounded_rectangle(person_box, radius=14, outline=(255, 235, 109), width=4)
-                self._overlay_tag(
+            if self.show_seat_boxes:
+                draw.rounded_rectangle(seat_box, radius=14, outline=outline_rgb, width=4)
+            if self.show_person_boxes and person_box is not None:
+                self._draw_detection_box(
                     draw,
-                    (person_box[0], max(18.0, person_box[1] - 42.0)),
-                    f"绑定人 {focus_seat:02d}",
+                    person_box,
+                    f"people {focus_seat:02d}",
                     (255, 235, 109),
+                    width=4,
                 )
-            if head_box is not None:
-                draw.rounded_rectangle(head_box, radius=10, outline=(94, 255, 184), width=3)
+            if self.show_head_boxes and head_box is not None:
+                self._draw_detection_box(
+                    draw,
+                    head_box,
+                    f"head {focus_seat:02d}",
+                    (94, 255, 184),
+                    width=3,
+                )
             crop = self._crop_focus_region(frame, seat_box, person_box)
             self.detail_image_label.set_pil_image(crop)
             detail_parts = [
@@ -3537,7 +3832,9 @@ if QT_AVAILABLE:
                 track_id = live_row.get("track_id")
                 if track_id not in (None, ""):
                     detail_parts.append(f"跟踪ID: {track_id}")
-                person_conf = live_row.get("person_conf", live_row.get("conf"))
+                person_conf = live_row.get("person_conf")
+                if person_conf in (None, ""):
+                    person_conf = live_row.get("conf")
                 if person_conf not in (None, ""):
                     try:
                         detail_parts.append(f"置信度: {float(person_conf):.2f}")
@@ -3597,6 +3894,7 @@ def parse_args() -> argparse.Namespace:
     default_source = default_head_line_source if default_head_line_source.exists() else resolve_demo_source(project_root)
     default_layout = project_root / "detect" / "seats.json"
     default_person_weights = project_root / "exam_seat_binding" / "weight" / "besthead.pt"
+    default_body_weights = project_root / "exam_seat_binding" / "weight" / "yolo26mheadpeople2.pt"
     default_desk_weights = project_root / "exam_seat_binding" / "weight" / "yolo11desk.pt"
     default_output_dir = project_root / "exam_seat_binding" / "output" / "head_line_binding1"
 
@@ -3621,7 +3919,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--room-name", type=str, default="第一考场", help="界面显示的考场名称")
     parser.add_argument("--refresh-ms", type=int, default=220, help="界面刷新间隔，单位毫秒")
-    parser.add_argument("--weights", type=str, default=str(default_person_weights), help="人物模型权重")
+    parser.add_argument("--weights", type=str, default=str(default_person_weights), help="头检测模型权重")
+    parser.add_argument("--person-weights", type=str, default=str(default_body_weights), help="人检测跟踪模型权重")
     parser.add_argument("--desk-weights", type=str, default=str(default_desk_weights), help="桌子模型权重")
     parser.add_argument("--output", type=str, default=str(default_output_dir), help="真实检测输出目录")
     parser.add_argument(
@@ -3687,6 +3986,7 @@ def main() -> None:
     live_config = LiveBindingConfig(
         source=args.source,
         person_weights=args.weights,
+        body_weights=args.person_weights,
         desk_weights=args.desk_weights,
         output_dir=args.output,
         binding_strategy=args.binding_strategy,

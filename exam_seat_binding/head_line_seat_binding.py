@@ -36,6 +36,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 DEFAULT_HEAD_WEIGHTS = PROJECT_ROOT / "exam_seat_binding" / "weight" / "besthead.pt"
+DEFAULT_PERSON_WEIGHTS = PROJECT_ROOT / "exam_seat_binding" / "weight" / "yolo26mheadpeople2.pt"
 LEGACY_HEAD_WEIGHT_NAMES = {"yolo26mheadpeople.pt"}
 
 
@@ -89,6 +90,23 @@ def class_name(names, cls_id: int) -> str:
 def box_area(xyxy):
     x1, y1, x2, y2 = [float(v) for v in xyxy]
     return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def xyxy_intersection_area(a, b) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in a]
+    bx1, by1, bx2, by2 = [float(v) for v in b]
+    left = max(ax1, bx1)
+    top = max(ay1, by1)
+    right = min(ax2, bx2)
+    bottom = min(ay2, by2)
+    return max(0.0, right - left) * max(0.0, bottom - top)
+
+
+def xyxy_overlap_ratio(inner_xyxy, outer_xyxy) -> float:
+    area = box_area(inner_xyxy)
+    if area <= 1e-6:
+        return 0.0
+    return xyxy_intersection_area(inner_xyxy, outer_xyxy) / area
 
 
 def is_head_detection(det, names, head_classes: set[int], head_area_max: float) -> bool:
@@ -148,6 +166,87 @@ def head_anchor_from_box(xyxy, mode="center", y_offset=0.0):
     else:
         y = (y1 + y2) / 2.0
     return np.asarray([cx, y + float(y_offset)], dtype=np.float32)
+
+
+def extract_track_detections(results, names) -> list[dict]:
+    if not results:
+        return []
+    boxes = results[0].boxes
+    ids = boxes.id.int().cpu().tolist() if getattr(boxes, "id", None) is not None else None
+    detections = []
+    for idx, box in enumerate(boxes):
+        x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
+        conf = float(box.conf[0])
+        cls_id = int(box.cls[0])
+        tid = int(ids[idx]) if ids is not None else -1
+        detections.append(
+            {
+                "track_id": tid,
+                "xyxy": [x1, y1, x2, y2],
+                "conf": conf,
+                "cls": cls_id,
+                "class_name": class_name(names, cls_id),
+            }
+        )
+    return detections
+
+
+def match_body_detections_to_heads(
+    head_dets: dict[int, dict],
+    head_anchor_pts: dict[int, np.ndarray],
+    body_dets: list[dict],
+) -> dict[int, dict]:
+    matches: dict[int, dict] = {}
+    for tid, head_det in head_dets.items():
+        head_xyxy = head_det["xyxy"]
+        anchor = head_anchor_pts.get(int(tid))
+        if anchor is None:
+            continue
+        hx1, hy1, hx2, hy2 = [float(v) for v in head_xyxy]
+        head_center = xyxy_center(head_xyxy)
+        head_w = max(1.0, hx2 - hx1)
+        head_h = max(1.0, hy2 - hy1)
+        best_det = None
+        best_score = None
+        for det in body_dets:
+            body_xyxy = det["xyxy"]
+            bx1, by1, bx2, by2 = [float(v) for v in body_xyxy]
+            bw = max(1.0, bx2 - bx1)
+            bh = max(1.0, by2 - by1)
+            margin = max(10.0, min(bw, bh) * 0.04)
+            anchor_inside = point_in_xyxy(anchor, body_xyxy, margin=margin)
+            head_overlap = xyxy_overlap_ratio(head_xyxy, body_xyxy)
+            if not anchor_inside and head_overlap < 0.35:
+                continue
+            body_center = xyxy_center(body_xyxy)
+            center_gap = l2(head_center, body_center)
+            horizontal_gap = abs(float(head_center[0]) - float(body_center[0]))
+            if horizontal_gap > max(bw * 0.62, head_w * 3.0):
+                continue
+            if float(head_center[1]) > by2 + head_h:
+                continue
+            if bh < head_h * 1.25 or bw < head_w * 1.05:
+                continue
+            same_track_bonus = -0.35 if int(det.get("track_id", -1)) == int(tid) else 0.0
+            containment_bonus = -0.25 if anchor_inside else 0.0
+            overlap_bonus = -min(0.4, float(head_overlap))
+            area_penalty = min(0.45, box_area(body_xyxy) / max(1.0, box_area(head_xyxy)) / 80.0)
+            score = (
+                center_gap / max(1.0, float(np.hypot(bw, bh)))
+                + area_penalty
+                + same_track_bonus
+                + containment_bonus
+                + overlap_bonus
+            )
+            if best_score is None or score < best_score:
+                best_det = dict(det)
+                best_det["head_overlap"] = float(head_overlap)
+                best_det["head_anchor_inside"] = bool(anchor_inside)
+                best_det["head_body_center_gap"] = float(center_gap)
+                best_score = float(score)
+        if best_det is not None:
+            matches[int(tid)] = best_det
+    return matches
 
 
 class DeskCornerZoneBuilder:
@@ -1729,10 +1828,27 @@ def summarize_tracks(track_seat_votes: dict[int, Counter], seat_track_votes: dic
 
 def run(args):
     args.weights = normalize_head_weights_path(args.weights)
+    if not hasattr(args, "person_weights"):
+        args.person_weights = str(DEFAULT_PERSON_WEIGHTS)
+    if not hasattr(args, "person_classes"):
+        args.person_classes = None
+    if not hasattr(args, "person_conf"):
+        args.person_conf = 0.25
+    if not hasattr(args, "person_iou"):
+        args.person_iou = 0.60
+    if not hasattr(args, "no_person_tracking"):
+        args.no_person_tracking = False
+    if not hasattr(args, "draw_head_boxes"):
+        args.draw_head_boxes = True
+    if not hasattr(args, "draw_person_boxes"):
+        args.draw_person_boxes = True
     if not os.path.isfile(args.source):
         raise FileNotFoundError(f"Video not found: {args.source}")
     if not os.path.isfile(args.weights):
         raise FileNotFoundError(f"Weights not found: {args.weights}")
+    person_tracking_enabled = not bool(getattr(args, "no_person_tracking", False))
+    if person_tracking_enabled and args.person_weights and not os.path.isfile(args.person_weights):
+        raise FileNotFoundError(f"Person weights not found: {args.person_weights}")
     if not os.path.isfile(args.desk_weights):
         raise FileNotFoundError(f"Desk weights not found: {args.desk_weights}")
 
@@ -1809,6 +1925,13 @@ def run(args):
     names = getattr(model, "names", None)
     print(f"Loaded head/person model: {args.weights}")
     print(f"Model classes: {names}")
+    person_model = None
+    person_names = None
+    if person_tracking_enabled and args.person_weights:
+        person_model = YOLO(args.person_weights)
+        person_names = getattr(person_model, "names", None)
+        print(f"Loaded person tracking model: {args.person_weights}")
+        print(f"Person model classes: {person_names}")
 
     cap = cv2.VideoCapture(args.source)
     if not cap.isOpened():
@@ -1878,6 +2001,8 @@ def run(args):
     head_classes = set(parse_classes(args.head_classes) or [])
     body_classes = set(parse_classes(args.body_classes) or [])
     model_classes = parse_classes(args.classes)
+    person_model_classes = parse_classes(args.person_classes)
+    person_model_class_set = set(person_model_classes or [])
     track_seat_votes: dict[int, Counter] = {}
     seat_track_votes: dict[int, Counter] = {}
     seen_tracks: set[int] = set()
@@ -1898,6 +2023,25 @@ def run(args):
             "cls",
             "class_name",
             "conf",
+            "person_track_id",
+            "person_cls",
+            "person_class_name",
+            "person_conf",
+            "person_x1",
+            "person_y1",
+            "person_x2",
+            "person_y2",
+            "person_head_overlap",
+            "person_head_anchor_inside",
+            "person_match_method",
+            "body_track_id",
+            "body_cls",
+            "body_class_name",
+            "body_conf",
+            "body_x1",
+            "body_y1",
+            "body_x2",
+            "body_y2",
             "head_x1",
             "head_y1",
             "head_x2",
@@ -1974,6 +2118,17 @@ def run(args):
             results = model.track(**track_kwargs)
             boxes = results[0].boxes
             ids = boxes.id.int().cpu().tolist() if getattr(boxes, "id", None) is not None else None
+            person_track_dets = []
+            if person_model is not None:
+                person_track_kwargs = dict(track_kwargs)
+                person_track_kwargs["conf"] = args.person_conf
+                person_track_kwargs["iou"] = args.person_iou
+                if person_model_classes is not None:
+                    person_track_kwargs["classes"] = person_model_classes
+                elif "classes" in person_track_kwargs:
+                    person_track_kwargs.pop("classes", None)
+                person_results = person_model.track(**person_track_kwargs)
+                person_track_dets = extract_track_detections(person_results, person_names)
 
             annotated = (
                 draw_layout(
@@ -1992,8 +2147,17 @@ def run(args):
             head_anchor_pts = {}
             head_dets = {}
             body_dets = []
+            person_dets = []
             inside_student_area_by_tid = {}
             body_xyxy_by_tid = {}
+            person_match_by_tid = {}
+            fallback_body_match_by_tid = {}
+
+            for det in person_track_dets:
+                if is_body_detection(det, person_names, person_model_class_set, set(), args.head_area_max):
+                    det = dict(det)
+                    det["source"] = "person_model"
+                    person_dets.append(det)
 
             for idx, box in enumerate(boxes):
                 x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
@@ -2012,6 +2176,7 @@ def run(args):
 
                 if is_body_detection(det, names, body_classes, head_classes, args.head_area_max):
                     det["body_anchor"] = xyxy_center(det["xyxy"])
+                    det["source"] = "head_model"
                     body_dets.append(det)
 
                 if is_head_detection(det, names, head_classes, args.head_area_max):
@@ -2035,6 +2200,21 @@ def run(args):
                     head_dets[tid] = det
                     inside_student_area_by_tid[tid] = inside_student_area
 
+            person_match_by_tid = match_body_detections_to_heads(
+                head_dets,
+                head_anchor_pts,
+                person_dets,
+            )
+            fallback_body_match_by_tid = match_body_detections_to_heads(
+                head_dets,
+                head_anchor_pts,
+                body_dets,
+            )
+            for tid, matched_body in fallback_body_match_by_tid.items():
+                body_xyxy_by_tid[int(tid)] = matched_body["xyxy"]
+            for tid, matched_person in person_match_by_tid.items():
+                body_xyxy_by_tid[int(tid)] = matched_person["xyxy"]
+
             for body in body_dets:
                 bx1, by1, bx2, by2 = [float(v) for v in body["xyxy"]]
                 bw = max(1.0, bx2 - bx1)
@@ -2042,6 +2222,8 @@ def run(args):
                 margin = max(16.0, bw * 0.18)
                 body_center = xyxy_center(body["xyxy"])
                 for tid, anchor in head_anchor_pts.items():
+                    if int(tid) in person_match_by_tid:
+                        continue
                     same_track = int(tid) == int(body["track_id"])
                     anchor_inside = point_in_xyxy(anchor, body["xyxy"], margin=margin)
                     head_body_gap = l2(anchor, body_center)
@@ -2145,6 +2327,22 @@ def run(args):
             else:
                 assignments = {}
             assignments.update(locked_assignments)
+
+            if args.draw_person_boxes:
+                for det in person_dets:
+                    px1, py1, px2, py2 = det["xyxy"]
+                    person_tid = int(det.get("track_id", -1))
+                    person_label = f"P{person_tid}" if person_tid >= 0 else "person"
+                    color = (0, 235, 255)
+                    cv2.rectangle(
+                        annotated,
+                        (int(round(px1)), int(round(py1))),
+                        (int(round(px2)), int(round(py2))),
+                        color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    draw_label(annotated, person_label, px1, max(0, py1 - 8), color)
 
             frame_rows = []
             for person in head_people:
@@ -2313,23 +2511,28 @@ def run(args):
                     color = (0, 0, 255)
                     label = f"raw{tid} unbound"
 
-                cv2.rectangle(
-                    annotated,
-                    (int(round(x1)), int(round(y1))),
-                    (int(round(x2)), int(round(y2))),
-                    color,
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.circle(
-                    annotated,
-                    (int(round(anchor[0])), int(round(anchor[1]))),
-                    4,
-                    color,
-                    -1,
-                    cv2.LINE_AA,
-                )
-                draw_label(annotated, label, x1, max(0, y1 - 8), color)
+                if args.draw_head_boxes:
+                    cv2.rectangle(
+                        annotated,
+                        (int(round(x1)), int(round(y1))),
+                        (int(round(x2)), int(round(y2))),
+                        color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    cv2.circle(
+                        annotated,
+                        (int(round(anchor[0])), int(round(anchor[1]))),
+                        4,
+                        color,
+                        -1,
+                        cv2.LINE_AA,
+                    )
+                    draw_label(annotated, label, x1, max(0, y1 - 8), color)
+
+                matched_person = person_match_by_tid.get(tid)
+                fallback_body = fallback_body_match_by_tid.get(tid)
+                active_body = matched_person or fallback_body
 
                 row_data = {
                     "frame_idx": frame_idx,
@@ -2340,6 +2543,57 @@ def run(args):
                     "cls": int(det["cls"]),
                     "class_name": det["class_name"],
                     "conf": round(float(det["conf"]), 5),
+                    "person_track_id": (
+                        int(matched_person["track_id"]) if matched_person is not None else None
+                    ),
+                    "person_cls": int(matched_person["cls"]) if matched_person is not None else None,
+                    "person_class_name": (
+                        matched_person["class_name"] if matched_person is not None else None
+                    ),
+                    "person_conf": (
+                        round(float(matched_person["conf"]), 5) if matched_person is not None else None
+                    ),
+                    "person_x1": (
+                        round(float(matched_person["xyxy"][0]), 2) if matched_person is not None else None
+                    ),
+                    "person_y1": (
+                        round(float(matched_person["xyxy"][1]), 2) if matched_person is not None else None
+                    ),
+                    "person_x2": (
+                        round(float(matched_person["xyxy"][2]), 2) if matched_person is not None else None
+                    ),
+                    "person_y2": (
+                        round(float(matched_person["xyxy"][3]), 2) if matched_person is not None else None
+                    ),
+                    "person_head_overlap": (
+                        round(float(matched_person.get("head_overlap", 0.0)), 6)
+                        if matched_person is not None else None
+                    ),
+                    "person_head_anchor_inside": (
+                        bool(matched_person.get("head_anchor_inside", False))
+                        if matched_person is not None else None
+                    ),
+                    "person_match_method": (
+                        matched_person.get("source") if matched_person is not None else None
+                    ),
+                    "body_track_id": int(active_body["track_id"]) if active_body is not None else None,
+                    "body_cls": int(active_body["cls"]) if active_body is not None else None,
+                    "body_class_name": active_body["class_name"] if active_body is not None else None,
+                    "body_conf": (
+                        round(float(active_body["conf"]), 5) if active_body is not None else None
+                    ),
+                    "body_x1": (
+                        round(float(active_body["xyxy"][0]), 2) if active_body is not None else None
+                    ),
+                    "body_y1": (
+                        round(float(active_body["xyxy"][1]), 2) if active_body is not None else None
+                    ),
+                    "body_x2": (
+                        round(float(active_body["xyxy"][2]), 2) if active_body is not None else None
+                    ),
+                    "body_y2": (
+                        round(float(active_body["xyxy"][3]), 2) if active_body is not None else None
+                    ),
                     "head_x1": round(x1, 2),
                     "head_y1": round(y1, 2),
                     "head_x2": round(x2, 2),
@@ -2434,6 +2688,7 @@ def run(args):
                         "fps": float(fps),
                         "total_frames": int(total_frames),
                         "rows": list(frame_rows),
+                        "person_count": int(len(person_dets)),
                         "student_count": sum(1 for row in frame_rows if row.get("seat_no_display") is not None),
                         "teacher_count": sum(1 for row in frame_rows if row.get("teacher_like")),
                         "unknown_count": sum(
@@ -2465,6 +2720,7 @@ def run(args):
     payload = {
         "source": args.source,
         "weights": args.weights,
+        "person_weights": args.person_weights if person_tracking_enabled else None,
         "desk_weights": args.desk_weights,
         "fps": float(fps),
         "total_frames": int(total_frames),
@@ -2482,12 +2738,18 @@ def run(args):
         "desk_count": int(len(desks)),
         "column_line_count": int(len(column_lines)),
         "head_classes": sorted(int(v) for v in head_classes),
+        "person_classes": (
+            sorted(int(v) for v in person_model_classes)
+            if person_model_classes is not None else None
+        ),
         "head_anchor": args.head_anchor,
         "head_y_offset": float(args.head_y_offset),
         "student_area_padding": float(args.student_area_padding),
         "first_column_head_pad_x": float(args.first_column_head_pad_x),
         "first_column_head_pad_y": float(args.first_column_head_pad_y),
         "draw_seat_zones": bool(args.draw_seat_zones),
+        "draw_head_boxes": bool(args.draw_head_boxes),
+        "draw_person_boxes": bool(args.draw_person_boxes),
         "seat_head_padding": float(args.seat_head_padding),
         "first_col_seat_head_padding": float(args.first_col_seat_head_padding),
         "seat_head_max_outside": float(args.seat_head_max_outside),
@@ -2613,7 +2875,12 @@ def build_arg_parser():
     p.add_argument(
         "--weights",
         default="exam_seat_binding/weight/besthead.pt",
-        help="Head/person YOLO weights",
+        help="Head YOLO weights",
+    )
+    p.add_argument(
+        "--person-weights",
+        default=str(DEFAULT_PERSON_WEIGHTS),
+        help="Person YOLO weights used to track full-body boxes for preview and binding context",
     )
     p.add_argument(
         "--desk-weights",
@@ -2631,6 +2898,10 @@ def build_arg_parser():
     p.add_argument("--half", action="store_true")
     p.add_argument("--tracker", default="bytetrack.yaml")
     p.add_argument("--classes", default=None, help="Optional YOLO class IDs to track, comma-separated")
+    p.add_argument("--person-classes", default=None, help="Optional person model class IDs to track, comma-separated")
+    p.add_argument("--person-conf", type=float, default=0.25)
+    p.add_argument("--person-iou", type=float, default=0.60)
+    p.add_argument("--no-person-tracking", action="store_true")
     p.add_argument("--head-classes", default=None, help="Head class IDs, comma-separated; auto by class name if empty")
     p.add_argument("--body-classes", default=None, help="Person/body class IDs, comma-separated; auto by class name if empty")
     p.add_argument("--head-area-max", type=float, default=6500.0, help="Fallback head area limit when class names are unclear")
@@ -2954,6 +3225,8 @@ def build_arg_parser():
     )
 
     p.add_argument("--draw-layout", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--draw-head-boxes", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--draw-person-boxes", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--draw-student-area", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
         "--draw-seat-zones",
