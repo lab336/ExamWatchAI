@@ -3738,7 +3738,11 @@ if QT_AVAILABLE:
 
             for row in self.latest_live_rows:
                 row_seat = self._seat_no_for_row(row)
-                label_id = row_seat if row_seat is not None else to_int(row.get("track_id_raw"))
+                label_id = (
+                    row_seat
+                    if row_seat is not None
+                    else to_int(row.get("identity_id")) or to_int(row.get("track_id_raw"))
+                )
                 label_suffix = f"{label_id:02d}" if label_id is not None else "?"
                 width = 4 if row_seat is not None and row_seat == focus_seat else 2
                 if self.show_person_boxes:
@@ -3893,7 +3897,13 @@ def parse_args() -> argparse.Namespace:
     default_head_line_source = project_root / "data" / "1.10" / "clipleft" / "merged_output.mp4"
     default_source = default_head_line_source if default_head_line_source.exists() else resolve_demo_source(project_root)
     default_layout = project_root / "detect" / "seats.json"
-    default_person_weights = project_root / "exam_seat_binding" / "weight" / "trackheadpeople.pt"
+    requested_unified_weights = project_root / "test" / "model" / "trackheadpeople.pt"
+    packaged_unified_weights = project_root / "exam_seat_binding" / "weight" / "trackheadpeople.pt"
+    default_person_weights = (
+        requested_unified_weights
+        if requested_unified_weights.exists()
+        else packaged_unified_weights
+    )
     default_body_weights = ""
     default_desk_weights = project_root / "exam_seat_binding" / "weight" / "yolo11desk.pt"
     default_output_dir = project_root / "exam_seat_binding" / "output" / "head_line_binding1"
