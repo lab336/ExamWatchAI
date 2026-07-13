@@ -25,6 +25,7 @@ import os
 import sys
 from collections import Counter, deque
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -37,6 +38,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 DEFAULT_HEAD_WEIGHTS = PROJECT_ROOT / "exam_seat_binding" / "weight" / "besthead.pt"
 DEFAULT_PERSON_WEIGHTS = PROJECT_ROOT / "exam_seat_binding" / "weight" / "yolo26mheadpeople2.pt"
+DEFAULT_UNIFIED_WEIGHTS = PROJECT_ROOT / "exam_seat_binding" / "weight" / "trackheadpeople.pt"
 LEGACY_HEAD_WEIGHT_NAMES = {"yolo26mheadpeople.pt"}
 
 
@@ -1332,6 +1334,153 @@ class TrackMotionFilter:
         )
 
 
+class StableIdentityRegistry:
+    """
+    Remap raw per-frame tracker ids to persistent stable ids.
+
+    ByteTrack/BoT-SORT drops a track after a short buffer of no match and
+    hands out a brand-new raw id when the same head/person reappears
+    (occlusion, a bowed head, a momentary miss). Every stateful piece of the
+    binding pipeline (seat ownership, motion history, vote counters) is keyed
+    by track id, so a raw-id change resets all of that state even though the
+    physical person never left. This registry sits between the raw tracker
+    output and the rest of the pipeline: a raw id that vanishes is kept in a
+    short-term "lost" pool and, if a new raw id later appears close to its
+    last known position, the old stable id is handed back instead of minting
+    a new one.
+
+    Head and person/body detections are tracked as two independent instances
+    (one per role). They complement each other via ``partner_stable_by_raw``:
+    when the head of a student is briefly lost but their body stays tracked
+    continuously (or vice versa), the still-tracked role's stable id is
+    passed in as corroborating evidence, which relaxes both the recovery time
+    budget and the spatial gate for the missing role.
+    """
+
+    def __init__(
+        self,
+        fps: float,
+        recover_seconds: float = 6.0,
+        recover_seconds_linked: float = 20.0,
+        max_drift_speed: float = 140.0,
+        min_recover_radius: float = 70.0,
+        linked_radius_multiplier: float = 2.5,
+    ):
+        self.fps = max(1.0, float(fps))
+        self.recover_frames = max(1, int(round(float(recover_seconds) * self.fps)))
+        self.recover_frames_linked = max(
+            self.recover_frames,
+            int(round(float(recover_seconds_linked) * self.fps)),
+        )
+        self.max_drift_speed = float(max_drift_speed)
+        self.min_recover_radius = float(min_recover_radius)
+        self.linked_radius_multiplier = float(linked_radius_multiplier)
+        self._next_stable_id = 1
+        self.active: dict[int, dict] = {}
+        self.lost: dict[int, dict] = {}
+
+    def _new_stable_id(self) -> int:
+        stable_id = self._next_stable_id
+        self._next_stable_id += 1
+        return stable_id
+
+    def resolve(
+        self,
+        frame_idx: int,
+        items: list[tuple[int, Any, list]],
+        partner_stable_by_raw: dict[int, int] | None = None,
+    ) -> dict[int, int]:
+        """
+        items: list of (raw_id, anchor_xy, xyxy) for this frame's detections
+        of one role (head or body). Returns {raw_id: stable_id}.
+        """
+        partner_stable_by_raw = partner_stable_by_raw or {}
+        out: dict[int, int] = {}
+        seen_raw: set[int] = set()
+
+        for raw_id, anchor, xyxy in items:
+            raw_id = int(raw_id)
+            seen_raw.add(raw_id)
+            partner = partner_stable_by_raw.get(raw_id)
+            prev = self.active.get(raw_id)
+            if prev is not None:
+                stable_id = int(prev["stable_id"])
+            else:
+                stable_id = self._recover_or_create(frame_idx, anchor, xyxy, partner)
+            self.active[raw_id] = {
+                "stable_id": stable_id,
+                "anchor": np.asarray(anchor, dtype=np.float32),
+                "xyxy": [float(v) for v in xyxy],
+                "frame_idx": int(frame_idx),
+                "partner_stable_id": (
+                    partner if partner is not None
+                    else (prev.get("partner_stable_id") if prev is not None else None)
+                ),
+            }
+            out[raw_id] = stable_id
+
+        for raw_id in list(self.active):
+            if raw_id in seen_raw:
+                continue
+            record = self.active.pop(raw_id)
+            record["lost_since_frame"] = int(frame_idx)
+            self.lost[int(record["stable_id"])] = record
+
+        for stable_id in list(self.lost):
+            record = self.lost[stable_id]
+            budget = (
+                self.recover_frames_linked
+                if record.get("partner_stable_id") is not None
+                else self.recover_frames
+            )
+            if int(frame_idx) - int(record["lost_since_frame"]) > budget:
+                del self.lost[stable_id]
+
+        return out
+
+    def _recover_or_create(
+        self,
+        frame_idx: int,
+        anchor,
+        xyxy,
+        partner_stable_id: int | None,
+    ) -> int:
+        best_stable_id = None
+        best_dist = None
+        for stable_id, record in self.lost.items():
+            gap_frames = int(frame_idx) - int(record["lost_since_frame"])
+            is_linked_match = (
+                partner_stable_id is not None
+                and record.get("partner_stable_id") == partner_stable_id
+            )
+            budget = self.recover_frames_linked if is_linked_match else self.recover_frames
+            if gap_frames > budget:
+                continue
+
+            gap_seconds = gap_frames / self.fps
+            lx1, ly1, lx2, ly2 = [float(v) for v in record["xyxy"]]
+            box_diag = float(np.hypot(max(1.0, lx2 - lx1), max(1.0, ly2 - ly1)))
+            radius = max(
+                self.min_recover_radius,
+                box_diag * 0.6,
+                self.max_drift_speed * gap_seconds,
+            )
+            if is_linked_match:
+                radius *= self.linked_radius_multiplier
+
+            dist = l2(anchor, record["anchor"])
+            if dist > radius:
+                continue
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_stable_id = stable_id
+
+        if best_stable_id is not None:
+            del self.lost[best_stable_id]
+            return int(best_stable_id)
+        return self._new_stable_id()
+
+
 class EvidenceSeatManager:
     """
     Seat state machine with evidence-based bind, switch, and release.
@@ -1829,7 +1978,7 @@ def summarize_tracks(track_seat_votes: dict[int, Counter], seat_track_votes: dic
 def run(args):
     args.weights = normalize_head_weights_path(args.weights)
     if not hasattr(args, "person_weights"):
-        args.person_weights = str(DEFAULT_PERSON_WEIGHTS)
+        args.person_weights = ""
     if not hasattr(args, "person_classes"):
         args.person_classes = None
     if not hasattr(args, "person_conf"):
@@ -1842,6 +1991,16 @@ def run(args):
         args.draw_head_boxes = True
     if not hasattr(args, "draw_person_boxes"):
         args.draw_person_boxes = True
+    if not hasattr(args, "id_recover_seconds"):
+        args.id_recover_seconds = 6.0
+    if not hasattr(args, "id_recover_seconds_linked"):
+        args.id_recover_seconds_linked = 20.0
+    if not hasattr(args, "id_recover_max_speed"):
+        args.id_recover_max_speed = 140.0
+    if not hasattr(args, "id_recover_min_radius"):
+        args.id_recover_min_radius = 70.0
+    if not hasattr(args, "id_recover_linked_radius_multiplier"):
+        args.id_recover_linked_radius_multiplier = 2.5
     if not os.path.isfile(args.source):
         raise FileNotFoundError(f"Video not found: {args.source}")
     if not os.path.isfile(args.weights):
@@ -1989,6 +2148,16 @@ def run(args):
         stationary_seconds=args.motion_stationary_seconds,
         bind_cooldown_seconds=args.motion_bind_cooldown_seconds,
     )
+    identity_kwargs = dict(
+        fps=fps,
+        recover_seconds=args.id_recover_seconds,
+        recover_seconds_linked=args.id_recover_seconds_linked,
+        max_drift_speed=args.id_recover_max_speed,
+        min_recover_radius=args.id_recover_min_radius,
+        linked_radius_multiplier=args.id_recover_linked_radius_multiplier,
+    )
+    head_identity = StableIdentityRegistry(**identity_kwargs)
+    body_identity = StableIdentityRegistry(**identity_kwargs)
     writer = None
     if not args.no_video:
         writer = cv2.VideoWriter(
@@ -2240,6 +2409,96 @@ def run(args):
                         or box_area(body["xyxy"]) < box_area(prev_body)
                     ):
                         body_xyxy_by_tid[int(tid)] = body["xyxy"]
+
+            # --- Stable identity resolution -------------------------------
+            # Raw ByteTrack/BoT-SORT ids churn whenever a head/person is
+            # briefly missed (occlusion, a bowed head). Remap raw ids to
+            # persistent stable ids here, before any stateful logic below
+            # keys off "tid", so a short gap doesn't reset seat/motion/vote
+            # history. Head and body get independent registries that
+            # complement each other: whichever role stayed continuously
+            # tracked corroborates recovery of the other role's stable id.
+            raw_head_to_raw_body: dict[int, int] = {}
+            for raw_tid in head_dets:
+                matched = person_match_by_tid.get(raw_tid) or fallback_body_match_by_tid.get(raw_tid)
+                if matched is not None:
+                    raw_head_to_raw_body[raw_tid] = int(matched["track_id"])
+            raw_body_to_raw_head: dict[int, int] = {}
+            for raw_head_tid, raw_body_tid in raw_head_to_raw_body.items():
+                raw_body_to_raw_head.setdefault(raw_body_tid, raw_head_tid)
+
+            body_items = [
+                (int(det["track_id"]), xyxy_center(det["xyxy"]), det["xyxy"])
+                for det in body_dets
+            ]
+            partner_stable_for_body: dict[int, int] = {}
+            for raw_body_tid, raw_head_tid in raw_body_to_raw_head.items():
+                head_active = head_identity.active.get(raw_head_tid)
+                if head_active is not None:
+                    partner_stable_for_body[raw_body_tid] = int(head_active["stable_id"])
+            body_stable_by_raw = body_identity.resolve(
+                frame_idx, body_items, partner_stable_by_raw=partner_stable_for_body
+            )
+
+            head_items = [
+                (raw_tid, head_anchor_pts[raw_tid], head_dets[raw_tid]["xyxy"])
+                for raw_tid in head_dets
+            ]
+            partner_stable_for_head: dict[int, int] = {}
+            for raw_head_tid, raw_body_tid in raw_head_to_raw_body.items():
+                body_active = body_identity.active.get(raw_body_tid)
+                if body_active is not None:
+                    partner_stable_for_head[raw_head_tid] = int(body_active["stable_id"])
+            head_stable_by_raw = head_identity.resolve(
+                frame_idx, head_items, partner_stable_by_raw=partner_stable_for_head
+            )
+
+            def _remap_det(det: dict, stable_id: int) -> dict:
+                remapped = dict(det)
+                remapped["track_id_raw"] = int(det["track_id"])
+                remapped["track_id"] = int(stable_id)
+                return remapped
+
+            def _remap_match(match_by_raw_head: dict) -> dict:
+                remapped = {}
+                for raw_tid, matched in match_by_raw_head.items():
+                    if raw_tid not in head_stable_by_raw:
+                        continue
+                    raw_body_tid = int(matched["track_id"])
+                    stable_body_tid = body_stable_by_raw.get(raw_body_tid, raw_body_tid)
+                    remapped[head_stable_by_raw[raw_tid]] = _remap_det(matched, stable_body_tid)
+                return remapped
+
+            body_dets = [
+                _remap_det(det, body_stable_by_raw[int(det["track_id"])])
+                for det in body_dets
+            ]
+            person_like_dets = person_dets if person_dets else body_dets
+            head_people = [
+                _remap_det(person, head_stable_by_raw[int(person["track_id"])])
+                for person in head_people
+            ]
+            head_dets = {
+                head_stable_by_raw[raw_tid]: _remap_det(det, head_stable_by_raw[raw_tid])
+                for raw_tid, det in head_dets.items()
+            }
+            head_anchor_pts = {
+                head_stable_by_raw[raw_tid]: anchor
+                for raw_tid, anchor in head_anchor_pts.items()
+            }
+            inside_student_area_by_tid = {
+                head_stable_by_raw[raw_tid]: value
+                for raw_tid, value in inside_student_area_by_tid.items()
+            }
+            body_xyxy_by_tid = {
+                head_stable_by_raw[raw_tid]: value
+                for raw_tid, value in body_xyxy_by_tid.items()
+                if raw_tid in head_stable_by_raw
+            }
+            person_match_by_tid = _remap_match(person_match_by_tid)
+            fallback_body_match_by_tid = _remap_match(fallback_body_match_by_tid)
+            # ----------------------------------------------------------------
+
             visible_head_track_ids = set(int(tid) for tid in head_dets)
             motion_by_tid = {
                 int(tid): motion_filter.update(int(tid), frame_idx, anchor)
@@ -2329,7 +2588,7 @@ def run(args):
             assignments.update(locked_assignments)
 
             if args.draw_person_boxes:
-                for det in person_dets:
+                for det in person_like_dets:
                     px1, py1, px2, py2 = det["xyxy"]
                     person_tid = int(det.get("track_id", -1))
                     person_label = f"P{person_tid}" if person_tid >= 0 else "person"
@@ -2539,7 +2798,7 @@ def run(args):
                     "timestamp": round(frame_idx / fps, 3),
                     "track_id": stable_track_id,
                     "student_id": stable_track_id,
-                    "track_id_raw": tid,
+                    "track_id_raw": person.get("track_id_raw", tid),
                     "cls": int(det["cls"]),
                     "class_name": det["class_name"],
                     "conf": round(float(det["conf"]), 5),
@@ -2688,7 +2947,7 @@ def run(args):
                         "fps": float(fps),
                         "total_frames": int(total_frames),
                         "rows": list(frame_rows),
-                        "person_count": int(len(person_dets)),
+                        "person_count": int(len(person_like_dets)),
                         "student_count": sum(1 for row in frame_rows if row.get("seat_no_display") is not None),
                         "teacher_count": sum(1 for row in frame_rows if row.get("teacher_like")),
                         "unknown_count": sum(
@@ -2874,13 +3133,17 @@ def build_arg_parser():
     )
     p.add_argument(
         "--weights",
-        default="exam_seat_binding/weight/besthead.pt",
-        help="Head YOLO weights",
+        default=str(DEFAULT_UNIFIED_WEIGHTS),
+        help="Head (+ person, if the model has both classes) YOLO weights",
     )
     p.add_argument(
         "--person-weights",
-        default=str(DEFAULT_PERSON_WEIGHTS),
-        help="Person YOLO weights used to track full-body boxes for preview and binding context",
+        default="",
+        help=(
+            "Optional second YOLO model tracked independently for full-body boxes. "
+            "Leave empty (default) when --weights already detects both head and "
+            "person classes in one pass."
+        ),
     )
     p.add_argument(
         "--desk-weights",
@@ -3163,6 +3426,40 @@ def build_arg_parser():
     p.add_argument("--large-move-line-scale", type=float, default=2.0)
     p.add_argument("--large-move-depth-scale", type=float, default=2.0)
     p.add_argument("--large-move-center-scale", type=float, default=1.4)
+
+    p.add_argument(
+        "--id-recover-seconds",
+        type=float,
+        default=6.0,
+        help="Seconds a lost head/person track id may be recovered by a nearby new detection",
+    )
+    p.add_argument(
+        "--id-recover-seconds-linked",
+        type=float,
+        default=20.0,
+        help=(
+            "Extended recovery window used when the still-tracked complementary "
+            "role (head or person) corroborates that it is the same person"
+        ),
+    )
+    p.add_argument(
+        "--id-recover-max-speed",
+        type=float,
+        default=140.0,
+        help="Assumed max drift speed (px/sec) while a track id is lost, used to size the recovery search radius",
+    )
+    p.add_argument(
+        "--id-recover-min-radius",
+        type=float,
+        default=70.0,
+        help="Minimum recovery search radius in pixels regardless of elapsed lost time",
+    )
+    p.add_argument(
+        "--id-recover-linked-radius-multiplier",
+        type=float,
+        default=2.5,
+        help="Multiplier applied to the recovery search radius when corroborated by the complementary role",
+    )
 
     p.add_argument("--initial-bind-seconds", type=float, default=1.0)
     p.add_argument(

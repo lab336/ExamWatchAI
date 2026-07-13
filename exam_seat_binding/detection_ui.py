@@ -3893,8 +3893,8 @@ def parse_args() -> argparse.Namespace:
     default_head_line_source = project_root / "data" / "1.10" / "clipleft" / "merged_output.mp4"
     default_source = default_head_line_source if default_head_line_source.exists() else resolve_demo_source(project_root)
     default_layout = project_root / "detect" / "seats.json"
-    default_person_weights = project_root / "exam_seat_binding" / "weight" / "besthead.pt"
-    default_body_weights = project_root / "exam_seat_binding" / "weight" / "yolo26mheadpeople2.pt"
+    default_person_weights = project_root / "exam_seat_binding" / "weight" / "trackheadpeople.pt"
+    default_body_weights = ""
     default_desk_weights = project_root / "exam_seat_binding" / "weight" / "yolo11desk.pt"
     default_output_dir = project_root / "exam_seat_binding" / "output" / "head_line_binding1"
 
@@ -3919,8 +3919,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--room-name", type=str, default="第一考场", help="界面显示的考场名称")
     parser.add_argument("--refresh-ms", type=int, default=220, help="界面刷新间隔，单位毫秒")
-    parser.add_argument("--weights", type=str, default=str(default_person_weights), help="头检测模型权重")
-    parser.add_argument("--person-weights", type=str, default=str(default_body_weights), help="人检测跟踪模型权重")
+    parser.add_argument("--weights", type=str, default=str(default_person_weights), help="头+人检测模型权重（统一模型）")
+    parser.add_argument(
+        "--person-weights",
+        type=str,
+        default=str(default_body_weights),
+        help="可选：独立的人体跟踪模型权重；留空则使用 --weights 中的人体类别（默认，推荐）",
+    )
     parser.add_argument("--desk-weights", type=str, default=str(default_desk_weights), help="桌子模型权重")
     parser.add_argument("--output", type=str, default=str(default_output_dir), help="真实检测输出目录")
     parser.add_argument(
