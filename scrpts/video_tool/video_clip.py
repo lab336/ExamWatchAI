@@ -149,13 +149,13 @@ def main():
         description='视频剪辑工具',
         epilog='时间格式说明: --start "1:30" (1分30秒) 或 --start 90 (90秒)'
     )
-    parser.add_argument('--input', type=str, default='data/1.10/topleft/00000000017000000.mp4',
+    parser.add_argument('--input', type=str, default='data/origin_video/gk7401273C2C88_1749551630_2.mp4',
                         help='输入视频路径')
-    parser.add_argument('--output', type=str, default='data/1.10/clipleft/clipped_testdata2.mp4',
+    parser.add_argument('--output', type=str, default='data/origin_video/output/1.mp4',
                         help='输出视频路径')
-    parser.add_argument('--start', type=str, default='16:16',
+    parser.add_argument('--start', type=str, default='0:01',
                         help='开始时间 - 支持两种格式: 秒数(如120)或分:秒(如2:30)')
-    parser.add_argument('--duration', type=str, default='6:00',
+    parser.add_argument('--duration', type=str, default='0:30',
                         help='持续时间 - 支持两种格式: 秒数(如30)或分:秒(如0:30)')
     
     args = parser.parse_args()

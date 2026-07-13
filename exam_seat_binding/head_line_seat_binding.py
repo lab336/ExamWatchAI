@@ -255,6 +255,75 @@ def match_body_detections_to_heads(
     return matches
 
 
+def match_bodies_to_heads_for_identity(
+    head_dets: dict[int, dict],
+    body_dets: list[dict],
+) -> dict[int, dict]:
+    """Strict one-to-one head/body pairing used only for identity output.
+
+    The existing seat-binding matcher intentionally remains unchanged.  This
+    matcher adds the anatomical ordering constraint needed by downstream
+    action recognition: a matched head must lie horizontally over/inside the
+    body and in the upper part of the person box.
+    """
+    candidates: list[tuple[float, int, int, dict]] = []
+    for raw_head_id, head_det in head_dets.items():
+        hx1, hy1, hx2, hy2 = [float(v) for v in head_det["xyxy"]]
+        head_w = max(1.0, hx2 - hx1)
+        head_h = max(1.0, hy2 - hy1)
+        head_cx = (hx1 + hx2) / 2.0
+        head_cy = (hy1 + hy2) / 2.0
+
+        for body_idx, body_det in enumerate(body_dets):
+            bx1, by1, bx2, by2 = [float(v) for v in body_det["xyxy"]]
+            body_w = max(1.0, bx2 - bx1)
+            body_h = max(1.0, by2 - by1)
+            body_cx = (bx1 + bx2) / 2.0
+            body_cy = (by1 + by2) / 2.0
+
+            if body_h < head_h * 1.25 or body_w < head_w * 1.05:
+                continue
+
+            # The head may extend slightly outside the detector's person box,
+            # but its centre must be horizontally supported by that body.
+            horizontal_margin = max(8.0, body_w * 0.08)
+            if not (bx1 - horizontal_margin <= head_cx <= bx2 + horizontal_margin):
+                continue
+
+            # Anatomical ordering: head centre above body centre and the head
+            # bottom still within the upper portion of the person box.  The
+            # small top allowance handles person boxes that start below hair.
+            if head_cy >= body_cy:
+                continue
+            if head_cy < by1 - max(head_h, body_h * 0.12):
+                continue
+            if hy2 > by1 + body_h * 0.58:
+                continue
+
+            horizontal_gap = abs(head_cx - body_cx) / body_w
+            upper_position = (head_cy - by1) / body_h
+            expected_upper_position = 0.12
+            vertical_gap = abs(upper_position - expected_upper_position)
+            head_overlap = xyxy_overlap_ratio(head_det["xyxy"], body_det["xyxy"])
+            score = horizontal_gap * 1.8 + vertical_gap - min(0.5, head_overlap) * 0.7
+
+            matched = dict(body_det)
+            matched["head_overlap"] = float(head_overlap)
+            matched["head_above_body"] = True
+            matched["head_body_vertical_ratio"] = float(upper_position)
+            matched["head_body_horizontal_gap_ratio"] = float(horizontal_gap)
+            candidates.append((float(score), int(raw_head_id), int(body_idx), matched))
+
+    matches: dict[int, dict] = {}
+    used_body_indices: set[int] = set()
+    for _score, raw_head_id, body_idx, matched in sorted(candidates, key=lambda item: item[0]):
+        if raw_head_id in matches or body_idx in used_body_indices:
+            continue
+        matches[raw_head_id] = matched
+        used_body_indices.add(body_idx)
+    return matches
+
+
 class DeskCornerZoneBuilder:
     """
     Build seat zones by connecting adjacent desk-box corners in each column.
@@ -2591,33 +2660,14 @@ def run(args):
             body_dets_by_raw = {
                 int(det["track_id"]): det for det in body_source_dets
             }
-            raw_head_to_raw_body: dict[int, int] = {}
-            identity_link_candidates: list[tuple[float, int, int]] = []
-            for raw_head_id in head_dets:
-                matched = (
-                    person_match_by_tid.get(raw_head_id)
-                    if person_model is not None
-                    else fallback_body_match_by_tid.get(raw_head_id)
-                )
-                if matched is not None:
-                    identity_link_candidates.append(
-                        (
-                            float(matched.get("head_body_center_gap", float("inf"))),
-                            int(raw_head_id),
-                            int(matched["track_id"]),
-                        )
-                    )
-            # Identity-output association is one-to-one, but the original
-            # person/body matching dictionaries above remain untouched for
-            # the existing seat-binding calculations.
-            used_identity_heads: set[int] = set()
-            used_identity_bodies: set[int] = set()
-            for _gap, raw_head_id, raw_body_id in sorted(identity_link_candidates):
-                if raw_head_id in used_identity_heads or raw_body_id in used_identity_bodies:
-                    continue
-                raw_head_to_raw_body[raw_head_id] = raw_body_id
-                used_identity_heads.add(raw_head_id)
-                used_identity_bodies.add(raw_body_id)
+            identity_match_by_raw_head = match_bodies_to_heads_for_identity(
+                head_dets,
+                body_source_dets,
+            )
+            raw_head_to_raw_body = {
+                int(raw_head_id): int(matched["track_id"])
+                for raw_head_id, matched in identity_match_by_raw_head.items()
+            }
 
             # Resolve the auxiliary body role for output continuity only.  It
             # must not feed back into the head ID used by the existing seat
@@ -2638,6 +2688,12 @@ def run(args):
             body_identity.bind(frame_idx, body_dets_by_raw, authoritative_body_links)
             body_stable_by_raw.update(authoritative_body_links)
             current_body_by_stable = body_identity.current(frame_idx)
+            strict_body_by_stable = {
+                int(head_stable_by_raw[raw_head_id]): matched
+                for raw_head_id, matched in identity_match_by_raw_head.items()
+                if raw_head_id in head_stable_by_raw
+            }
+            visible_stable_head_ids = set(int(v) for v in head_stable_by_raw.values())
 
             person_like_dets = body_source_dets
             head_people = [
@@ -2672,7 +2728,30 @@ def run(args):
                 if raw_tid in head_stable_by_raw
             }
 
-            for stable_tid, matched in current_body_by_stable.items():
+            # A visible head may only expose a body that passes the strict
+            # above-body constraint. Body continuity without a visible head
+            # is still allowed for short head-miss recovery.
+            for stable_tid in visible_stable_head_ids - set(strict_body_by_stable):
+                cached = person_box_cache.get(stable_tid)
+                current_head = head_dets.get(stable_tid)
+                cached_still_valid = bool(
+                    cached is not None
+                    and current_head is not None
+                    and match_bodies_to_heads_for_identity(
+                        {stable_tid: current_head},
+                        [cached],
+                    )
+                )
+                if not cached_still_valid:
+                    person_box_cache.pop(stable_tid, None)
+
+            bodies_for_cache = {
+                stable_tid: matched
+                for stable_tid, matched in current_body_by_stable.items()
+                if stable_tid not in visible_stable_head_ids
+            }
+            bodies_for_cache.update(strict_body_by_stable)
+            for stable_tid, matched in bodies_for_cache.items():
                 person_box_cache[stable_tid] = {
                     "xyxy": [float(v) for v in matched["xyxy"]],
                     "track_id": int(stable_tid),
@@ -2996,7 +3075,7 @@ def run(args):
                 # Output association comes from the isolated one-to-one
                 # identity layer; the original match remains available only
                 # to the unchanged seat-binding calculations.
-                matched_person = current_body_by_stable.get(tid)
+                matched_person = strict_body_by_stable.get(tid)
                 active_body = person_box_cache.get(tid)
                 body_hold_frames = (
                     frame_idx - int(active_body["last_seen_frame"])
